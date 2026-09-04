@@ -55,7 +55,7 @@ int openssl_SSL_read_exit(struct pt_regs *ctx) {
     __u64 *ret_ptr = args->ret_ptr;
     bpf_map_delete_elem(&ssl_pending, &pid_tgid);
 
-    __u32 pid = pid_tgid >> 32;
+    __u32 pid = current_tgid();
     __u64 id = pid_tgid | IS_TLS_READ_ID;
     trace_enter_read(id, pid, fd, 1, buf, ret_ptr, 0);
 

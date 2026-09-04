@@ -41,6 +41,39 @@ struct {
     __uint(max_entries, 10240);
 } ssl_last_fd SEC(".maps");
 
+#if defined(__CORE_PIDNS)
+
+// The classic tracepoint only carries the fields the kernel copied into the ring
+// buffer, and the child's task_struct is not one of them. bpf_get_current_task()
+// is of no help either, since at this point the current task is the parent. The
+// raw tracepoint receives the original TP_PROTO arguments instead:
+//     TP_PROTO(struct task_struct *task, u64 clone_flags)
+SEC("raw_tracepoint/task_newtask")
+int task_newtask(struct bpf_raw_tracepoint_args *ctx)
+{
+    struct task_struct *child = (struct task_struct *)ctx->args[0];
+    __u64 clone_flags = ctx->args[1];
+
+    if (clone_flags & CLONE_THREAD) { // skipping threads
+        return 0;
+    }
+    struct proc_event e = {
+        .type = EVENT_TYPE_PROCESS_START,
+    };
+    if (agent_pidns_inum) {
+        e.pid = pid_in_agent_ns(BPF_CORE_READ(child, thread_pid));
+        if (!e.pid) { // outside of the agent's pid namespace
+            return 0;
+        }
+    } else {
+        e.pid = BPF_CORE_READ(child, pid);
+    }
+    bpf_perf_event_output(ctx, &proc_events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+    return 0;
+}
+
+#else
+
 struct trace_event_raw_task_newtask__stub {
     __u64 unused;
 #if defined(__CTX_EXTRA_PADDING)
@@ -65,6 +98,8 @@ int task_newtask(struct trace_event_raw_task_newtask__stub *args)
     return 0;
 }
 
+#endif
+
 struct trace_event_raw_sched_process_template__stub {
     __u64 unused;
 #if defined(__CTX_EXTRA_PADDING)
@@ -79,8 +114,11 @@ int sched_process_exit(struct trace_event_raw_sched_process_template__stub *args
 {
     __u64 id = bpf_get_current_pid_tgid();
     bpf_map_delete_elem(&ssl_last_fd, &id);
-    __u64 pid = id >> 32;
-    if (pid != (__u32)id) { // skipping threads for the rest
+    if ((id >> 32) != (__u32)id) { // skipping threads for the rest
+        return 0;
+    }
+    __u64 pid = current_tgid();
+    if (!pid) {
         return 0;
     }
 
@@ -93,7 +131,7 @@ int sched_process_exit(struct trace_event_raw_sched_process_template__stub *args
 
     struct proc_event e = {
         .type = EVENT_TYPE_PROCESS_EXIT,
-        .pid = args->pid,
+        .pid = pid,
     };
     if (bpf_map_lookup_elem(&oom_info, &e.pid)) {
         e.reason = EVENT_REASON_OOM_KILL;

@@ -97,13 +97,14 @@ int trace_exit_open(struct trace_event_raw_sys_exit__stub* ctx)
 	if (!i) {
 	    return 0;
 	}
-	if (ctx->ret < 0 || i->mnt == 0) {
+	__u32 pid = current_tgid();
+	if (ctx->ret < 0 || i->mnt == 0 || pid == 0) {
 	    bpf_map_delete_elem(&open_file_info, &id);
 		return 0;
 	}
 	struct file_event e = {
 		.type = EVENT_TYPE_FILE_OPEN,
-		.pid = id >> 32,
+		.pid = pid,
 		.fd = ctx->ret,
 		.mnt = i->mnt,
 		.log = i->log,

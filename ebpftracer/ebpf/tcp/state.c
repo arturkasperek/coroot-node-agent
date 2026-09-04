@@ -122,12 +122,12 @@ int inet_sock_set_state(void *ctx)
         return 0;
     }
     __u64 id = bpf_get_current_pid_tgid();
-    __u32 pid = id >> 32;
+    __u32 pid = current_tgid();
 
     if (args.oldstate == BPF_TCP_CLOSE && args.newstate == BPF_TCP_SYN_SENT) {
         __u64 *fdp = bpf_map_lookup_elem(&fd_by_pid_tgid, &id);
 
-        if (!fdp) {
+        if (!fdp || !pid) {
             return 0;
         }
         struct connection_id cid = {};
@@ -235,8 +235,12 @@ int sys_exit_connect(struct trace_event_raw_sys_exit__stub* ctx) {
         return 0;
     }
     struct connection_id cid = {};
-    cid.pid = id >> 32;
+    cid.pid = current_tgid();
     cid.fd = *fdp;
+    if (!cid.pid) {
+        bpf_map_delete_elem(&fd_by_pid_tgid, &id);
+        return 0;
+    }
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (!conn && ctx->ret == 0) { // non-TCP connection
         struct connection conn = {};
@@ -265,10 +269,12 @@ int sys_enter_close(void *ctx) {
     if (bpf_probe_read(&args, sizeof(args), ctx) < 0) {
         return 0;
     }
-    __u64 id = bpf_get_current_pid_tgid();
     struct connection_id cid = {};
-    cid.pid = id >> 32;
+    cid.pid = current_tgid();
     cid.fd = args.fd;
+    if (!cid.pid) {
+        return 0;
+    }
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (conn) {
         struct tcp_event e = {};
@@ -290,10 +296,12 @@ int handle_accept_exit(long int ret) {
     if (ret < 0) {
         return 0;
     }
-    __u64 id = bpf_get_current_pid_tgid();
     struct connection_id cid = {};
-    cid.pid = id >> 32;
+    cid.pid = current_tgid();
     cid.fd = (__u64)ret;
+    if (!cid.pid) {
+        return 0;
+    }
     struct connection conn = {};
     conn.timestamp = bpf_ktime_get_ns();
     conn.is_inbound = 1;

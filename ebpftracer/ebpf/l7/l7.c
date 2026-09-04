@@ -244,8 +244,11 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
     }
     __u32 zero = 0;
     struct connection_id cid = {};
-    cid.pid = id >> 32;
+    cid.pid = current_tgid();
     cid.fd = fd;
+    if (!cid.pid) {
+        return 0;
+    }
     __u64 total_size = size;
 
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
@@ -435,6 +438,9 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
 
 static inline __attribute__((__always_inline__))
 int trace_enter_read(__u64 id, __u32 pid, __u64 fd, __u8 socket_only, char *buf, __u64 *ret, __u64 iovlen) {
+    if (!pid) { // outside of the agent's pid namespace
+        return 0;
+    }
     if (bpf_map_lookup_elem(&rustls_pids, &pid)) {
         bpf_map_update_elem(&rustls_last_read_fd, &id, &fd, BPF_ANY);
     }
@@ -462,6 +468,9 @@ int trace_enter_read(__u64 id, __u32 pid, __u64 fd, __u8 socket_only, char *buf,
 
 static inline __attribute__((__always_inline__))
 int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) {
+    if (!pid) { // outside of the agent's pid namespace
+        return 0;
+    }
     struct read_args *args = bpf_map_lookup_elem(&active_reads, &id);
     if (!args) {
         return 0;
@@ -751,7 +760,7 @@ int sys_enter_read(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     if (ssl_check_read_enter(id, ctx->fd) >= 0) {
         return 0;
     }
-    __u32 pid = id >> 32;
+    __u32 pid = current_tgid();
     return trace_enter_read(id, pid, ctx->fd, 0, ctx->buf, 0, 0);
 }
 
@@ -761,7 +770,7 @@ int sys_enter_readv(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     if (ssl_check_read_enter(id, ctx->fd) >= 0) {
         return 0;
     }
-    __u32 pid = id >> 32;
+    __u32 pid = current_tgid();
     return trace_enter_read(id, pid, ctx->fd, 0, ctx->buf, 0, ctx->size);
 }
 
@@ -775,7 +784,7 @@ int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
         return 0;
     }
-    __u32 pid = id >> 32;
+    __u32 pid = current_tgid();
     return trace_enter_read(id, pid, ctx->fd, 1, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
 }
 
@@ -785,7 +794,7 @@ int sys_enter_recvfrom(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     if (ssl_check_read_enter(id, ctx->fd) >= 0) {
         return 0;
     }
-    __u32 pid = id >> 32;
+    __u32 pid = current_tgid();
     return trace_enter_read(id, pid, ctx->fd, 1, ctx->buf, 0, 0);
 }
 
@@ -795,7 +804,7 @@ int sys_exit_read(struct trace_event_raw_sys_exit__stub* ctx) {
     if (ssl_check_read_exit(pid_tgid) >= 0) {
         return 0;
     }
-    __u32 pid = pid_tgid >> 32;
+    __u32 pid = current_tgid();
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }
 
@@ -805,7 +814,7 @@ int sys_exit_readv(struct trace_event_raw_sys_exit__stub* ctx) {
     if (ssl_check_read_exit(pid_tgid) >= 0) {
         return 0;
     }
-    __u32 pid = pid_tgid >> 32;
+    __u32 pid = current_tgid();
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }
 
@@ -815,7 +824,7 @@ int sys_exit_recvmsg(struct trace_event_raw_sys_exit__stub* ctx) {
     if (ssl_check_read_exit(pid_tgid) >= 0) {
         return 0;
     }
-    __u32 pid = pid_tgid >> 32;
+    __u32 pid = current_tgid();
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }
 
@@ -825,6 +834,6 @@ int sys_exit_recvfrom(struct trace_event_raw_sys_exit__stub* ctx) {
     if (ssl_check_read_exit(pid_tgid) >= 0) {
         return 0;
     }
-    __u32 pid = pid_tgid >> 32;
+    __u32 pid = current_tgid();
     return trace_exit_read(ctx, pid_tgid, pid, 0, ctx->ret);
 }

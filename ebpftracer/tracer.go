@@ -2,8 +2,6 @@ package ebpftracer
 
 import (
 	"bytes"
-	"compress/gzip"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -260,38 +258,28 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
 	}
 
-	var flags string
-	if isCtxExtraPaddingRequired(traceFsPath) {
-		flags = "ctx-extra-padding"
-	}
+	ctxExtraPadding := isCtxExtraPaddingRequired(traceFsPath)
+	btf := kernelBTFAvailable()
 	kv := common.GetKernelVersion()
-	var prog []byte
-	for _, p := range ebpfProgs[runtime.GOARCH] {
-		pv, _ := common.VersionFromString(p.version)
-		if !kv.GreaterOrEqual(pv) {
-			continue
-		}
-		if flags != p.flags {
-			continue
-		}
-		prog = p.prog
-		break
-	}
+
+	prog := selectProg(ebpfProgs[runtime.GOARCH], kv, ctxExtraPadding, btf)
 	if len(prog) == 0 {
-		return fmt.Errorf("unsupported kernel version: %s %s", kv, flags)
+		return fmt.Errorf("unsupported kernel version: %s (ctx-extra-padding=%t)", kv, ctxExtraPadding)
+	}
+	if !btf {
+		klog.Infof("%s is not available, PIDs will not be translated into the agent's namespace", kernelBTFPath)
 	}
 
-	reader, err := gzip.NewReader(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(prog)))
+	prog, err := decodeProg(prog)
 	if err != nil {
-		return fmt.Errorf("invalid program encoding: %w", err)
-	}
-	prog, err = io.ReadAll(reader)
-	if err != nil {
-		return fmt.Errorf("failed to ungzip program: %w", err)
+		return err
 	}
 	collectionSpec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(prog))
 	if err != nil {
 		return fmt.Errorf("failed to load collection spec: %w", err)
+	}
+	if err = setAgentPidNs(collectionSpec); err != nil {
+		return err
 	}
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
 	c, err := ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
@@ -358,6 +346,8 @@ func (t *Tracer) attachPrograms() error {
 		case ebpf.TracePoint:
 			parts := strings.SplitN(programSpec.AttachTo, "/", 2)
 			l, err = link.Tracepoint(parts[0], parts[1], program, nil)
+		case ebpf.RawTracepoint:
+			l, err = link.AttachRawTracepoint(link.RawTracepointOptions{Name: programSpec.AttachTo, Program: program})
 		case ebpf.Kprobe:
 			if strings.HasPrefix(programSpec.SectionName, "uprobe/") { // attached to a process on demand
 				continue

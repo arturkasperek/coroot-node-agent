@@ -5,6 +5,12 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
 
+// libbpf 1.0 dropped PT_REGS_ARM64, which the Go and rustls uprobes below rely on.
+// The CO-RE objects are built against a newer libbpf than the plain ones.
+#if defined(__TARGET_ARCH_arm64) && !defined(PT_REGS_ARM64)
+#define PT_REGS_ARM64 const struct user_pt_regs
+#endif
+
 #define EVENT_TYPE_PROCESS_START	    1
 #define EVENT_TYPE_PROCESS_EXIT		    2
 #define EVENT_TYPE_CONNECTION_OPEN	    3
@@ -38,6 +44,8 @@ struct trace_event_raw_sys_exit__stub {
 	__u64 unused2;
 	long int ret;
 };
+
+#include "pidns.h"
 
 #include "nodejs.c"
 #include "python.c"

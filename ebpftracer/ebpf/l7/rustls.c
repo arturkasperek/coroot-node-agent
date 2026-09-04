@@ -1,7 +1,7 @@
 SEC("uprobe/rustls_write_enter")
 int rustls_write_enter(struct pt_regs *ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
-    __u32 pid = tid >> 32;
+    __u32 pid = current_tgid();
 
     __u8 dummy = 1;
     bpf_map_update_elem(&rustls_pids, &pid, &dummy, BPF_ANY);
@@ -16,7 +16,7 @@ int rustls_write_enter(struct pt_regs *ctx) {
 SEC("uprobe/rustls_read_enter")
 int rustls_read_enter(struct pt_regs *ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
-    __u32 pid = tid >> 32;
+    __u32 pid = current_tgid();
 
     __u64 *fd_ptr = bpf_map_lookup_elem(&rustls_last_read_fd, &tid);
     if (!fd_ptr) {
@@ -41,6 +41,6 @@ int rustls_read_exit(struct pt_regs *ctx) {
     }
 
     int ret = (int)RUSTLS_RET_SIZE(ctx);
-    __u32 pid = pid_tgid >> 32;
+    __u32 pid = current_tgid();
     return trace_exit_read(ctx, id, pid, 1, ret);
 }

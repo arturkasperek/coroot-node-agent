@@ -26,9 +26,12 @@ struct {
 SEC("uprobe/uv_io_poll_exit")
 int uv_io_poll_exit(struct pt_regs *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u64 pid = pid_tgid >> 32;
     __u64 timestamp = bpf_ktime_get_ns();
-    if ((__u32)pid_tgid != (__u32)pid) {
+    if ((__u32)pid_tgid != (__u32)(pid_tgid >> 32)) {
+        return 0;
+    }
+    __u64 pid = current_tgid();
+    if (!pid) {
         return 0;
     }
     bpf_map_update_elem(&nodejs_prev_event_loop_iter, &pid, &timestamp, BPF_ANY);
@@ -38,8 +41,11 @@ int uv_io_poll_exit(struct pt_regs *ctx) {
 SEC("uprobe/uv_io_poll_enter")
 int uv_io_poll_enter(struct pt_regs *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u64 pid = pid_tgid >> 32;
-    if ((__u32)pid_tgid != (__u32)pid) {
+    if ((__u32)pid_tgid != (__u32)(pid_tgid >> 32)) {
+        return 0;
+    }
+    __u64 pid = current_tgid();
+    if (!pid) {
         return 0;
     }
     __u64 *prev = bpf_map_lookup_elem(&nodejs_prev_event_loop_iter, &pid);
@@ -64,8 +70,11 @@ int uv_io_poll_enter(struct pt_regs *ctx) {
 SEC("uprobe/uv_io_cb_enter")
 int uv_io_cb_enter(struct pt_regs *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u64 pid = pid_tgid >> 32;
-    if ((__u32)pid_tgid != (__u32)pid) {
+    if ((__u32)pid_tgid != (__u32)(pid_tgid >> 32)) {
+        return 0;
+    }
+    __u64 pid = current_tgid();
+    if (!pid) {
         return 0;
     }
     __u64 timestamp = bpf_ktime_get_ns();
@@ -76,8 +85,11 @@ int uv_io_cb_enter(struct pt_regs *ctx) {
 SEC("uprobe/uv_io_cb_exit")
 int uv_io_cb_exit(struct pt_regs *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u64 pid = pid_tgid >> 32;
-    if ((__u32)pid_tgid != (__u32)pid) {
+    if ((__u32)pid_tgid != (__u32)(pid_tgid >> 32)) {
+        return 0;
+    }
+    __u64 pid = current_tgid();
+    if (!pid) {
         return 0;
     }
     __u64 *start = bpf_map_lookup_elem(&nodejs_current_io_cb, &pid);

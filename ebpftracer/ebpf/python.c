@@ -34,7 +34,10 @@ int pthread_cond_timedwait_exit(struct pt_regs *ctx) {
     }
     __u64 duration = bpf_ktime_get_ns() - *timestamp;
     bpf_map_delete_elem(&python_thread_locks, &pid_tgid);
-    __u64 pid = pid_tgid >> 32;
+    __u64 pid = current_tgid();
+    if (!pid) {
+        return 0;
+    }
     struct python_proc_stats *stats = bpf_map_lookup_elem(&python_stats, &pid);
     if (!stats) {
         struct python_proc_stats s = {};

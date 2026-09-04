@@ -1,7 +1,7 @@
 SEC("uprobe/java_tls_write_enter")
 int java_tls_write_enter(struct pt_regs *ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
-    __u32 pid = tid >> 32;
+    __u32 pid = current_tgid();
 
     __u8 dummy = 1;
     bpf_map_update_elem(&java_tls_pids, &pid, &dummy, BPF_ANY);
@@ -32,7 +32,7 @@ int java_tls_read_exit(struct pt_regs *ctx) {
         return 0;
     }
 
-    __u32 pid = pid_tgid >> 32;
+    __u32 pid = current_tgid();
     __u64 id = pid_tgid | IS_TLS_READ_ID;
     trace_enter_read(id, pid, fd, 1, buf, 0, 0);
     return trace_exit_read(ctx, id, pid, 1, size);

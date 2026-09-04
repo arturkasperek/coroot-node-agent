@@ -54,7 +54,7 @@ int go_crypto_tls_read_enter(struct pt_regs *ctx) {
     char *buf_ptr = (char*)GO_PARAM2(ctx);
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u64 goroutine_id = GOROUTINE(ctx);
-    __u64 pid = pid_tgid >> 32;
+    __u64 pid = current_tgid();
     __u64 id = pid << 32 | goroutine_id | IS_TLS_READ_ID;
     return trace_enter_read(id, pid, fd, 1, buf_ptr, 0, 0);
 }
@@ -62,7 +62,7 @@ int go_crypto_tls_read_enter(struct pt_regs *ctx) {
 SEC("uprobe/go_crypto_tls_read_exit")
 int go_crypto_tls_read_exit(struct pt_regs *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u64 pid = pid_tgid >> 32;
+    __u64 pid = current_tgid();
     __u64 goroutine_id = GOROUTINE(ctx);
     __u64 id = pid << 32 | goroutine_id | IS_TLS_READ_ID;
     long int ret = GO_PARAM1(ctx);
