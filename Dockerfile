@@ -1,6 +1,7 @@
-FROM debian:bullseye AS builder
-# Using Debian instead of the official Golang image because it’s based on newer OS versions
-# with newer glibc, which causes compatibility issues.
+FROM debian:bookworm AS builder
+# Debian rather than the official Golang image, which tracks a newer distro
+# whose glibc would be newer than the UBI runtime below.
+# Bookworm is glibc 2.36; UBI10 is 2.39.
 
 RUN apt-get update && apt-get install -y \
     curl git build-essential pkg-config libsystemd-dev
@@ -18,7 +19,7 @@ COPY . .
 ARG VERSION=unknown
 RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/coroot/coroot-node-agent/flags.Version=${VERSION}'" -o coroot-node-agent .
 
-FROM registry.access.redhat.com/ubi9/ubi
+FROM registry.access.redhat.com/ubi10/ubi
 
 ARG VERSION=unknown
 LABEL name="coroot-node-agent" \

@@ -1,0 +1,33 @@
+# Runs the test suite on Linux. The agent only builds for linux and windows - the
+# platform-specific halves of packages like flags, gpu and host are selected by
+# filename suffix - so `go test ./...` cannot work on a macOS host.
+#
+# Mirrors the builder stage of Dockerfile so the test environment does not drift
+# from the one the agent is actually built in.
+#
+# The tests are the entrypoint rather than a RUN step: those in ebpftracer load
+# programs into the kernel and need privileges that are not available at build time.
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    curl git build-essential pkg-config libsystemd-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG GO_VERSION=1.24.9
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
+    tar -C /usr/local -xzf go.tar.gz && rm go.tar.gz
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV CGO_ENABLED=1
+
+WORKDIR /tmp/src
+COPY go.mod .
+COPY go.sum .
+RUN go mod download
+COPY . .
+
+# Compile the tests during the build so that a broken build fails fast, without
+# waiting for a container to be started.
+RUN go build ./... && go vet ./...
+
+ENTRYPOINT ["go", "test"]
+CMD ["./..."]
