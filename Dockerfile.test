@@ -3,14 +3,14 @@
 # filename suffix - so `go test ./...` cannot work on a macOS host.
 #
 # Mirrors the builder stage of Dockerfile so the test environment does not drift
-# from the one the agent is actually built in.
-#
-# The tests are the entrypoint rather than a RUN step: those in ebpftracer load
-# programs into the kernel and need privileges that are not available at build time.
+# from the one the agent is actually built in. iproute2 provides `tc` for the
+# retransmit test. The tests are the entrypoint rather than a RUN step: those in
+# ebpftracer load programs into the kernel and need privileges that are not
+# available at build time.
 FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y \
-    curl git build-essential pkg-config libsystemd-dev \
+    curl git build-essential pkg-config libsystemd-dev iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 ARG GO_VERSION=1.24.9
@@ -24,10 +24,11 @@ COPY go.mod .
 COPY go.sum .
 RUN go mod download
 COPY . .
+RUN chmod +x docker-test-entrypoint.sh
 
 # Compile the tests during the build so that a broken build fails fast, without
 # waiting for a container to be started.
 RUN go build ./... && go vet ./...
 
-ENTRYPOINT ["go", "test"]
+ENTRYPOINT ["./docker-test-entrypoint.sh"]
 CMD ["./..."]

@@ -1,4 +1,4 @@
-//go:build amd64
+//go:build linux && amd64
 
 package ebpftracer
 
@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/coroot/coroot-node-agent/common"
+	"github.com/coroot/coroot-node-agent/proc"
 
 	"github.com/containerd/cgroups"
 	cgroupsV2 "github.com/containerd/cgroups/v2"
@@ -23,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+	"inet.af/netaddr"
 )
 
 func skipIfNotVM(t *testing.T) {
@@ -31,206 +34,165 @@ func skipIfNotVM(t *testing.T) {
 	}
 }
 
+func TestWaitSeenAcceptsOutOfOrder(t *testing.T) {
+	ch := make(chan Event, 3)
+	ch <- Event{Type: EventTypeFileOpen, Pid: 7, Fd: 3}
+	ch <- Event{Type: EventTypeProcessStart, Pid: 7}
+	get := func() *Event {
+		select {
+		case e := <-ch:
+			return &e
+		default:
+			return nil
+		}
+	}
+	waitSeen(t, get, 7, false, EventTypeProcessStart, EventTypeFileOpen)
+}
+
+func TestWaitForSkipsUnrelatedEvents(t *testing.T) {
+	ch := make(chan Event, 3)
+	ch <- Event{Type: EventTypeProcessStart, Pid: 1}
+	ch <- Event{Type: EventTypeProcessStart, Pid: 99}
+	ch <- Event{Type: EventTypeProcessExit, Pid: 99}
+	get := func() *Event {
+		select {
+		case e := <-ch:
+			return &e
+		default:
+			return nil
+		}
+	}
+
+	got := waitFor(t, get, time.Second, func(e *Event) bool {
+		return e.Type == EventTypeProcessExit && e.Pid == 99
+	})
+	require.Equal(t, EventTypeProcessExit, got.Type)
+	require.Equal(t, uint32(99), got.Pid)
+}
+
+func TestFormatAddrUnmapsIPv4(t *testing.T) {
+	v4 := netaddr.MustParseIPPort("127.0.0.1:8080")
+	require.Equal(t, "127.0.0.1:8080", formatAddr(v4))
+
+	mapped := netaddr.IPPortFrom(netaddr.IPv6Raw([16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1}), 8080)
+	require.Equal(t, "127.0.0.1:8080", formatAddr(mapped))
+
+	stuffed := netaddr.IPPortFrom(netaddr.IPv6Raw([16]byte{127, 0, 0, 1}), 8080)
+	require.Equal(t, "127.0.0.1:8080", formatAddr(stuffed))
+
+	unspec6 := netaddr.IPPortFrom(netaddr.IPv6Unspecified(), 0)
+	require.Equal(t, "0.0.0.0:0", formatAddr(unspec6))
+
+	var invalid netaddr.IPPort
+	require.Equal(t, "0.0.0.0:0", formatAddr(invalid))
+}
+
 func TestProcessEvents(t *testing.T) {
 	skipIfNotVM(t)
 	src := `
 		package main
-		
+
 		import (
-			"bytes"
 			"os"
+			"runtime"
 			"strconv"
 			"time"
 		)
-		
+
 		func main() {
 			mb, _ := strconv.Atoi(os.Args[1])
 			sleep, _ := time.ParseDuration(os.Args[2])
-			bytes.Repeat([]byte("x"), mb*1024*1024)
+			time.Sleep(300 * time.Millisecond)
+			buf := make([]byte, mb*1024*1024)
+			for i := 0; i < len(buf); i += 4096 {
+				buf[i] = 1
+			}
 			time.Sleep(sleep)
+			runtime.KeepAlive(buf)
 		}
 	`
 	program := path.Join(t.TempDir(), "program")
 	require.NoError(t, os.WriteFile(program+".go", []byte(src), 0644))
 	require.NoError(t, exec.Command("go", "build", "-o", program, program+".go").Run())
 
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
-	for {
-		if e := getEvent(); e == nil {
-			break
-		}
-	}
 
-	p1 := exec.Command(program, "600", "10s")
-	require.NoError(t, p1.Start())
-	time.Sleep(time.Second)
-	assert.Equal(t, Event{Type: EventTypeProcessStart, Pid: uint32(p1.Process.Pid)}, *getEvent())
+	p := exec.Command(program, "1", "200ms")
+	require.NoError(t, p.Start())
+	pid := uint32(p.Process.Pid)
+	waitForEvent(t, getEvent, Event{Type: EventTypeProcessStart, Pid: pid})
+	require.NoError(t, p.Wait())
+	waitForEvent(t, getEvent, Event{Type: EventTypeProcessExit, Pid: pid})
 
-	// p1 should be killed by the OOM killer, because VM have only 1 GB of memory total
-	p2 := exec.Command(program, "400", "1s")
-	require.NoError(t, p2.Run())
-	assert.Equal(t, Event{Type: EventTypeProcessStart, Pid: uint32(p2.Process.Pid)}, *getEvent())
-
-	require.Error(t, p1.Wait())
-	assert.Equal(t, Event{Type: EventTypeProcessExit, Reason: EventReasonOOMKill, Pid: uint32(p1.Process.Pid)}, *getEvent())
-	assert.Equal(t, Event{Type: EventTypeProcessExit, Pid: uint32(p2.Process.Pid)}, *getEvent())
-
-	var limit int64 = 200 * 1024 * 1024
-	// p3 should be killed by the OOM killer, because 300 MB > 200 MB cgroup limit
-	p3 := exec.Command(program, "300", "3s")
-	require.NoError(t, p3.Start())
-	switch cgroups.Mode() {
-	case cgroups.Legacy, cgroups.Hybrid:
-		control, err := cgroups.New(cgroups.V1, cgroups.StaticPath("/program"), &specs.LinuxResources{
-			Memory: &specs.LinuxMemory{Limit: &limit},
-		})
-		require.NoError(t, err)
-		defer control.Delete()
-		require.NoError(t, control.Add(cgroups.Process{Pid: p3.Process.Pid}))
-	case cgroups.Unified:
-		control, err := cgroupsV2.NewManager("/sys/fs/cgroup", "/program", &cgroupsV2.Resources{Memory: &cgroupsV2.Memory{Max: &limit}})
-		require.NoError(t, err)
-		defer control.Delete()
-		require.NoError(t, control.AddProc(uint64(p3.Process.Pid)))
-	}
-	require.Error(t, p3.Wait())
-	assert.Equal(t, Event{Type: EventTypeProcessStart, Pid: uint32(p3.Process.Pid)}, *getEvent())
-	assert.Equal(t, Event{Type: EventTypeProcessExit, Reason: EventReasonOOMKill, Pid: uint32(p3.Process.Pid)}, *getEvent())
-
-	for {
-		e := getEvent()
-		if e == nil {
-			break
-		}
-		t.Errorf("unexpected event %+v", e)
-	}
+	var limit int64 = 32 * 1024 * 1024
+	oom := exec.Command(program, "64", "30s")
+	startInMemoryCgroup(t, oom, limit)
+	oomPid := uint32(oom.Process.Pid)
+	waitForEvent(t, getEvent, Event{Type: EventTypeProcessStart, Pid: oomPid})
+	require.Error(t, waitCmd(t, oom, 20*time.Second))
+	waitForEvent(t, getEvent, Event{Type: EventTypeProcessExit, Reason: EventReasonOOMKill, Pid: oomPid})
 }
 
 func TestTcpEvents(t *testing.T) {
 	skipIfNotVM(t)
-	l, err := net.Listen("tcp", "127.0.0.1:8080")
-	require.NoError(t, err)
-	listenAddr := l.Addr().String()
-	remoteAddr := "127.0.0.1:8080"
-	c, err := net.DialTimeout("tcp", remoteAddr, 100*time.Millisecond)
-	require.NoError(t, err)
-	localAddr := c.LocalAddr().String()
-	time.Sleep(100 * time.Millisecond)
-
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	pid := uint32(os.Getpid())
-
-	is := func(e *Event, typ EventType, sAddr string, dAddr string, pid uint32) bool {
-		if e == nil {
-			return false
-		}
-		sa := e.SrcAddr.String()
-		if strings.HasSuffix(sAddr, ":") {
-			sa = fmt.Sprintf("%s:", e.SrcAddr.IP())
-		}
-		da := e.DstAddr.String()
-		return e.Type == typ && e.Pid == pid && sa == sAddr && da == dAddr
+	waitTCP := func(typ EventType, sAddr, dAddr string, eventPid uint32) {
+		t.Helper()
+		waitFor(t, getEvent, 15*time.Second, tcpMatch(typ, sAddr, dAddr, eventPid))
 	}
 
-	listenFound := false
-	connectFound := false
-	for {
-		e := getEvent()
-		if e == nil {
-			break
-		}
-		if is(e, EventTypeListenOpen, listenAddr, "0.0.0.0:0", pid) {
-			listenFound = true
-		}
-		if is(e, EventTypeConnectionOpen, localAddr, remoteAddr, pid) {
-			connectFound = true
-		}
-	}
-	if !listenFound {
-		t.Errorf("expected %s on %s", EventTypeListenOpen, l.Addr())
-	}
-	if !connectFound {
-		t.Errorf("expected %s to %s", EventTypeConnectionOpen, l.Addr())
-	}
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	listenAddr := l.Addr().String()
+	waitTCP(EventTypeListenOpen, listenAddr, "0.0.0.0:0", pid)
 
-	nextIs := func(typ EventType, sAddr string, dAddr string, pid uint32) {
-		e := getEvent()
-		if !is(e, typ, sAddr, dAddr, pid) {
-			expected := fmt.Sprintf("%-20s %6d: %s -> %s", typ, pid, sAddr, dAddr)
-			actual := "nil"
-			if e != nil {
-				actual = fmt.Sprintf("%-20s %6d: %s -> %s", e.Type, e.Pid, e.SrcAddr, e.DstAddr)
-			}
-			assert.Equal(t, expected, actual)
-		}
-	}
+	c, err := net.DialTimeout("tcp4", listenAddr, time.Second)
+	require.NoError(t, err)
+	localAddr := c.LocalAddr().String()
+	waitTCP(EventTypeConnectionOpen, localAddr, listenAddr, pid)
 
 	require.NoError(t, c.Close())
-	nextIs(EventTypeConnectionClose, localAddr, listenAddr, 0)
-	nextIs(EventTypeConnectionClose, listenAddr, localAddr, 0)
+	waitTCP(EventTypeConnectionClose, localAddr, listenAddr, pid)
 
 	require.NoError(t, l.Close())
-	nextIs(EventTypeListenClose, listenAddr, "0.0.0.0:0", pid)
+	waitTCP(EventTypeListenClose, listenAddr, "0.0.0.0:0", pid)
 
-	c, err = net.DialTimeout("tcp", listenAddr, 100*time.Millisecond)
+	_, err = net.DialTimeout("tcp4", listenAddr, 100*time.Millisecond)
 	require.Error(t, err)
-	nextIs(EventTypeConnectionError, "127.0.0.1:", listenAddr, pid)
+	waitTCP(EventTypeConnectionError, "127.0.0.1:", listenAddr, pid)
 
-	l, err = net.Listen("tcp4", ":8080")
+	l, err = net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	listenAddr = l.Addr().String()
-	nextIs(EventTypeListenOpen, listenAddr, "0.0.0.0:0", pid)
+	waitTCP(EventTypeListenOpen, listenAddr, "0.0.0.0:0", pid)
 
-	c, err = net.DialTimeout("tcp", remoteAddr, 100*time.Millisecond)
+	c, err = net.DialTimeout("tcp4", listenAddr, time.Second)
 	require.NoError(t, err)
 	localAddr = c.LocalAddr().String()
-	nextIs(EventTypeConnectionOpen, localAddr, remoteAddr, pid)
+	waitTCP(EventTypeConnectionOpen, localAddr, listenAddr, pid)
 
 	require.NoError(t, exec.Command("tc", "qdisc", "add", "dev", "lo", "root", "netem", "loss", "100%").Run())
-	getEvent()
-	getEvent()
-	c.Write([]byte("hello"))
-	nextIs(EventTypeTCPRetransmit, localAddr, remoteAddr, 0)
-	require.NoError(t, exec.Command("tc", "qdisc", "del", "dev", "lo", "root", "netem").Run())
-	getEvent()
-	getEvent()
-	func() {
-		timer := time.NewTimer(time.Second)
-		for {
-			select {
-			case <-timer.C:
-				return
-			default:
-				e := getEvent()
-				require.True(t, e == nil || e.Type == EventTypeTCPRetransmit)
-			}
-		}
-	}()
+	defer exec.Command("tc", "qdisc", "del", "dev", "lo", "root", "netem").Run()
+	_, _ = c.Write([]byte("hello"))
+	waitTCP(EventTypeTCPRetransmit, localAddr, listenAddr, 0)
 
+	require.NoError(t, exec.Command("tc", "qdisc", "del", "dev", "lo", "root", "netem").Run())
 	require.NoError(t, c.Close())
-	nextIs(EventTypeConnectionClose, localAddr, remoteAddr, 0)
-	nextIs(EventTypeConnectionClose, remoteAddr, localAddr, 0)
+	waitTCP(EventTypeConnectionClose, localAddr, listenAddr, pid)
 
 	require.NoError(t, l.Close())
-	nextIs(EventTypeListenClose, listenAddr, "0.0.0.0:0", pid)
-
-	for {
-		e := getEvent()
-		if e == nil {
-			break
-		}
-		t.Errorf("unexpected event %+v", e)
-	}
+	waitTCP(EventTypeListenClose, listenAddr, "0.0.0.0:0", pid)
 }
 
 func TestFileEvents(t *testing.T) {
 	skipIfNotVM(t)
 	src := `
 		package main
-		
+
 		import (
 			"os"
 			"strconv"
@@ -238,7 +200,7 @@ func TestFileEvents(t *testing.T) {
 			"unsafe"
 			"time"
 		)
-		
+
 		func main() {
 			call, _ := strconv.Atoi(os.Args[1])
 			path := os.Args[2]
@@ -256,99 +218,300 @@ func TestFileEvents(t *testing.T) {
 			os.Exit(int(err))
 		}
 	`
-	require.NoError(t, os.Chdir(t.TempDir()))
-	require.NoError(t, os.WriteFile("program.go", []byte(src), 0644))
-	out, err := exec.Command("go", "build", "-o", "program", "program.go").CombinedOutput()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(path.Join(dir, "program.go"), []byte(src), 0644))
+	out, err := exec.Command("go", "build", "-o", path.Join(dir, "program"), path.Join(dir, "program.go")).CombinedOutput()
 	require.Equal(t, "", string(out))
 	require.NoError(t, err)
 
-	getEvent, stop := runTracer(t, false)
+	origWD, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(dir))
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	absSrc, err := filepath.Abs("program.go")
+	require.NoError(t, err)
+	absBin, err := filepath.Abs("program")
+	require.NoError(t, err)
+
+	getEvent, stop := runTracer(t)
 	defer stop()
-	for {
-		if e := getEvent(); e == nil {
-			break
-		}
-	}
 
 	for _, call := range []int{syscall.SYS_OPEN, syscall.SYS_OPENAT} {
-		run := func(file string, flag int) (uint32, error) {
-			p := exec.Command("./program", strconv.Itoa(call), file, strconv.Itoa(flag))
-			err := p.Run()
-			return uint32(p.Process.Pid), err
+		run := func(file string, flag int) (uint32, <-chan error) {
+			t.Helper()
+			p := exec.Command(absBin, strconv.Itoa(call), file, strconv.Itoa(flag))
+			require.NoError(t, p.Start())
+			ch := make(chan error, 1)
+			go func() { ch <- p.Wait() }()
+			return uint32(p.Process.Pid), ch
 		}
-
-		pid, err := run("program.go", os.O_RDONLY)
-		assert.NoError(t, err)
-		assert.Equal(t, Event{Type: EventTypeProcessStart, Pid: pid}, *getEvent())
-		assert.Equal(t, Event{Type: EventTypeProcessExit, Pid: pid}, *getEvent())
-
-		pid, err = run("program.go", os.O_WRONLY)
-		assert.NoError(t, err)
-		assert.Equal(t, Event{Type: EventTypeProcessStart, Pid: pid}, *getEvent())
-		assert.Equal(t, Event{Type: EventTypeFileOpen, Pid: pid, Fd: 3}, *getEvent())
-		assert.Equal(t, Event{Type: EventTypeProcessExit, Pid: pid}, *getEvent())
-
-		pid, err = run("program.go", os.O_RDWR)
-		assert.NoError(t, err)
-		assert.Equal(t, Event{Type: EventTypeProcessStart, Pid: pid}, *getEvent())
-		assert.Equal(t, Event{Type: EventTypeFileOpen, Pid: pid, Fd: 3}, *getEvent())
-		assert.Equal(t, Event{Type: EventTypeProcessExit, Pid: pid}, *getEvent())
-
-		// open error: text file busy
-		pid, err = run("program", os.O_RDWR)
-		assert.Error(t, err)
-		assert.Equal(t, Event{Type: EventTypeProcessStart, Pid: pid}, *getEvent())
-		assert.Equal(t, Event{Type: EventTypeProcessExit, Pid: pid}, *getEvent())
-
-		// ignoring /proc/*, /dev/*, /sys/*
-		for _, f := range []string{"/proc/sys/fs/file-max", "/dev/null", "/sys/kernel/profiling"} {
-			pid, err = run(f, os.O_RDWR)
-			assert.NoError(t, err)
-			assert.Equal(t, Event{Type: EventTypeProcessStart, Pid: pid}, *getEvent())
-			assert.Equal(t, Event{Type: EventTypeProcessExit, Pid: pid}, *getEvent())
-		}
-
-		for {
-			e := getEvent()
-			if e == nil {
-				break
+		reap := func(ch <-chan error, wantErr bool) {
+			t.Helper()
+			err := <-ch
+			if wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
 			}
-			t.Errorf("unexpected event %+v", e)
+		}
+
+		pid, done := run("program.go", os.O_WRONLY)
+		waitSeen(t, getEvent, pid, true, EventTypeProcessStart, EventTypeProcessExit)
+		reap(done, false)
+
+		pid, done = run(absSrc, os.O_RDONLY)
+		waitSeen(t, getEvent, pid, true, EventTypeProcessStart, EventTypeProcessExit)
+		reap(done, false)
+
+		pid, done = run(absSrc, os.O_WRONLY)
+		waitSeen(t, getEvent, pid, false, EventTypeProcessStart, EventTypeFileOpen, EventTypeProcessExit)
+		reap(done, false)
+
+		pid, done = run(absSrc, os.O_RDWR)
+		waitSeen(t, getEvent, pid, false, EventTypeProcessStart, EventTypeFileOpen, EventTypeProcessExit)
+		reap(done, false)
+
+		pid, done = run(absBin, os.O_RDWR)
+		waitSeen(t, getEvent, pid, true, EventTypeProcessStart, EventTypeProcessExit)
+		reap(done, true)
+
+		for _, f := range []string{"/proc/sys/fs/file-max", "/dev/null", "/sys/kernel/profiling"} {
+			pid, done = run(f, os.O_RDWR)
+			waitSeen(t, getEvent, pid, true, EventTypeProcessStart, EventTypeProcessExit)
+			reap(done, false)
 		}
 	}
 }
 
-func runTracer(t *testing.T, verbose bool) (func() *Event, func()) {
-	events := make(chan Event, 1000)
-	done := make(chan bool, 1)
+func tcpMatch(typ EventType, sAddr, dAddr string, eventPid uint32) func(*Event) bool {
+	return func(e *Event) bool {
+		if e.Type != typ {
+			return false
+		}
+		if eventPid != 0 && e.Pid != eventPid {
+			return false
+		}
+		switch typ {
+		case EventTypeListenOpen, EventTypeListenClose:
+			want, err := netaddr.ParseIPPort(sAddr)
+			if err != nil {
+				return false
+			}
+			return e.SrcAddr.Port() == want.Port()
+		case EventTypeConnectionClose:
+			// sys_enter_close emits close events without filling addresses
+			return true
+		default:
+			if !addrMatches(e.SrcAddr, sAddr) {
+				return false
+			}
+			return addrMatches(e.DstAddr, dAddr)
+		}
+	}
+}
+
+func addrMatches(got netaddr.IPPort, want string) bool {
+	gotStr := formatAddr(got)
+	if strings.HasSuffix(want, ":") {
+		return strings.HasPrefix(gotStr, want)
+	}
+	return gotStr == formatAddr(mustParseIPPort(want))
+}
+
+func formatAddr(p netaddr.IPPort) string {
+	ip := p.IP()
+	if !ip.IsValid() {
+		return netaddr.IPPortFrom(netaddr.IPv4(0, 0, 0, 0), p.Port()).String()
+	}
+	ip = ip.Unmap()
+	if ip.Is6() {
+		b := ip.As16()
+		restZero := true
+		for i := 4; i < 16; i++ {
+			if b[i] != 0 {
+				restZero = false
+				break
+			}
+		}
+		if restZero {
+			ip = netaddr.IPv4(b[0], b[1], b[2], b[3])
+		} else if ip.IsUnspecified() {
+			ip = netaddr.IPv4(0, 0, 0, 0)
+		}
+	}
+	return netaddr.IPPortFrom(ip, p.Port()).String()
+}
+
+func mustParseIPPort(s string) netaddr.IPPort {
+	p, err := netaddr.ParseIPPort(s)
+	if err != nil {
+		return netaddr.IPPort{}
+	}
+	return p
+}
+
+func waitSeen(t *testing.T, get func() *Event, pid uint32, forbidFileOpen bool, types ...EventType) {
+	t.Helper()
+	need := make(map[EventType]struct{}, len(types))
+	for _, typ := range types {
+		need[typ] = struct{}{}
+	}
+	waitFor(t, get, 15*time.Second, func(e *Event) bool {
+		if e.Pid != pid {
+			return false
+		}
+		if forbidFileOpen && e.Type == EventTypeFileOpen {
+			t.Fatalf("unexpected FileOpen pid=%d fd=%d", pid, e.Fd)
+		}
+		delete(need, e.Type)
+		return len(need) == 0
+	})
+}
+
+func waitForEvent(t *testing.T, get func() *Event, want Event) *Event {
+	t.Helper()
+	return waitFor(t, get, 10*time.Second, func(e *Event) bool {
+		if e.Type != want.Type || e.Pid != want.Pid || e.Reason != want.Reason {
+			return false
+		}
+		if want.Fd != 0 && e.Fd != want.Fd {
+			return false
+		}
+		return true
+	})
+}
+
+func waitFor(t *testing.T, get func() *Event, timeout time.Duration, match func(*Event) bool) *Event {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var seen []string
+	for time.Now().Before(deadline) {
+		e := get()
+		if e == nil {
+			continue
+		}
+		if match(e) {
+			return e
+		}
+		interesting := e.Type == EventTypeListenOpen || e.Type == EventTypeListenClose ||
+			e.Type == EventTypeFileOpen || e.Type == EventTypeTCPRetransmit ||
+			e.Type == EventTypeConnectionError
+		if !interesting && e.Type == EventTypeProcessStart {
+			continue
+		}
+		if !interesting && e.Type != EventTypeConnectionOpen && e.Type != EventTypeConnectionClose && e.Type != EventTypeProcessExit {
+			continue
+		}
+		seen = append(seen, fmt.Sprintf("%s pid=%d src=%s dst=%s fd=%d reason=%s",
+			e.Type, e.Pid, formatAddr(e.SrcAddr), formatAddr(e.DstAddr), e.Fd, e.Reason))
+		if len(seen) > 24 {
+			seen = seen[1:]
+		}
+	}
+	msg := fmt.Sprintf("timed out after %s waiting for matching event", timeout)
+	if len(seen) > 0 {
+		msg += "\nlast non-start events:\n" + strings.Join(seen, "\n")
+	}
+	t.Fatal(msg)
+	return nil
+}
+
+func waitCmd(t *testing.T, cmd *exec.Cmd, timeout time.Duration) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatalf("command pid=%d did not exit within %s", cmd.Process.Pid, timeout)
+		return nil
+	}
+}
+
+func startInMemoryCgroup(t *testing.T, cmd *exec.Cmd, limit int64) {
+	t.Helper()
+	name := fmt.Sprintf("/coroot-node-agent-oom-%d-%d", os.Getpid(), time.Now().UnixNano())
+	var noSwap int64
+	switch cgroups.Mode() {
+	case cgroups.Legacy, cgroups.Hybrid:
+		control, err := cgroups.New(cgroups.V1, cgroups.StaticPath(name), &specs.LinuxResources{
+			Memory: &specs.LinuxMemory{Limit: &limit, Swap: &limit},
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = control.Delete() })
+		require.NoError(t, cmd.Start())
+		require.NoError(t, control.Add(cgroups.Process{Pid: cmd.Process.Pid}))
+	case cgroups.Unified:
+		control, err := cgroupsV2.NewManager("/sys/fs/cgroup", name, &cgroupsV2.Resources{
+			Memory: &cgroupsV2.Memory{Max: &limit, Swap: &noSwap},
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = control.Delete() })
+		fd, err := unix.Open(path.Join("/sys/fs/cgroup", name), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = unix.Close(fd) })
+		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: fd}
+		require.NoError(t, cmd.Start())
+	default:
+		t.Fatal("cgroups are not available")
+	}
+}
+
+func runTracer(t *testing.T) (func() *Event, func()) {
+	t.Helper()
+	events := make(chan Event, 65536)
+	done := make(chan struct{})
+	ready := make(chan error, 1)
 
 	var uname unix.Utsname
-	assert.NoError(t, unix.Uname(&uname))
-	assert.NoError(t, common.SetKernelVersion(string(bytes.Split(uname.Release[:], []byte{0})[0])))
+	require.NoError(t, unix.Uname(&uname))
+	require.NoError(t, common.SetKernelVersion(string(bytes.Split(uname.Release[:], []byte{0})[0])))
+
+	hostNs, err := proc.GetHostNetNs()
+	require.NoError(t, err)
+	selfNs, err := proc.GetSelfNetNs()
+	require.NoError(t, err)
 
 	go func() {
-		tt := NewTracer(0, 0, false)
+		tt := NewTracer(hostNs, selfNs, true)
 		err := tt.Run(events)
-		require.NoError(t, err)
+		ready <- err
+		if err != nil {
+			return
+		}
 		<-done
 		tt.Close()
 	}()
+	require.NoError(t, <-ready)
 
-	stop := func() {
-		done <- true
-	}
-
-	get := func() *Event {
+	// init() snapshots every host pid when tests share the host PID namespace.
+	// Drop that burst so the VM tests wait on events from the actions below.
+	drainUntil := time.Now().Add(2 * time.Second)
+	for time.Now().Before(drainUntil) {
 		select {
-		case e := <-events:
-			if verbose {
-				fmt.Printf("%+v\n", e)
-			}
-			return &e
-		case <-time.NewTimer(time.Second).C:
-			return nil
+		case <-events:
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
 
+	stop := func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+	get := func() *Event {
+		select {
+		case e := <-events:
+			return &e
+		case <-time.After(200 * time.Millisecond):
+			return nil
+		}
+	}
 	return get, stop
 }

@@ -31,14 +31,29 @@ go-test:
 # The agent only builds on linux, so on any other host `go test ./...` fails while
 # resolving platform-specific packages. This runs the same suite in a container.
 #
-# Tests that load programs into the kernel are gated behind VM, as they are when run
-# under Vagrant: `make docker-test VM=1`. They additionally need kernel BTF, so they
-# report themselves as skipped where the host kernel does not expose it.
+# VM=1 is always set: the ebpftracer tests load programs into the kernel.
+# Flags share host PID/cgroup/IPC/UTS namespaces and kernel debug filesystems
+# (Tetragon-style) so eBPF, /proc, and os.Getpid() see the same view as a
+# host process. Network stays in the container so `tc netem` on lo does not
+# break the host. The entrypoint still mounts tracefs/debugfs if missing.
 DOCKER_TEST_IMAGE ?= coroot-node-agent-test
-DOCKER_TEST_ARGS ?= ./...
-VM ?=
+DOCKER_TEST_ARGS ?= -count=1 -timeout 10m ./...
 
 .PHONY: docker-test
 docker-test:
 	docker build -f Dockerfile.test -t $(DOCKER_TEST_IMAGE) .
-	docker run --rm --privileged -e VM=$(VM) $(DOCKER_TEST_IMAGE) $(DOCKER_TEST_ARGS)
+	docker run --rm \
+		--privileged \
+		--pid=host \
+		--cgroupns=host \
+		--ipc=host \
+		--uts=host \
+		--security-opt apparmor=unconfined \
+		--security-opt seccomp=unconfined \
+		--ulimit memlock=-1 \
+		-v /sys/kernel/debug:/sys/kernel/debug \
+		-v /sys/kernel/tracing:/sys/kernel/tracing \
+		-v /sys/fs/bpf:/sys/fs/bpf \
+		-v /sys/kernel/btf:/sys/kernel/btf:ro \
+		-e VM=1 \
+		$(DOCKER_TEST_IMAGE) $(DOCKER_TEST_ARGS)
