@@ -289,6 +289,120 @@ func TestFileEvents(t *testing.T) {
 
 func TestHttpIngressEvents(t *testing.T) {
 	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	serverPid, addr, stopServer := startHTTPUsersServer(t)
+	defer stopServer()
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			ForceAttemptHTTP2: false,
+		},
+	}
+	resp, err := client.Get("http://" + addr + "/users")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	got := waitHTTP(t, getEvent, serverPid, true)
+	method, uri := l7.ParseHttp(got.L7Request.Payload)
+	require.Equal(t, "GET", method)
+	require.Equal(t, "/users", uri)
+	require.Equal(t, l7.Status(http.StatusOK), got.L7Request.Status)
+}
+
+func TestHttpEgressEvents(t *testing.T) {
+	skipIfNotVM(t)
+	clientSrc := `
+		package main
+
+		import (
+			"io"
+			"net/http"
+			"os"
+			"time"
+		)
+
+		func main() {
+			client := &http.Client{
+				Timeout: 5 * time.Second,
+				Transport: &http.Transport{
+					DisableKeepAlives: true,
+					ForceAttemptHTTP2: false,
+				},
+			}
+			resp, err := client.Get(os.Args[1])
+			if err != nil {
+				os.Exit(1)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				os.Exit(1)
+			}
+		}
+	`
+	dir := t.TempDir()
+	clientBin := path.Join(dir, "httpclient")
+	require.NoError(t, os.WriteFile(clientBin+".go", []byte(clientSrc), 0644))
+	out, err := exec.Command("go", "build", "-o", clientBin, clientBin+".go").CombinedOutput()
+	require.Equal(t, "", string(out))
+	require.NoError(t, err)
+
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	_, addr, stopServer := startHTTPUsersServer(t)
+	defer stopServer()
+
+	cmd := exec.Command(clientBin, "http://"+addr+"/users")
+	require.NoError(t, cmd.Start())
+	clientPid := uint32(cmd.Process.Pid)
+	require.NoError(t, cmd.Wait())
+
+	var conn, l7ev *Event
+	conns := map[uint64]Event{}
+	l7s := map[uint64]Event{}
+	waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		if e.Pid != clientPid {
+			return false
+		}
+		if e.Type == EventTypeConnectionOpen && addrMatches(e.DstAddr, addr) {
+			conns[e.Fd] = *e
+		}
+		if e.Type == EventTypeL7Request && e.L7Request != nil && !e.L7Request.IsInbound &&
+			e.L7Request.Protocol == l7.ProtocolHTTP {
+			method, uri := l7.ParseHttp(e.L7Request.Payload)
+			if method == "GET" && uri == "/users" {
+				req := *e.L7Request
+				ev := *e
+				ev.L7Request = &req
+				l7s[e.Fd] = ev
+			}
+		}
+		for fd, c := range conns {
+			if l, ok := l7s[fd]; ok {
+				cc, ll := c, l
+				conn, l7ev = &cc, &ll
+				return true
+			}
+		}
+		return false
+	})
+	require.Equal(t, conn.Fd, l7ev.Fd, "L7 egress should be on the same socket eBPF opened to the server")
+	require.Equal(t, addr, formatAddr(conn.DstAddr))
+	method, uri := l7.ParseHttp(l7ev.L7Request.Payload)
+	require.Equal(t, "GET", method)
+	require.Equal(t, "/users", uri)
+	require.Equal(t, l7.Status(http.StatusOK), l7ev.L7Request.Status)
+}
+
+func startHTTPUsersServer(t *testing.T) (uint32, string, func()) {
+	t.Helper()
 	src := `
 		package main
 
@@ -320,17 +434,14 @@ func TestHttpIngressEvents(t *testing.T) {
 	require.Equal(t, "", string(out))
 	require.NoError(t, err)
 
-	getEvent, stop := runTracer(t, false)
-	defer stop()
-
 	addrFile := path.Join(dir, "addr")
 	cmd := exec.Command(program, addrFile)
 	require.NoError(t, cmd.Start())
-	t.Cleanup(func() {
+	stop := func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-	})
-	pid := uint32(cmd.Process.Pid)
+	}
+	t.Cleanup(stop)
 
 	var addr string
 	deadline := time.Now().Add(5 * time.Second)
@@ -343,31 +454,21 @@ func TestHttpIngressEvents(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	require.NotEmpty(t, addr, "http helper did not write listen address")
+	return uint32(cmd.Process.Pid), addr, stop
+}
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-			ForceAttemptHTTP2: false,
-		},
-	}
-	resp, err := client.Get("http://" + addr + "/users")
-	require.NoError(t, err)
-	_, _ = io.Copy(io.Discard, resp.Body)
-	require.NoError(t, resp.Body.Close())
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+func waitHTTP(t *testing.T, get func() *Event, pid uint32, inbound bool) *Event {
+	t.Helper()
+	return waitFor(t, get, 15*time.Second, func(e *Event) bool {
 		if e.Type != EventTypeL7Request || e.Pid != pid || e.L7Request == nil {
 			return false
 		}
-		if e.L7Request.Protocol != l7.ProtocolHTTP || !e.L7Request.IsInbound {
+		if e.L7Request.Protocol != l7.ProtocolHTTP || e.L7Request.IsInbound != inbound {
 			return false
 		}
 		method, uri := l7.ParseHttp(e.L7Request.Payload)
 		return method == "GET" && uri == "/users"
 	})
-	require.Equal(t, l7.Status(http.StatusOK), got.L7Request.Status)
 }
 
 func tcpMatch(typ EventType, sAddr, dAddr string, eventPid uint32) func(*Event) bool {
