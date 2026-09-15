@@ -5,7 +5,9 @@ package ebpftracer
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/coroot/coroot-node-agent/common"
+	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/proc"
 
 	"github.com/containerd/cgroups"
@@ -115,7 +118,7 @@ func TestProcessEvents(t *testing.T) {
 	require.NoError(t, os.WriteFile(program+".go", []byte(src), 0644))
 	require.NoError(t, exec.Command("go", "build", "-o", program, program+".go").Run())
 
-	getEvent, stop := runTracer(t)
+	getEvent, stop := runTracer(t, true)
 	defer stop()
 
 	p := exec.Command(program, "1", "200ms")
@@ -136,7 +139,7 @@ func TestProcessEvents(t *testing.T) {
 
 func TestTcpEvents(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t)
+	getEvent, stop := runTracer(t, true)
 	defer stop()
 
 	pid := uint32(os.Getpid())
@@ -234,7 +237,7 @@ func TestFileEvents(t *testing.T) {
 	absBin, err := filepath.Abs("program")
 	require.NoError(t, err)
 
-	getEvent, stop := runTracer(t)
+	getEvent, stop := runTracer(t, true)
 	defer stop()
 
 	for _, call := range []int{syscall.SYS_OPEN, syscall.SYS_OPENAT} {
@@ -282,6 +285,89 @@ func TestFileEvents(t *testing.T) {
 			reap(done, false)
 		}
 	}
+}
+
+func TestHttpIngressEvents(t *testing.T) {
+	skipIfNotVM(t)
+	src := `
+		package main
+
+		import (
+			"net"
+			"net/http"
+			"os"
+		)
+
+		func main() {
+			ln, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				os.Exit(1)
+			}
+			if err := os.WriteFile(os.Args[1], []byte(ln.Addr().String()), 0644); err != nil {
+				os.Exit(1)
+			}
+			http.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("ok"))
+			})
+			_ = http.Serve(ln, nil)
+		}
+	`
+	dir := t.TempDir()
+	program := path.Join(dir, "httpserver")
+	require.NoError(t, os.WriteFile(program+".go", []byte(src), 0644))
+	out, err := exec.Command("go", "build", "-o", program, program+".go").CombinedOutput()
+	require.Equal(t, "", string(out))
+	require.NoError(t, err)
+
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addrFile := path.Join(dir, "addr")
+	cmd := exec.Command(program, addrFile)
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	pid := uint32(cmd.Process.Pid)
+
+	var addr string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(addrFile)
+		if err == nil && len(bytes.TrimSpace(b)) > 0 {
+			addr = string(bytes.TrimSpace(b))
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.NotEmpty(t, addr, "http helper did not write listen address")
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			ForceAttemptHTTP2: false,
+		},
+	}
+	resp, err := client.Get("http://" + addr + "/users")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		if e.Type != EventTypeL7Request || e.Pid != pid || e.L7Request == nil {
+			return false
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP || !e.L7Request.IsInbound {
+			return false
+		}
+		method, uri := l7.ParseHttp(e.L7Request.Payload)
+		return method == "GET" && uri == "/users"
+	})
+	require.Equal(t, l7.Status(http.StatusOK), got.L7Request.Status)
 }
 
 func tcpMatch(typ EventType, sAddr, dAddr string, eventPid uint32) func(*Event) bool {
@@ -343,6 +429,13 @@ func formatAddr(p netaddr.IPPort) string {
 	return netaddr.IPPortFrom(ip, p.Port()).String()
 }
 
+func truncateForLog(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "..."
+}
+
 func mustParseIPPort(s string) netaddr.IPPort {
 	p, err := netaddr.ParseIPPort(s)
 	if err != nil {
@@ -396,15 +489,21 @@ func waitFor(t *testing.T, get func() *Event, timeout time.Duration, match func(
 		}
 		interesting := e.Type == EventTypeListenOpen || e.Type == EventTypeListenClose ||
 			e.Type == EventTypeFileOpen || e.Type == EventTypeTCPRetransmit ||
-			e.Type == EventTypeConnectionError
+			e.Type == EventTypeConnectionError || e.Type == EventTypeL7Request
 		if !interesting && e.Type == EventTypeProcessStart {
 			continue
 		}
 		if !interesting && e.Type != EventTypeConnectionOpen && e.Type != EventTypeConnectionClose && e.Type != EventTypeProcessExit {
 			continue
 		}
-		seen = append(seen, fmt.Sprintf("%s pid=%d src=%s dst=%s fd=%d reason=%s",
-			e.Type, e.Pid, formatAddr(e.SrcAddr), formatAddr(e.DstAddr), e.Fd, e.Reason))
+		line := fmt.Sprintf("%s pid=%d src=%s dst=%s fd=%d reason=%s",
+			e.Type, e.Pid, formatAddr(e.SrcAddr), formatAddr(e.DstAddr), e.Fd, e.Reason)
+		if e.L7Request != nil {
+			method, uri := l7.ParseHttp(e.L7Request.Payload)
+			line += fmt.Sprintf(" proto=%s inbound=%v status=%s method=%s uri=%s payload=%q",
+				e.L7Request.Protocol, e.L7Request.IsInbound, e.L7Request.Status, method, uri, truncateForLog(e.L7Request.Payload, 64))
+		}
+		seen = append(seen, line)
 		if len(seen) > 24 {
 			seen = seen[1:]
 		}
@@ -461,7 +560,7 @@ func startInMemoryCgroup(t *testing.T, cmd *exec.Cmd, limit int64) {
 	}
 }
 
-func runTracer(t *testing.T) (func() *Event, func()) {
+func runTracer(t *testing.T, disableL7Tracing bool) (func() *Event, func()) {
 	t.Helper()
 	events := make(chan Event, 65536)
 	done := make(chan struct{})
@@ -477,7 +576,7 @@ func runTracer(t *testing.T) (func() *Event, func()) {
 	require.NoError(t, err)
 
 	go func() {
-		tt := NewTracer(hostNs, selfNs, true)
+		tt := NewTracer(hostNs, selfNs, disableL7Tracing)
 		err := tt.Run(events)
 		ready <- err
 		if err != nil {
