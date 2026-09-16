@@ -439,6 +439,41 @@ func TestHttp2EgressEvents(t *testing.T) {
 	require.Equal(t, l7.ProtocolHTTP2, l7ev.L7Request.Protocol)
 }
 
+func TestHttp2TlsIngressEvents(t *testing.T) {
+	skipIfNotVM(t)
+	tr, getEvent, stop := startTracer(t, false)
+	defer stop()
+
+	serverPid, addr, stopServer := startHTTP2TlsUsersServer(t)
+	defer stopServer()
+	attachGoTls(t, tr, serverPid)
+
+	clientBin := buildStdGoProg(t, "http2tlsclient", http2TlsClientSrc)
+	runHTTP2TlsClient(t, clientBin, addr, tr)
+
+	got := waitHTTP2(t, getEvent, serverPid, true)
+	require.Equal(t, l7.ProtocolHTTP2, got.L7Request.Protocol)
+	require.True(t, got.L7Request.IsInbound)
+}
+
+func TestHttp2TlsEgressEvents(t *testing.T) {
+	skipIfNotVM(t)
+	tr, getEvent, stop := startTracer(t, false)
+	defer stop()
+
+	_, addr, stopServer := startHTTP2TlsUsersServer(t)
+	defer stopServer()
+
+	clientBin := buildStdGoProg(t, "http2tlsclient", http2TlsClientSrc)
+	clientPid := runHTTP2TlsClient(t, clientBin, addr, tr)
+
+	conn, l7ev := waitHTTP2Egress(t, getEvent, clientPid, addr)
+	require.Equal(t, conn.Fd, l7ev.Fd, "L7 HTTP2 TLS egress should be on the same socket eBPF opened to the server")
+	require.Equal(t, addr, formatAddr(conn.DstAddr))
+	require.Equal(t, l7.ProtocolHTTP2, l7ev.L7Request.Protocol)
+	require.False(t, l7ev.L7Request.IsInbound)
+}
+
 func startHTTPUsersServer(t *testing.T) (uint32, string, func()) {
 	t.Helper()
 	src := `
@@ -534,6 +569,75 @@ func startHTTP2UsersServer(t *testing.T) (uint32, string, func()) {
 	}
 	require.NotEmpty(t, addr, "http2 helper did not write listen address")
 	return uint32(cmd.Process.Pid), addr, stop
+}
+
+func startHTTP2TlsUsersServer(t *testing.T) (uint32, string, func()) {
+	t.Helper()
+	program := buildStdGoProg(t, "http2tlsserver", http2TlsServerSrc)
+	certFile, keyFile := writeTlsTestCerts(t, path.Dir(program))
+
+	addrFile := path.Join(path.Dir(program), "addr")
+	cmd := exec.Command(program, addrFile, certFile, keyFile)
+	require.NoError(t, cmd.Start())
+	stop := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	t.Cleanup(stop)
+
+	var addr string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(addrFile)
+		if err == nil && len(bytes.TrimSpace(b)) > 0 {
+			addr = string(bytes.TrimSpace(b))
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.NotEmpty(t, addr, "http2 tls helper did not write listen address")
+	return uint32(cmd.Process.Pid), addr, stop
+}
+
+func runHTTP2TlsClient(t *testing.T, clientBin, addr string, tr *Tracer) uint32 {
+	t.Helper()
+	ready := path.Join(t.TempDir(), "ready")
+	cmd := exec.Command(clientBin, "https://"+addr+"/users", ready)
+	require.NoError(t, cmd.Start())
+	pid := uint32(cmd.Process.Pid)
+	attachGoTls(t, tr, pid)
+	require.NoError(t, os.WriteFile(ready, []byte("1"), 0644))
+	require.NoError(t, cmd.Wait())
+	return pid
+}
+
+func attachGoTls(t *testing.T, tr *Tracer, pid uint32) {
+	t.Helper()
+	key, isGo := tr.AttachGoTlsUprobes(pid)
+	require.True(t, isGo, "pid=%d is not a Go binary", pid)
+	require.NotNil(t, key, "failed to attach crypto/tls uprobes to pid=%d", pid)
+	t.Cleanup(func() { tr.ReleaseGlobalUprobes(*key) })
+}
+
+func writeTlsTestCerts(t *testing.T, dir string) (string, string) {
+	t.Helper()
+	certFile := path.Join(dir, "cert.pem")
+	keyFile := path.Join(dir, "key.pem")
+	require.NoError(t, os.WriteFile(certFile, []byte(tlsTestCertPEM), 0644))
+	require.NoError(t, os.WriteFile(keyFile, []byte(tlsTestKeyPEM), 0644))
+	return certFile, keyFile
+}
+
+func buildStdGoProg(t *testing.T, name, src string) string {
+	t.Helper()
+	dir := t.TempDir()
+	srcFile := path.Join(dir, name+".go")
+	require.NoError(t, os.WriteFile(srcFile, []byte(src), 0644))
+	bin := path.Join(dir, name)
+	out, err := exec.Command("go", "build", "-o", bin, srcFile).CombinedOutput()
+	require.Equal(t, "", string(out), "%s", out)
+	require.NoError(t, err)
+	return bin
 }
 
 func waitHTTP2(t *testing.T, get func() *Event, pid uint32, inbound bool) *Event {
@@ -699,6 +803,134 @@ func buildHTTP2Prog(t *testing.T, name, src string) string {
 	require.NoError(t, err, "%s", out)
 	return bin
 }
+
+const tlsTestCertPEM = `-----BEGIN CERTIFICATE-----
+MIIDGjCCAgKgAwIBAgIUGj7Ttd77TnhjjXX0PFpL6qO+4dAwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJMTI3LjAuMC4xMB4XDTI2MDkxNjA2NDkwMVoXDTM2MDkx
+MzA2NDkwMVowFDESMBAGA1UEAwwJMTI3LjAuMC4xMIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAklzAaoEVI+sHxe0CKNjhYS5c5o/LXi1n3MX/KxCcyqvr
+CjVeSaSZ1v9ncWCfIx0FKKwi21clEANyCSVOFCc/j5JVyTEpb9EGGSNvj7f0uJAt
+2XAdHa0snXyAjQ8obqC4pCNiuiAIGaO7UpI2ptZhfxAjqlfy9YA+d1OUcjxDMgtm
+p+bsFGJ1OmnO5aTE9ur+kSMFVv+UANm3xqA0AvyOzHFAiKTo6r7ol6gO1RPwjUec
+TT6ZV0W4e0NMWZ/6TSfmG5mFeGgfanW45jCPzXRd4b1Qb4ME1SIHTLnqSUE0wict
+LceqIkQN4TcpJr9HUhnGdGgAhs+B1jScUTC5qZjjKwIDAQABo2QwYjAdBgNVHQ4E
+FgQUiWPR+I6JYFjGBXZGqeheDLYkbHgwHwYDVR0jBBgwFoAUiWPR+I6JYFjGBXZG
+qeheDLYkbHgwDwYDVR0TAQH/BAUwAwEB/zAPBgNVHREECDAGhwR/AAABMA0GCSqG
+SIb3DQEBCwUAA4IBAQAQo9jRS07VPw06/r+dNGS9v4ws1dg6O6iNXMMC4i3uR4tN
+McYvuDuZHENZaA95+7TQowEYrCIW3dBSXT8KCBW3vO6Of5ofg+RutFLcIrPndi2N
+VDzitYY0iNTfQnv4hV+fvjydUfsmweWBbmzVYreUJBsNDnR2l0XdVI6GNU3jG/wX
+rp3GM758v6DpH1S1ae7BeMh/ANnelzkZqvtPbVyw1O9IZDyrO0pDU3sJpxCJG3mG
+dG7/NW5OWEpdw22uKPC/+Df0cHfi6N/3beDSSEj5yp8V+8T7KP6o849jl7pe0BmP
+D5WZJ7ebc44bitnajvDaueFhzgIxHKv0m0jmcotE
+-----END CERTIFICATE-----
+`
+
+const tlsTestKeyPEM = `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCSXMBqgRUj6wfF
+7QIo2OFhLlzmj8teLWfcxf8rEJzKq+sKNV5JpJnW/2dxYJ8jHQUorCLbVyUQA3IJ
+JU4UJz+PklXJMSlv0QYZI2+Pt/S4kC3ZcB0drSydfICNDyhuoLikI2K6IAgZo7tS
+kjam1mF/ECOqV/L1gD53U5RyPEMyC2an5uwUYnU6ac7lpMT26v6RIwVW/5QA2bfG
+oDQC/I7McUCIpOjqvuiXqA7VE/CNR5xNPplXRbh7Q0xZn/pNJ+YbmYV4aB9qdbjm
+MI/NdF3hvVBvgwTVIgdMuepJQTTCJy0tx6oiRA3hNykmv0dSGcZ0aACGz4HWNJxR
+MLmpmOMrAgMBAAECggEAFDYOtCZjHvSjvCdAdxeL9/mJBqWwta6bexc0Z2QB4tLe
+wCgifxTl0ZSvWi63iwfE4Jr0rUlZat6u7qhiIdJRqqfQhNnvGOvKZcpI65XBi4MN
+cctTmfeCA7VfoxsGwFAdbz0bswwdUj0T7xEVzvAnwn4eDrXabSBqf9vg0e2UceJ/
+lk89qdZsg1ODTGXdIm1euTQQSu+BeDEy5PnTW0gHqdXjXkHpX339uzTLtQqjQFvN
+R+XPd3/32ndtrlWJt4otw4nfh0+TZ5Tcuu5WihtC6pSVyVhmJYe98Ne3ZrNW2lk0
++UP6mZgpMNYIPE7NW9v9bH7mxYc9gWwi+1Hf2fQ1gQKBgQDObuOFwz9mSpVwCL9l
+iTYo2SNYoQ2w0VjqE4pVfcbh1jvZeFfFYVsODf2hwSeI0huRvxjy7YvKhgBSTyKg
+H+KV1NyaL8JVGo0OQfT5QLXdTX9cZoz5sK8wT2kJIpraL3HCco80hvqrGZrV8ftd
+okQaBOc5ivNG4Q+LIyLxhnx8CwKBgQC1gWfDhXdJuZLlZlbf5rSE+HizspzYKXzB
+h/SJkhHH1qcVXai+V3Pi4H4orwqNGUhIOuUdzgyL9WUkwvHk+vqZJwKIPqjEvC9g
+QHYoYvDwF5DTHE3rEQvyEnwJ/GyakVljpWmR5+x32pXJ49WS0369HH+5HGPsac/M
+OxktPaSJYQKBgC2Zxz7MI5woC5zFAeqfBcy+MpWodgrCI/8JM/ywnRdUKMJgWBss
+511Sb92kemQ57YcjjJJVMRUaxsVn38E5aecpL1YMCMSd6dzlawUIa2Qoc2Lo8GlT
+w09Lq2suLsDVzC5k+gdjbcoQDOkH3DwR1TNeM+m9LQJSQwm8SELML4GDAoGAC+it
+sjpzlTbD2KFaWd59Qaw73y589AHk2Z3eAZi/6ei/lbtLcxGx3NT18h1qB8/82iBj
+IA2A7T3woPTZgjilcJ8Kn33c/OuMADi6h/PV8yrYqcFVq3K24e8sjEsvpQScZNlZ
+j+Uzsrl40oJMZRHTYv0XtEGUnNJke/X0tO8yeIECgYEAoBbocG5qbvSvXHH/q90/
+DenRojKrafPeutedPQVk71RNufWfatBB4qqYHkT8V/wsX6cdq8co6zTKy+WBJweA
+5YFWkNvqXtky/dywpEyd1vpAsXMWRfahc2ZwTx6FOceVN5KmuxNoXlYStDgyTLzV
+ZUWufuwTfq1BQMxdYy2f9xA=
+-----END PRIVATE KEY-----
+`
+
+const http2TlsServerSrc = `package main
+
+import (
+	"crypto/tls"
+	"net"
+	"net/http"
+	"os"
+)
+
+func main() {
+	cert, err := tls.LoadX509KeyPair(os.Args[2], os.Args[3])
+	if err != nil {
+		os.Exit(1)
+	}
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		os.Exit(1)
+	}
+	if err := os.WriteFile(os.Args[1], []byte(ln.Addr().String()), 0644); err != nil {
+		os.Exit(1)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	srv := &http.Server{
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		},
+	}
+	_ = srv.ServeTLS(ln, "", "")
+}
+`
+
+const http2TlsClientSrc = `package main
+
+import (
+	"crypto/tls"
+	"io"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	ready := os.Args[2]
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			os.Exit(1)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+			ForceAttemptHTTP2: true,
+		},
+	}
+	resp, err := client.Get(os.Args[1])
+	if err != nil {
+		os.Exit(1)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+}
+`
 
 const http2ServerSrc = `package main
 
@@ -1116,9 +1348,19 @@ func startInMemoryCgroup(t *testing.T, cmd *exec.Cmd, limit int64) {
 
 func runTracer(t *testing.T, disableL7Tracing bool) (func() *Event, func()) {
 	t.Helper()
+	_, get, stop := startTracer(t, disableL7Tracing)
+	return get, stop
+}
+
+func startTracer(t *testing.T, disableL7Tracing bool) (*Tracer, func() *Event, func()) {
+	t.Helper()
 	events := make(chan Event, 65536)
 	done := make(chan struct{})
-	ready := make(chan error, 1)
+	type ready struct {
+		tr  *Tracer
+		err error
+	}
+	started := make(chan ready, 1)
 
 	var uname unix.Utsname
 	require.NoError(t, unix.Uname(&uname))
@@ -1132,14 +1374,15 @@ func runTracer(t *testing.T, disableL7Tracing bool) (func() *Event, func()) {
 	go func() {
 		tt := NewTracer(hostNs, selfNs, disableL7Tracing)
 		err := tt.Run(events)
-		ready <- err
+		started <- ready{tr: tt, err: err}
 		if err != nil {
 			return
 		}
 		<-done
 		tt.Close()
 	}()
-	require.NoError(t, <-ready)
+	r := <-started
+	require.NoError(t, r.err)
 
 	// init() snapshots every host pid when tests share the host PID namespace.
 	// Drop that burst so the VM tests wait on events from the actions below.
@@ -1166,5 +1409,5 @@ func runTracer(t *testing.T, disableL7Tracing bool) (func() *Event, func()) {
 			return nil
 		}
 	}
-	return get, stop
+	return r.tr, get, stop
 }
