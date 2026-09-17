@@ -403,6 +403,83 @@ func TestHttpEgressEvents(t *testing.T) {
 	require.Equal(t, l7.Status(http.StatusOK), l7ev.L7Request.Status)
 }
 
+func TestHttpPayloadCopies1024(t *testing.T) {
+	skipIfNotVM(t)
+
+	t.Run("write", func(t *testing.T) {
+		assertHTTPPayloadCopies1024(t, false)
+	})
+	t.Run("writev", func(t *testing.T) {
+		assertHTTPPayloadCopies1024(t, true)
+	})
+}
+
+func assertHTTPPayloadCopies1024(t *testing.T, writev bool) {
+	t.Helper()
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	_, addr, stopServer := startHTTPUsersServer(t)
+	defer stopServer()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const markerIdx = MaxPayloadSize - 1
+	req := paddedHTTPGetUsers(addr, MaxPayloadSize+400, markerIdx, 0x5a)
+	require.Equal(t, byte(0x5a), req[markerIdx])
+
+	tcp, ok := conn.(*net.TCPConn)
+	require.True(t, ok)
+	raw, err := tcp.SyscallConn()
+	require.NoError(t, err)
+
+	var wrote int
+	require.NoError(t, raw.Write(func(fd uintptr) bool {
+		var n int
+		var werr error
+		if writev {
+			n, werr = unix.Writev(int(fd), [][]byte{req[:MaxPayloadSize+10], req[MaxPayloadSize+10:]})
+		} else {
+			n, werr = unix.Write(int(fd), req)
+		}
+		require.NoError(t, werr)
+		wrote = n
+		return true
+	}))
+	require.Equal(t, len(req), wrote)
+
+	buf := make([]byte, 256)
+	_, err = conn.Read(buf)
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		if e.Type != EventTypeL7Request || e.Pid != pid || e.L7Request == nil {
+			return false
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP || e.L7Request.IsInbound {
+			return false
+		}
+		method, uri := l7.ParseHttp(e.L7Request.Payload)
+		return method == "GET" && uri == "/users"
+	})
+	require.Equal(t, MaxPayloadSize, len(got.L7Request.Payload), "captured payload must be 1024, not 1023")
+	require.Equal(t, byte(0x5a), got.L7Request.Payload[markerIdx])
+	require.Equal(t, l7.Status(http.StatusOK), got.L7Request.Status)
+}
+
+func paddedHTTPGetUsers(addr string, total, markerIdx int, marker byte) []byte {
+	head := fmt.Sprintf("GET /users HTTP/1.1\r\nHost: %s\r\nX-Pad: ", addr)
+	tail := "\r\n\r\n"
+	buf := bytes.Repeat([]byte{'a'}, total)
+	copy(buf, head)
+	copy(buf[len(buf)-len(tail):], tail)
+	buf[markerIdx] = marker
+	return buf
+}
+
 func TestHttp2IngressEvents(t *testing.T) {
 	skipIfNotVM(t)
 	getEvent, stop := runTracer(t, false)

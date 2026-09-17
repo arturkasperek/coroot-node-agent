@@ -5,7 +5,8 @@ import (
 )
 
 var (
-	kernelVersion Version
+	kernelVersion    Version
+	MinKernelVersion = NewVersion(6, 18, 0)
 )
 
 func SetKernelVersion(version string) error {
@@ -19,4 +20,11 @@ func SetKernelVersion(version string) error {
 
 func GetKernelVersion() Version {
 	return kernelVersion
+}
+
+func CheckKernelVersion() error {
+	if !GetKernelVersion().GreaterOrEqual(MinKernelVersion) {
+		return fmt.Errorf("the minimum Linux kernel version required is %s or later", MinKernelVersion)
+	}
+	return nil
 }

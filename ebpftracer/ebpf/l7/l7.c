@@ -28,19 +28,63 @@
 #define METHOD_HTTP2_CLIENT_FRAMES  5
 #define METHOD_HTTP2_SERVER_FRAMES  6
 
-#define TRUNCATE_PAYLOAD_SIZE(size) ({                                  \
-    size = MIN(size, MAX_PAYLOAD_SIZE-1);                               \
-    asm volatile ("%0 &= %1" : "+r"(size) : "i"(MAX_PAYLOAD_SIZE-1));   \
-})
-#define COPY_PAYLOAD(dst, size, src) ({     \
-    TRUNCATE_PAYLOAD_SIZE(size);            \
-    if (bpf_probe_read(dst, size, src)) {   \
-        return 0;                           \
-    }                                       \
-})
-
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
 #define MAX_IOVEC_SIZE 32
+
+static __always_inline
+__u32 payload_copy_len(__u64 size) {
+    __u32 n = MAX_PAYLOAD_SIZE;
+    if (size < MAX_PAYLOAD_SIZE) {
+        n = size;
+    }
+    asm volatile ("%0 &= %1" : "+r"(n) : "i"(IOVEC_BUF_SIZE - 1));
+    return n;
+}
+
+// noinline: a stack dynptr must not outlive this helper (inlining poisons later probe_read_str).
+static __attribute__((noinline))
+int copy_to_payload(char *dst, __u32 offset, __u32 size, const void *src) {
+    struct bpf_dynptr d;
+    if (!size) {
+        return 0;
+    }
+    if (bpf_dynptr_from_mem(dst, MAX_PAYLOAD_SIZE, 0, &d)) {
+        return -1;
+    }
+    if (bpf_probe_read_user_dynptr(&d, offset, size, src) &&
+        bpf_probe_read_kernel_dynptr(&d, offset, size, src)) {
+        return -1;
+    }
+    return 0;
+}
+
+static __always_inline
+int copy_payload(char *dst, __u64 *size, const void *src) {
+    __u32 n = payload_copy_len(*size);
+    if (copy_to_payload(dst, 0, n, src)) {
+        return -1;
+    }
+    *size = n;
+    return 0;
+}
+
+#define COPY_PAYLOAD(dst, size, src) ({                                 \
+    if (copy_payload((dst), &(size), (src))) {                          \
+        return 0;                                                       \
+    }                                                                   \
+})
+
+// Bound a payload offset for the verifier without clamping 1024 to 1023.
+// IOVEC_BUF_SIZE is 2048, so SIZE-1 keeps 1024 and still fits map+user reads.
+#define PAYLOAD_BOUND(size) ({                                          \
+    asm volatile ("%0 &= %1" : "+r"(size) : "i"(IOVEC_BUF_SIZE - 1));   \
+})
+
+#define PAYLOAD_READ(buf, off, dst) ({                                  \
+    __u32 __off = (off);                                                \
+    PAYLOAD_BOUND(__off);                                               \
+    bpf_read((buf) + __off, dst);                                       \
+})
 
 #include "http.c"
 #include "postgres.c"
@@ -190,12 +234,11 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
     bpf_perf_event_output(ctx, &l7_events, BPF_F_CURRENT_CPU, e, sizeof(*e));
 }
 
-static inline __attribute__((__always_inline__))
+static __always_inline
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
     struct iovec iov = {};
-    __u64 max = (ret) ? MIN(ret, MAX_PAYLOAD_SIZE) : MAX_PAYLOAD_SIZE;
-    __u64 offset = 0;
-    __u64 size = 0;
+    __u32 max = payload_copy_len(ret ? ret : MAX_PAYLOAD_SIZE);
+    __u32 offset = 0;
     #pragma unroll
     for (int i = 0; i < MAX_IOVEC_SIZE; i++) {
         if (i >= iovlen) {
@@ -209,10 +252,11 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
         }
         *total_size += iov.size;
         if (offset < max) {
-            size = MIN(iov.size, max-offset);
-            TRUNCATE_PAYLOAD_SIZE(size);
-            TRUNCATE_PAYLOAD_SIZE(offset);
-            if (bpf_probe_read(buf + offset, size, (void *)iov.buf)) {
+            __u32 size = payload_copy_len(max - offset);
+            if (iov.size < size) {
+                size = iov.size;
+            }
+            if (copy_to_payload(buf, offset, size, (void *)iov.buf)) {
                 return 0;
             }
             offset += size;

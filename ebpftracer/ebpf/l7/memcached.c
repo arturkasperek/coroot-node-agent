@@ -7,8 +7,11 @@ int is_memcached_query(char *buf, __u64 buf_size) {
     char b[7];
     bpf_read(buf, b);
     char end[2];
-    TRUNCATE_PAYLOAD_SIZE(buf_size);
-    bpf_read(buf+buf_size-2, end);
+    __u32 tail = payload_copy_len(buf_size);
+    if (tail < 2) {
+        return 0;
+    }
+    PAYLOAD_READ(buf, tail-2, end);
     if (end[0] != '\r' || end[1] != '\n') {
         return 0;
     }
@@ -53,8 +56,11 @@ int is_memcached_response(char *buf, __u64 buf_size, __s32 *status) {
     char r[3];
     bpf_read(buf, r);
     char end[2];
-    TRUNCATE_PAYLOAD_SIZE(buf_size);
-    bpf_read(buf+buf_size-2, end);
+    __u32 tail = payload_copy_len(buf_size);
+    if (tail < 2) {
+        return 0;
+    }
+    PAYLOAD_READ(buf, tail-2, end);
     if (end[0] != '\r' || end[1] != '\n') {
         return 0;
     }

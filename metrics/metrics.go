@@ -62,6 +62,10 @@ var (
 
 	Ip2Fqdn = metric("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", "ip", "fqdn")
 
+	EbpfLostSamples           = metric("node_ebpf_lost_samples_total", "Total number of events the kernel dropped because a perf buffer was full")
+	L7PayloadsTruncated       = metric("node_l7_payloads_truncated_total", "Total number of L7 events whose payload was truncated to 1024 bytes")
+	GoTlsUprobeAttachFailures = metric("node_go_tls_uprobe_attach_failures_total", "Total number of Go binaries where crypto/tls uprobes could not be attached (typically stripped binaries)")
+
 	PythonThreadLockWaitTime   = metric("container_python_thread_lock_wait_time_seconds", "Time spent waiting acquiring GIL in seconds")
 	NodejsEventLoopBlockedTime = metric("container_nodejs_event_loop_blocked_time_seconds_total", "Total time the Node.js event loop spent blocked")
 

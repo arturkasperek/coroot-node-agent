@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -104,6 +105,10 @@ type Tracer struct {
 
 	globalUprobes     map[UprobeKey]*globalUprobe
 	globalUprobesLock sync.Mutex
+
+	lostSamples         atomic.Uint64
+	truncatedPayloads   atomic.Uint64
+	goTlsAttachFailures atomic.Uint64
 }
 
 func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
@@ -205,6 +210,36 @@ func (t *Tracer) ActiveConnectionsIterator() *ebpf.MapIterator {
 
 func (t *Tracer) DeleteActiveConnection(cid ConnectionId) error {
 	return t.collection.Maps["active_connections"].Delete(&cid)
+}
+
+func (t *Tracer) LostSamples() uint64 {
+	return t.lostSamples.Load()
+}
+
+func (t *Tracer) TruncatedPayloads() uint64 {
+	return t.truncatedPayloads.Load()
+}
+
+func (t *Tracer) GoTlsAttachFailures() uint64 {
+	return t.goTlsAttachFailures.Load()
+}
+
+func copiedPayload(payload []byte, payloadSize uint64) []byte {
+	n := len(payload)
+	if n > MaxPayloadSize {
+		n = MaxPayloadSize
+	}
+	if payloadSize < uint64(n) {
+		n = int(payloadSize)
+	}
+	if n == 0 {
+		return nil
+	}
+	return payload[:n]
+}
+
+func payloadTruncated(payloadSize uint64, copied int) bool {
+	return payloadSize > uint64(copied)
 }
 
 func (t *Tracer) NodejsStatsIterator() *ebpf.MapIterator {
@@ -332,7 +367,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
 		}
 		t.readers[pm.name] = r
-		go runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
+		go t.runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
 	}
 
 	t.collectionSpec = collectionSpec
@@ -460,7 +495,7 @@ type l7Event struct {
 	PayloadSize         uint64
 }
 
-func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
+func (t *Tracer) runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
 	if readTimeout == 0 {
 		readTimeout = 100 * time.Millisecond
 	}
@@ -474,6 +509,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			continue
 		}
 		if rec.LostSamples > 0 {
+			t.lostSamples.Add(rec.LostSamples)
 			klog.Errorln(name, "lost samples:", rec.LostSamples)
 			continue
 		}
@@ -487,7 +523,10 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
-			payload := reader.Bytes()
+			payload := copiedPayload(reader.Bytes(), v.PayloadSize)
+			if payloadTruncated(v.PayloadSize, len(payload)) {
+				t.truncatedPayloads.Add(1)
+			}
 			req := &l7.RequestData{
 				Protocol:    l7.Protocol(v.Protocol),
 				Status:      l7.Status(v.Status),
@@ -495,13 +534,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				Method:      l7.Method(v.Method),
 				StatementId: v.StatementId,
 				IsInbound:   v.IsInbound != 0,
-			}
-			switch {
-			case v.PayloadSize == 0:
-			case v.PayloadSize > MaxPayloadSize:
-				req.Payload = payload[:MaxPayloadSize]
-			default:
-				req.Payload = payload[:v.PayloadSize]
+				Payload:     payload,
 			}
 			event = Event{Type: EventTypeL7Request, Pid: v.Pid, Fd: v.Fd, Timestamp: v.ConnectionTimestamp, L7Request: req}
 		case perfMapTypeFileEvents:

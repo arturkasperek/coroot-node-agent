@@ -5,7 +5,7 @@ Below are some basic guidelines.
 
 
 ## Requirements
-* Linux ≥v5.1 (amd64, arm64)
+* Linux ≥v6.18 (amd64, arm64)
 * Go v1.23
 
 

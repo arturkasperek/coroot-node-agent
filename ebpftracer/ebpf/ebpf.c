@@ -5,6 +5,14 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
 
+#if defined(__TARGET_ARCH_arm64) && !defined(PT_REGS_ARM64)
+#define PT_REGS_ARM64 struct user_pt_regs
+#endif
+
+/* Linux 6.16+: kfuncs, u32 off/size (u64 from 6.19). */
+extern int bpf_probe_read_user_dynptr(struct bpf_dynptr *dptr, __u32 off, __u32 size, const void *unsafe_ptr) __ksym;
+extern int bpf_probe_read_kernel_dynptr(struct bpf_dynptr *dptr, __u32 off, __u32 size, const void *unsafe_ptr) __ksym;
+
 #define EVENT_TYPE_PROCESS_START	    1
 #define EVENT_TYPE_PROCESS_EXIT		    2
 #define EVENT_TYPE_CONNECTION_OPEN	    3
@@ -27,6 +35,7 @@
     }                                                 \
 })
 
+#undef bpf_printk
 #define bpf_printk(fmt, ...)                                   \
 ({                                                             \
     char ____fmt[] = fmt;                                      \

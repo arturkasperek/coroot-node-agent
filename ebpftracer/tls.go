@@ -167,6 +167,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) (*UprobeKey, bool) {
 		ef, err := OpenELFFile(exePath)
 		if err != nil {
 			log("failed to open as elf binary", err)
+			t.goTlsAttachFailures.Add(1)
 			return nil
 		}
 		defer ef.Close()
@@ -176,9 +177,11 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) (*UprobeKey, bool) {
 			{symbol: goTlsReadSymbol, uprobe: "go_crypto_tls_read_enter"},
 			{symbol: goTlsReadSymbol, uretprobe: "go_crypto_tls_read_exit"},
 		}, log)
-		if len(links) > 0 {
-			log("crypto/tls uprobes attached", nil)
+		if len(links) == 0 {
+			t.goTlsAttachFailures.Add(1)
+			return nil
 		}
+		log("crypto/tls uprobes attached", nil)
 		return links
 	})
 	if ok {

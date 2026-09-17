@@ -145,6 +145,9 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 
 func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.Ip2Fqdn
+	ch <- metrics.EbpfLostSamples
+	ch <- metrics.L7PayloadsTruncated
+	ch <- metrics.GoTlsUprobeAttachFailures
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
@@ -154,6 +157,11 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 		if domain.SpecifyIP {
 			ch <- metrics.Gauge(metrics.Ip2Fqdn, 1, ip.String(), domain.FQDN)
 		}
+	}
+	if r.tracer != nil {
+		ch <- metrics.Counter(metrics.EbpfLostSamples, float64(r.tracer.LostSamples()))
+		ch <- metrics.Counter(metrics.L7PayloadsTruncated, float64(r.tracer.TruncatedPayloads()))
+		ch <- metrics.Counter(metrics.GoTlsUprobeAttachFailures, float64(r.tracer.GoTlsAttachFailures()))
 	}
 }
 

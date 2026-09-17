@@ -1,5 +1,5 @@
 #define MAX_CONNECTIONS 1000000
-#define MAX_PAYLOAD_SIZE 1024 // must be power of 2
+#define MAX_PAYLOAD_SIZE 1024
 
 struct tcp_event {
     __u64 fd;
@@ -42,11 +42,7 @@ struct trace_event_raw_inet_sock_set_state__stub {
     __u16 sport;
     __u16 dport;
     __u16 family;
-#if __KERNEL_FROM >= 506
     __u16 protocol;
-#else
-    __u8 protocol;
-#endif
     __u8 saddr[4];
     __u8 daddr[4];
     __u8 saddr_v6[16];

@@ -22,8 +22,11 @@ int is_postgres_query(char *buf, __u64 buf_size, __u8 *request_type) {
         return 1;
     }
     char sync[5];
-    TRUNCATE_PAYLOAD_SIZE(buf_size);
-    bpf_read(buf+buf_size-5, sync);
+    __u32 tail = payload_copy_len(buf_size);
+    if (tail < 5) {
+        return 0;
+    }
+    PAYLOAD_READ(buf, tail-5, sync);
     if (sync[0] == 'S' && sync[1] == 0 && sync[2] == 0 && sync[3] == 0 && sync[4] == 4) {
         *request_type = f_cmd;
         return 1;

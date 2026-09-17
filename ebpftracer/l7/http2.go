@@ -86,11 +86,11 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 			Flags:    http2.Flags(payload[offset+4]),
 			StreamId: binary.BigEndian.Uint32(payload[offset+5:]) & (1<<31 - 1),
 		}
+		if len(payload)-offset-http2FrameHeaderLength < h.Length {
+			break
+		}
 		offset += http2FrameHeaderLength
 		if h.Type != http2.FrameHeaders {
-			if len(payload)-offset < h.Length {
-				break
-			}
 			offset += h.Length
 			continue
 		}
@@ -133,13 +133,11 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 			})
 		}
 		next := offset + h.Length
-		if next > len(payload) {
-			next = len(payload)
-		}
-		if _, err := decoder.Write(payload[offset:next]); err != nil {
+		_, err := decoder.Write(payload[offset:next])
+		offset = next
+		if err != nil {
 			continue
 		}
-		offset = next
 	}
 	var res []Http2Request
 	for streamId, status := range statuses {

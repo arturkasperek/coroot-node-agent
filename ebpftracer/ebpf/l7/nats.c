@@ -8,8 +8,11 @@ int nats_method(char *buf, __u64 buf_size) {
     char b[5];
     bpf_read(buf, b);
     char end[2];
-    TRUNCATE_PAYLOAD_SIZE(buf_size);
-    bpf_read(buf+buf_size-2, end);
+    __u32 tail = payload_copy_len(buf_size);
+    if (tail < 2) {
+        return 0;
+    }
+    PAYLOAD_READ(buf, tail-2, end);
     if (end[0] != '\r' || end[1] != '\n') {
         return 0;
     }

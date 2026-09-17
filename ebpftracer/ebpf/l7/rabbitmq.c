@@ -26,8 +26,7 @@ int is_rabbitmq_method_frame(char *buf, __u64 buf_size) {
         return 0;
     }
     __u8 end = 0;
-    TRUNCATE_PAYLOAD_SIZE(size);
-    bpf_read(buf+7+size, end);
+    PAYLOAD_READ(buf, 7+size, end);
     if (end != RABBITMQ_FRAME_END) {
         return 0;
     }
