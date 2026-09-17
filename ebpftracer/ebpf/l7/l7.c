@@ -115,7 +115,6 @@ struct l7_event {
     __u8 padding;
     __u32 statement_id;
     __u64 payload_size;
-    char payload[MAX_PAYLOAD_SIZE];
 };
 
 struct {
@@ -125,11 +124,19 @@ struct {
      __uint(max_entries, 1);
 } l7_event_heap SEC(".maps");
 
+#define L7_EVENTS_RINGBUF_SIZE (16 * 1024 * 1024)
+
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(int));
-    __uint(value_size, sizeof(int));
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, L7_EVENTS_RINGBUF_SIZE);
 } l7_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 1);
+} l7_events_dropped SEC(".maps");
 
 struct read_args {
     __u64 fd;
@@ -226,13 +233,66 @@ struct user_msghdr {
     __u32 msg_flags;
 };
 
-static inline __attribute__((__always_inline__))
-void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct connection *conn) {
-    e->connection_timestamp = conn->timestamp;
-    e->fd = cid.fd;
-    e->pid = cid.pid;
-    bpf_perf_event_output(ctx, &l7_events, BPF_F_CURRENT_CPU, e, sizeof(*e));
+// BPF noinline functions take at most 5 arguments, so emit args are packed here.
+// SEND_EVENT fills this on the caller stack and passes one pointer.
+struct l7_send_args {
+    struct l7_event *e;
+    struct connection_id cid;
+    struct connection *conn;
+    const void *src;
+    __u64 size;
+};
+
+static __always_inline
+void l7_drop_event(void) {
+    __u32 zero = 0;
+    __u64 *n = bpf_map_lookup_elem(&l7_events_dropped, &zero);
+    if (n) {
+        __sync_fetch_and_add(n, 1);
+    }
 }
+
+// noinline: the reserved ringbuf dynptr must be submit/discarded here; inlining
+// poisons later probe_read_str. One pointer arg because BPF caps noinline at 5.
+static __attribute__((noinline))
+void send_event(struct l7_send_args *a) {
+    struct bpf_dynptr d = {};
+    struct l7_event *e = a->e;
+    __u32 n = payload_copy_len(a->size);
+    __u32 rec = sizeof(*e) + n;
+
+    e->connection_timestamp = a->conn->timestamp;
+    e->fd = a->cid.fd;
+    e->pid = a->cid.pid;
+    e->payload_size = a->size;
+
+    if (bpf_ringbuf_reserve_dynptr(&l7_events, rec, 0, &d)) {
+        l7_drop_event();
+        bpf_ringbuf_discard_dynptr(&d, 0);
+        return;
+    }
+    if (bpf_dynptr_write(&d, 0, e, sizeof(*e), 0)) {
+        bpf_ringbuf_discard_dynptr(&d, 0);
+        return;
+    }
+    if (n &&
+        bpf_probe_read_user_dynptr(&d, sizeof(*e), n, a->src) &&
+        bpf_probe_read_kernel_dynptr(&d, sizeof(*e), n, a->src)) {
+        bpf_ringbuf_discard_dynptr(&d, 0);
+        return;
+    }
+    bpf_ringbuf_submit_dynptr(&d, 0);
+}
+
+// Packs send_event args. Underscored names so the preprocessor does not rewrite
+// designated initializers (.src / .size) when the call site uses those tokens.
+#define SEND_EVENT(_e, _cid, _conn, _src, _n) ({                        \
+    struct l7_send_args __a = {                                         \
+        .e = (_e), .cid = (_cid), .conn = (_conn),                      \
+        .src = (_src), .size = (_n),                                    \
+    };                                                                  \
+    send_event(&__a);                                                   \
+})
 
 static __always_inline
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
@@ -372,9 +432,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
             e->protocol = PROTOCOL_POSTGRES;
             e->method = METHOD_STATEMENT_CLOSE;
             e->is_inbound = 0;
-            e->payload_size = size;
-            COPY_PAYLOAD(e->payload, size, payload);
-            send_event(ctx, e, cid, conn);
+            SEND_EVENT(e, cid, conn, payload, size);
             return 0;
         }
         req->protocol = PROTOCOL_POSTGRES;
@@ -394,9 +452,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
             e->protocol = PROTOCOL_MYSQL;
             e->method = METHOD_STATEMENT_CLOSE;
             e->is_inbound = 0;
-            e->payload_size = size;
-            COPY_PAYLOAD(e->payload, size, payload);
-            send_event(ctx, e, cid, conn);
+            SEND_EVENT(e, cid, conn, payload, size);
             return 0;
         }
         req->protocol = PROTOCOL_MYSQL;
@@ -412,7 +468,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
             e->method = METHOD_PRODUCE;
             e->status = STATUS_OK;
             e->is_inbound = 0;
-            send_event(ctx, e, cid, conn);
+            SEND_EVENT(e, cid, conn, 0, 0);
         }
         return 0;
     } else if (!conn->is_inbound && nats_method(payload, size) == METHOD_PRODUCE) {
@@ -424,7 +480,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
         e->method = METHOD_PRODUCE;
         e->status = STATUS_OK;
         e->is_inbound = 0;
-        send_event(ctx, e, cid, conn);
+        SEND_EVENT(e, cid, conn, 0, 0);
         return 0;
     } else if (is_cassandra_request(payload, size, &k.stream_id)) {
         req->protocol = PROTOCOL_CASSANDRA;
@@ -437,9 +493,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
         e->method = METHOD_HTTP2_CLIENT_FRAMES;
         e->is_inbound = conn->is_inbound;
         e->duration = bpf_ktime_get_ns();
-        e->payload_size = size;
-        COPY_PAYLOAD(e->payload, size, payload);
-        send_event(ctx, e, cid, conn);
+        SEND_EVENT(e, cid, conn, payload, size);
         return 0;
     } else if (is_clickhouse_query(payload, size)) {
         req->protocol = PROTOCOL_CLICKHOUSE;
@@ -585,7 +639,7 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
                 e->protocol = PROTOCOL_RABBITMQ;
                 e->method = METHOD_CONSUME;
                 e->status = STATUS_OK;
-                send_event(ctx, e, cid, conn);
+                SEND_EVENT(e, cid, conn, 0, 0);
             }
             return 0;
         }
@@ -593,7 +647,7 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
             e->protocol = PROTOCOL_NATS;
             e->method = METHOD_CONSUME;
             e->status = STATUS_OK;
-            send_event(ctx, e, cid, conn);
+            SEND_EVENT(e, cid, conn, 0, 0);
             return 0;
         }
     }
@@ -608,9 +662,7 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
             }
             e->protocol = PROTOCOL_DNS;
             e->duration = bpf_ktime_get_ns() - req->ns;
-            e->payload_size = ret;
-            COPY_PAYLOAD(e->payload, ret, payload);
-            send_event(ctx, e, cid, conn);
+            SEND_EVENT(e, cid, conn, payload, ret);
             bpf_map_delete_elem(&active_l7_requests, &k);
             return 0;
         } else if (is_cassandra_response(payload, ret, &k.stream_id, &e->status)) {
@@ -623,9 +675,7 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
             e->protocol = PROTOCOL_HTTP2;
             e->method = METHOD_HTTP2_SERVER_FRAMES;
             e->duration = bpf_ktime_get_ns();
-            e->payload_size = ret;
-            COPY_PAYLOAD(e->payload, ret, payload);
-            send_event(ctx, e, cid, conn);
+            SEND_EVENT(e, cid, conn, payload, ret);
             return 0;
         } else {
             return 0;
@@ -633,8 +683,6 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
     }
 
     e->protocol = req->protocol;
-    e->payload_size = req->payload_size;
-    COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
     } else if (e->protocol == PROTOCOL_POSTGRES) {
@@ -678,12 +726,13 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
             return 0; // keeping the query in the map
         }
     }
-    bpf_map_delete_elem(&active_l7_requests, &k);
     if (!response) {
+        bpf_map_delete_elem(&active_l7_requests, &k);
         return 0;
     }
     e->duration = bpf_ktime_get_ns() - req->ns;
-    send_event(ctx, e, cid, conn);
+    SEND_EVENT(e, cid, conn, req->payload, req->payload_size);
+    bpf_map_delete_elem(&active_l7_requests, &k);
     return 0;
 }
 

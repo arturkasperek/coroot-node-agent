@@ -21,6 +21,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -79,7 +80,6 @@ const (
 	perfMapTypeProcEvents perfMapType = 1
 	perfMapTypeTCPEvents  perfMapType = 2
 	perfMapTypeFileEvents perfMapType = 3
-	perfMapTypeL7Events   perfMapType = 4
 )
 
 type UprobeKey struct {
@@ -100,6 +100,7 @@ type Tracer struct {
 	collectionSpec *ebpf.CollectionSpec
 	collection     *ebpf.Collection
 	readers        map[string]*perf.Reader
+	l7Reader       *ringbuf.Reader
 	links          []link.Link
 	uprobes        map[string]*ebpf.Program
 
@@ -151,6 +152,9 @@ func (t *Tracer) Close() {
 	}
 	for _, r := range t.readers {
 		_ = r.Close()
+	}
+	if t.l7Reader != nil {
+		_ = t.l7Reader.Close()
 	}
 	t.globalUprobesLock.Lock()
 	for _, gu := range t.globalUprobes {
@@ -213,7 +217,26 @@ func (t *Tracer) DeleteActiveConnection(cid ConnectionId) error {
 }
 
 func (t *Tracer) LostSamples() uint64 {
-	return t.lostSamples.Load()
+	return t.lostSamples.Load() + t.l7RingbufDrops()
+}
+
+func (t *Tracer) l7RingbufDrops() uint64 {
+	if t.collection == nil {
+		return 0
+	}
+	m := t.collection.Maps["l7_events_dropped"]
+	if m == nil {
+		return 0
+	}
+	var values []uint64
+	if err := m.Lookup(uint32(0), &values); err != nil {
+		return 0
+	}
+	var n uint64
+	for _, v := range values {
+		n += v
+	}
+	return n
 }
 
 func (t *Tracer) TruncatedPayloads() uint64 {
@@ -222,6 +245,26 @@ func (t *Tracer) TruncatedPayloads() uint64 {
 
 func (t *Tracer) GoTlsAttachFailures() uint64 {
 	return t.goTlsAttachFailures.Load()
+}
+
+func parseL7Event(raw []byte) (*Event, bool, error) {
+	v := l7Event{}
+	reader := bytes.NewBuffer(raw)
+	if err := binary.Read(reader, binary.LittleEndian, &v); err != nil {
+		return nil, false, err
+	}
+	payload := copiedPayload(reader.Bytes(), v.PayloadSize)
+	req := &l7.RequestData{
+		Protocol:    l7.Protocol(v.Protocol),
+		Status:      l7.Status(v.Status),
+		Duration:    time.Duration(v.Duration),
+		Method:      l7.Method(v.Method),
+		StatementId: v.StatementId,
+		IsInbound:   v.IsInbound != 0,
+		Payload:     payload,
+	}
+	return &Event{Type: EventTypeL7Request, Pid: v.Pid, Fd: v.Fd, Timestamp: v.ConnectionTimestamp, L7Request: req},
+		payloadTruncated(v.PayloadSize, len(payload)), nil
 }
 
 func copiedPayload(payload []byte, payloadSize uint64) []byte {
@@ -355,10 +398,6 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		{name: "file_events", typ: perfMapTypeFileEvents, perCPUBufferSizePages: 4},
 	}
 
-	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 32})
-	}
-
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
 		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
@@ -368,6 +407,16 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		}
 		t.readers[pm.name] = r
 		go t.runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
+	}
+
+	if !t.disableL7Tracing {
+		rd, err := ringbuf.NewReader(t.collection.Maps["l7_events"])
+		if err != nil {
+			t.Close()
+			return fmt.Errorf("failed to create l7 ringbuf reader: %w", err)
+		}
+		t.l7Reader = rd
+		go t.runL7EventsReader(rd, ch)
 	}
 
 	t.collectionSpec = collectionSpec
@@ -516,27 +565,6 @@ func (t *Tracer) runEventsReader(name string, r *perf.Reader, ch chan<- Event, t
 		var event Event
 
 		switch typ {
-		case perfMapTypeL7Events:
-			v := &l7Event{}
-			reader := bytes.NewBuffer(rec.RawSample)
-			if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
-				klog.Warningln("failed to read msg:", err)
-				continue
-			}
-			payload := copiedPayload(reader.Bytes(), v.PayloadSize)
-			if payloadTruncated(v.PayloadSize, len(payload)) {
-				t.truncatedPayloads.Add(1)
-			}
-			req := &l7.RequestData{
-				Protocol:    l7.Protocol(v.Protocol),
-				Status:      l7.Status(v.Status),
-				Duration:    time.Duration(v.Duration),
-				Method:      l7.Method(v.Method),
-				StatementId: v.StatementId,
-				IsInbound:   v.IsInbound != 0,
-				Payload:     payload,
-			}
-			event = Event{Type: EventTypeL7Request, Pid: v.Pid, Fd: v.Fd, Timestamp: v.ConnectionTimestamp, L7Request: req}
 		case perfMapTypeFileEvents:
 			v := &fileEvent{}
 			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
@@ -579,6 +607,28 @@ func (t *Tracer) runEventsReader(name string, r *perf.Reader, ch chan<- Event, t
 		}
 
 		ch <- event
+	}
+}
+
+func (t *Tracer) runL7EventsReader(r *ringbuf.Reader, ch chan<- Event) {
+	for {
+		r.SetDeadline(time.Now().Add(100 * time.Millisecond))
+		rec, err := r.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				break
+			}
+			continue
+		}
+		event, truncated, err := parseL7Event(rec.RawSample)
+		if err != nil {
+			klog.Warningln("failed to read l7 ringbuf record:", err)
+			continue
+		}
+		if truncated {
+			t.truncatedPayloads.Add(1)
+		}
+		ch <- *event
 	}
 }
 
