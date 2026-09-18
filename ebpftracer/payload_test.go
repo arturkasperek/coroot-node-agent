@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/stretchr/testify/require"
@@ -94,6 +95,64 @@ func TestParseL7EventHeaderOnly(t *testing.T) {
 func TestParseL7EventTooShort(t *testing.T) {
 	_, _, err := parseL7Event([]byte{1, 2, 3})
 	require.Error(t, err)
+}
+
+func TestParseTcpEventSize(t *testing.T) {
+	require.Equal(t, 110, binary.Size(tcpEvent{}))
+}
+
+func TestParseTcpEventConnectionOpen(t *testing.T) {
+	raw := encodeTcpSample(t, tcpEvent{
+		Fd:        9,
+		Timestamp: 111,
+		Duration:  222,
+		Type:      EventTypeConnectionOpen,
+		Pid:       4242,
+		SPort:     12345,
+		DPort:     80,
+		SAddr:     [16]byte{127, 0, 0, 1},
+		DAddr:     [16]byte{10, 0, 0, 2},
+	})
+	got, err := parseTcpEvent(raw)
+	require.NoError(t, err)
+	require.Equal(t, EventTypeConnectionOpen, got.Type)
+	require.Equal(t, uint32(4242), got.Pid)
+	require.Equal(t, uint64(9), got.Fd)
+	require.Equal(t, uint64(111), got.Timestamp)
+	require.Equal(t, time.Duration(222), got.Duration)
+	require.Nil(t, got.TrafficStats)
+	require.Equal(t, uint16(12345), got.SrcAddr.Port())
+	require.Equal(t, uint16(80), got.DstAddr.Port())
+}
+
+func TestParseTcpEventConnectionCloseHasTraffic(t *testing.T) {
+	raw := encodeTcpSample(t, tcpEvent{
+		Type:          EventTypeConnectionClose,
+		Pid:           7,
+		Fd:            3,
+		BytesSent:     100,
+		BytesReceived: 200,
+		IsInbound:     1,
+	})
+	got, err := parseTcpEvent(raw)
+	require.NoError(t, err)
+	require.Equal(t, EventTypeConnectionClose, got.Type)
+	require.True(t, got.IsInbound)
+	require.NotNil(t, got.TrafficStats)
+	require.Equal(t, uint64(100), got.TrafficStats.BytesSent)
+	require.Equal(t, uint64(200), got.TrafficStats.BytesReceived)
+}
+
+func TestParseTcpEventTooShort(t *testing.T) {
+	_, err := parseTcpEvent([]byte{1, 2, 3})
+	require.Error(t, err)
+}
+
+func encodeTcpSample(t *testing.T, v tcpEvent) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, binary.Write(&buf, binary.LittleEndian, &v))
+	return buf.Bytes()
 }
 
 func encodeL7Sample(t *testing.T, hdr l7Event, payload []byte) []byte {

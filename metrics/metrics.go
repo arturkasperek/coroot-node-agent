@@ -62,7 +62,7 @@ var (
 
 	Ip2Fqdn = metric("ip_to_fqdn", "Mapping IP addresses to FQDNs based on DNS requests initiated by containers", "ip", "fqdn")
 
-	EbpfLostSamples           = metric("node_ebpf_lost_samples_total", "Total number of events the kernel dropped because a perf or L7 ring buffer was full")
+	EbpfLostSamples           = metric("node_ebpf_lost_samples_total", "Total number of events the kernel dropped because a perf, L7, or TCP-connect ring buffer was full")
 	L7PayloadsTruncated       = metric("node_l7_payloads_truncated_total", "Total number of L7 events whose payload was truncated to 1024 bytes")
 	GoTlsUprobeAttachFailures = metric("node_go_tls_uprobe_attach_failures_total", "Total number of Go binaries where crypto/tls uprobes could not be attached (typically stripped binaries)")
 

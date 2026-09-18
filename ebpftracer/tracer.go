@@ -97,12 +97,13 @@ type Tracer struct {
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 
-	collectionSpec *ebpf.CollectionSpec
-	collection     *ebpf.Collection
-	readers        map[string]*perf.Reader
-	l7Reader       *ringbuf.Reader
-	links          []link.Link
-	uprobes        map[string]*ebpf.Program
+	collectionSpec   *ebpf.CollectionSpec
+	collection       *ebpf.Collection
+	readers          map[string]*perf.Reader
+	l7Reader         *ringbuf.Reader
+	tcpConnectReader *ringbuf.Reader
+	links            []link.Link
+	uprobes          map[string]*ebpf.Program
 
 	globalUprobes     map[UprobeKey]*globalUprobe
 	globalUprobesLock sync.Mutex
@@ -155,6 +156,9 @@ func (t *Tracer) Close() {
 	}
 	if t.l7Reader != nil {
 		_ = t.l7Reader.Close()
+	}
+	if t.tcpConnectReader != nil {
+		_ = t.tcpConnectReader.Close()
 	}
 	t.globalUprobesLock.Lock()
 	for _, gu := range t.globalUprobes {
@@ -217,14 +221,14 @@ func (t *Tracer) DeleteActiveConnection(cid ConnectionId) error {
 }
 
 func (t *Tracer) LostSamples() uint64 {
-	return t.lostSamples.Load() + t.l7RingbufDrops()
+	return t.lostSamples.Load() + t.ringbufDrops("l7_events_dropped") + t.ringbufDrops("tcp_connect_events_dropped")
 }
 
-func (t *Tracer) l7RingbufDrops() uint64 {
+func (t *Tracer) ringbufDrops(mapName string) uint64 {
 	if t.collection == nil {
 		return 0
 	}
-	m := t.collection.Maps["l7_events_dropped"]
+	m := t.collection.Maps[mapName]
 	if m == nil {
 		return 0
 	}
@@ -393,7 +397,6 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	perfMaps := []perfMap{
 		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4},
 		{name: "tcp_listen_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
-		{name: "tcp_connect_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 8, readTimeout: 10 * time.Millisecond},
 		{name: "tcp_retransmit_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
 		{name: "file_events", typ: perfMapTypeFileEvents, perCPUBufferSizePages: 4},
 	}
@@ -418,6 +421,14 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		t.l7Reader = rd
 		go t.runL7EventsReader(rd, ch)
 	}
+
+	tcpRd, err := ringbuf.NewReader(t.collection.Maps["tcp_connect_events"])
+	if err != nil {
+		t.Close()
+		return fmt.Errorf("failed to create tcp_connect ringbuf reader: %w", err)
+	}
+	t.tcpConnectReader = tcpRd
+	go t.runTcpConnectEventsReader(tcpRd, ch)
 
 	t.collectionSpec = collectionSpec
 	return nil
@@ -580,33 +591,61 @@ func (t *Tracer) runEventsReader(name string, r *perf.Reader, ch chan<- Event, t
 			}
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
-			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+			parsed, err := parseTcpEvent(rec.RawSample)
+			if err != nil {
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
-			event = Event{
-				Type:          v.Type,
-				Pid:           v.Pid,
-				SrcAddr:       ipPort(v.SAddr, v.SPort),
-				DstAddr:       ipPort(v.DAddr, v.DPort),
-				ActualDstAddr: ipPort(v.AAddr, v.Aport),
-				Fd:            v.Fd,
-				Timestamp:     v.Timestamp,
-				Duration:      time.Duration(v.Duration),
-				IsInbound:     v.IsInbound != 0,
-			}
-			if v.Type == EventTypeConnectionClose {
-				event.TrafficStats = &TrafficStats{
-					BytesSent:     v.BytesSent,
-					BytesReceived: v.BytesReceived,
-				}
-			}
+			event = *parsed
 		default:
 			continue
 		}
 
 		ch <- event
+	}
+}
+
+func parseTcpEvent(raw []byte) (*Event, error) {
+	v := tcpEvent{}
+	if err := binary.Read(bytes.NewBuffer(raw), binary.LittleEndian, &v); err != nil {
+		return nil, err
+	}
+	event := Event{
+		Type:          v.Type,
+		Pid:           v.Pid,
+		SrcAddr:       ipPort(v.SAddr, v.SPort),
+		DstAddr:       ipPort(v.DAddr, v.DPort),
+		ActualDstAddr: ipPort(v.AAddr, v.Aport),
+		Fd:            v.Fd,
+		Timestamp:     v.Timestamp,
+		Duration:      time.Duration(v.Duration),
+		IsInbound:     v.IsInbound != 0,
+	}
+	if v.Type == EventTypeConnectionClose {
+		event.TrafficStats = &TrafficStats{
+			BytesSent:     v.BytesSent,
+			BytesReceived: v.BytesReceived,
+		}
+	}
+	return &event, nil
+}
+
+func (t *Tracer) runTcpConnectEventsReader(r *ringbuf.Reader, ch chan<- Event) {
+	for {
+		r.SetDeadline(time.Now().Add(10 * time.Millisecond))
+		rec, err := r.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				break
+			}
+			continue
+		}
+		event, err := parseTcpEvent(rec.RawSample)
+		if err != nil {
+			klog.Warningln("failed to read tcp_connect ringbuf record:", err)
+			continue
+		}
+		ch <- *event
 	}
 }
 

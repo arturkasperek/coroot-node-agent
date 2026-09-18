@@ -38,6 +38,18 @@ func TestL7EventsMapIsRingbuf(t *testing.T) {
 	require.Equal(t, ebpf.PerCPUArray, dropped.Type)
 }
 
+func TestTcpConnectEventsMapIsRingbuf(t *testing.T) {
+	spec := loadAmd64ProgramSpec(t)
+	m, ok := spec.Maps["tcp_connect_events"]
+	require.True(t, ok, "tcp_connect_events map missing")
+	require.Equal(t, ebpf.RingBuf, m.Type)
+	require.GreaterOrEqual(t, m.MaxEntries, uint32(8<<20), "ringbuf should be at least 8MiB")
+
+	dropped, ok := spec.Maps["tcp_connect_events_dropped"]
+	require.True(t, ok, "tcp_connect_events_dropped map missing")
+	require.Equal(t, ebpf.PerCPUArray, dropped.Type)
+}
+
 func loadAmd64ProgramSpec(t *testing.T) *ebpf.CollectionSpec {
 	t.Helper()
 	var blob []byte

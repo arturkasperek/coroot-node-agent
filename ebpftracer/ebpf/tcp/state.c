@@ -25,11 +25,37 @@ struct {
     __uint(value_size, sizeof(int));
 } tcp_listen_events SEC(".maps");
 
+#define TCP_CONNECT_EVENTS_RINGBUF_SIZE (16 * 1024 * 1024)
+
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(int));
-    __uint(value_size, sizeof(int));
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, TCP_CONNECT_EVENTS_RINGBUF_SIZE);
 } tcp_connect_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 1);
+} tcp_connect_events_dropped SEC(".maps");
+
+static __always_inline
+void tcp_connect_drop_event(void) {
+    __u32 zero = 0;
+    __u64 *n = bpf_map_lookup_elem(&tcp_connect_events_dropped, &zero);
+    if (n) {
+        __sync_fetch_and_add(n, 1);
+    }
+}
+
+// Fixed-size tcp_event: copy into the ringbuf. Unlike L7 there is no variable
+// payload, so bpf_ringbuf_output is enough (no dynptr / reserve lifecycle).
+static __always_inline
+void send_tcp_connect_event(struct tcp_event *e) {
+    if (bpf_ringbuf_output(&tcp_connect_events, e, sizeof(*e), 0)) {
+        tcp_connect_drop_event();
+    }
+}
 
 struct trace_event_raw_inet_sock_set_state__stub {
     __u64 unused;
@@ -143,7 +169,6 @@ int inet_sock_set_state(void *ctx)
     __u32 type = 0;
     __u64 timestamp = 0;
     __u64 duration = 0;
-    void *map = &tcp_connect_events;
 
     struct tcp_event e = {};
 
@@ -173,11 +198,9 @@ int inet_sock_set_state(void *ctx)
     }
     if (args.oldstate == BPF_TCP_CLOSE && args.newstate == BPF_TCP_LISTEN) {
         type = EVENT_TYPE_LISTEN_OPEN;
-        map = &tcp_listen_events;
     }
     if (args.oldstate == BPF_TCP_LISTEN && args.newstate == BPF_TCP_CLOSE) {
         type = EVENT_TYPE_LISTEN_CLOSE;
-        map = &tcp_listen_events;
     }
 
     if (type == 0) {
@@ -202,7 +225,11 @@ int inet_sock_set_state(void *ctx)
         e.aport = actualDst->port;
         __builtin_memcpy(&e.aaddr, &actualDst->ip, sizeof(e.aaddr));
     }
-    bpf_perf_event_output(ctx, map, BPF_F_CURRENT_CPU, &e, sizeof(e));
+    if (type == EVENT_TYPE_LISTEN_OPEN || type == EVENT_TYPE_LISTEN_CLOSE) {
+        bpf_perf_event_output(ctx, &tcp_listen_events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+    } else {
+        send_tcp_connect_event(&e);
+    }
     return 0;
 }
 
@@ -275,7 +302,7 @@ int sys_enter_close(void *ctx) {
         e.bytes_received = conn->bytes_received;
         e.timestamp = conn->timestamp;
         e.is_inbound = conn->is_inbound;
-        bpf_perf_event_output(ctx, &tcp_connect_events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+        send_tcp_connect_event(&e);
         bpf_map_delete_elem(&active_connections, &cid);
     }
     return 0;
