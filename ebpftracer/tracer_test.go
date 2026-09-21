@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
@@ -551,6 +552,87 @@ func TestHttp2TlsEgressEvents(t *testing.T) {
 	require.False(t, l7ev.L7Request.IsInbound)
 }
 
+func TestHttp2WriteTilesDataThenHeaders(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	headers := http2HeadersGETUsers(t, addr)
+	payload := append(http2DataFrame([]byte("hello"), 1, false), headers...)
+	n, err := conn.Write(payload)
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
+
+	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		return e.Type == EventTypeL7Request && e.Pid == uint32(os.Getpid()) &&
+			e.L7Request != nil && e.L7Request.Protocol == l7.ProtocolHTTP2 &&
+			!e.L7Request.IsInbound && bytes.Equal(e.L7Request.Payload, payload)
+	})
+	require.Equal(t, l7.ProtocolHTTP2, got.L7Request.Protocol)
+	require.False(t, got.L7Request.IsInbound)
+}
+
+func TestHttp2SendmmsgWalksMoreThanTwoMessages(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	tcp, ok := conn.(*net.TCPConn)
+	require.True(t, ok)
+	raw, err := tcp.SyscallConn()
+	require.NoError(t, err)
+
+	const nmsg = 5
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	bufs := make([][]byte, nmsg)
+	iov := make([]unix.Iovec, nmsg)
+	msgs := make([]mmsghdr, nmsg)
+	for i := 0; i < nmsg; i++ {
+		bufs[i] = append([]byte(nil), settings...)
+		iov[i].Base = &bufs[i][0]
+		iov[i].Len = uint64(len(bufs[i]))
+		msgs[i].Hdr.Iov = &iov[i]
+		msgs[i].Hdr.Iovlen = 1
+	}
+
+	var sent int
+	require.NoError(t, raw.Write(func(fd uintptr) bool {
+		n, werr := sendmmsg(int(fd), msgs, 0)
+		require.NoError(t, werr)
+		sent = n
+		return true
+	}))
+	require.Equal(t, nmsg, sent)
+
+	pid := uint32(os.Getpid())
+	got := 0
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && got < nmsg {
+		e := getEvent()
+		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol == l7.ProtocolHTTP2 && !e.L7Request.IsInbound {
+			got++
+		}
+	}
+	require.GreaterOrEqual(t, got, nmsg, "sendmmsg must walk more than the old 2-slot unroll")
+}
+
 func startHTTPUsersServer(t *testing.T) (uint32, string, func()) {
 	t.Helper()
 	src := `
@@ -715,6 +797,81 @@ func buildStdGoProg(t *testing.T, name, src string) string {
 	require.Equal(t, "", string(out), "%s", out)
 	require.NoError(t, err)
 	return bin
+}
+
+type mmsghdr struct {
+	Hdr unix.Msghdr
+	Len uint32
+	_   [4]byte
+}
+
+func sendmmsg(fd int, msgvec []mmsghdr, flags int) (int, error) {
+	var p unsafe.Pointer
+	if len(msgvec) > 0 {
+		p = unsafe.Pointer(&msgvec[0])
+	}
+	n, _, errno := unix.Syscall6(unix.SYS_SENDMMSG, uintptr(fd), uintptr(p), uintptr(len(msgvec)), uintptr(flags), 0, 0)
+	if errno != 0 {
+		return int(n), errno
+	}
+	return int(n), nil
+}
+
+func startTCPDiscard(t *testing.T) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		io.Copy(io.Discard, c)
+	}()
+	return ln.Addr().String(), func() {
+		ln.Close()
+		<-done
+	}
+}
+
+func http2HeadersGETUsers(t *testing.T, addr string) []byte {
+	t.Helper()
+	var hdr bytes.Buffer
+	enc := hpack.NewEncoder(&hdr)
+	for _, hf := range []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":path", Value: "/users"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: addr},
+	} {
+		require.NoError(t, enc.WriteField(hf))
+	}
+	var buf bytes.Buffer
+	fr := http2.NewFramer(&buf, nil)
+	require.NoError(t, fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: hdr.Bytes(),
+		EndStream:     true,
+		EndHeaders:    true,
+	}))
+	return buf.Bytes()
+}
+
+func http2DataFrame(payload []byte, streamID uint32, endStream bool) []byte {
+	flags := byte(0)
+	if endStream {
+		flags = 0x1
+	}
+	n := len(payload)
+	hdr := [9]byte{
+		byte(n >> 16), byte(n >> 8), byte(n),
+		0, flags,
+		byte(streamID >> 24), byte(streamID >> 16), byte(streamID >> 8), byte(streamID),
+	}
+	return append(hdr[:], payload...)
 }
 
 func waitHTTP2(t *testing.T, get func() *Event, pid uint32, inbound bool) *Event {

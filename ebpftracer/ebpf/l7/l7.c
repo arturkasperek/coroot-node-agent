@@ -30,6 +30,7 @@
 
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
 #define MAX_IOVEC_SIZE 32
+#define SENDMMSG_MAX_MSGS 32
 
 static __always_inline
 __u32 payload_copy_len(__u64 size) {
@@ -243,6 +244,23 @@ struct l7_send_args {
     __u64 size;
 };
 
+struct l7_write_args {
+    void *ctx;
+    char *buf;
+    __u64 fd;
+    __u64 size;
+    __u64 iovlen;
+    __u16 is_tls;
+    __u8 socket_only;
+};
+
+struct sendmmsg_iter {
+    void *ctx;
+    char *mmsg;
+    __u64 fd;
+    __u32 vlen;
+};
+
 static __always_inline
 void l7_drop_event(void) {
     __u32 zero = 0;
@@ -293,6 +311,23 @@ void send_event(struct l7_send_args *a) {
     };                                                                  \
     send_event(&__a);                                                   \
 })
+
+static __always_inline
+int emit_http2(struct connection_id cid, struct connection *conn, char *payload, __u64 size, __u8 method) {
+    __u32 zero = 0;
+    struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+    if (!e) {
+        return 0;
+    }
+    e->protocol = PROTOCOL_HTTP2;
+    e->method = method;
+    e->is_inbound = conn->is_inbound;
+    e->status = STATUS_UNKNOWN;
+    e->statement_id = 0;
+    e->duration = bpf_ktime_get_ns();
+    SEND_EVENT(e, cid, conn, payload, size);
+    return 0;
+}
 
 static __always_inline
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
@@ -399,6 +434,10 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
 static inline __attribute__((__always_inline__))
 int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
                    __u16 is_tls, char *payload, __u64 size, __u64 total_size) {
+    if (conn->protocol == PROTOCOL_HTTP2) {
+        return emit_http2(cid, conn, payload, size, METHOD_HTTP2_CLIENT_FRAMES);
+    }
+
     __u32 zero = 0;
     struct l7_request_key k = {.pid = cid.pid, .fd = cid.fd, .is_tls = is_tls, .stream_id = -1};
 
@@ -420,6 +459,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
 
     if (is_http_request(payload)) {
         req->protocol = PROTOCOL_HTTP;
+        conn->protocol = PROTOCOL_HTTP;
     } else if (is_postgres_query(payload, size, &req->request_type)) {
         if (req->request_type == POSTGRES_FRAME_CLOSE) {
             if (conn->is_inbound) {
@@ -484,17 +524,9 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
         return 0;
     } else if (is_cassandra_request(payload, size, &k.stream_id)) {
         req->protocol = PROTOCOL_CASSANDRA;
-    } else if (looks_like_http2_frame(payload, size, METHOD_HTTP2_CLIENT_FRAMES)) {
-        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
-        if (!e) {
-            return 0;
-        }
-        e->protocol = PROTOCOL_HTTP2;
-        e->method = METHOD_HTTP2_CLIENT_FRAMES;
-        e->is_inbound = conn->is_inbound;
-        e->duration = bpf_ktime_get_ns();
-        SEND_EVENT(e, cid, conn, payload, size);
-        return 0;
+    } else if (conn->protocol == PROTOCOL_UNKNOWN && is_http2(payload, size)) {
+        conn->protocol = PROTOCOL_HTTP2;
+        return emit_http2(cid, conn, payload, size, METHOD_HTTP2_CLIENT_FRAMES);
     } else if (is_clickhouse_query(payload, size)) {
         req->protocol = PROTOCOL_CLICKHOUSE;
     } else if (is_zk_request(payload, total_size)) {
@@ -620,6 +652,10 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
 static inline __attribute__((__always_inline__))
 int handle_response(void *ctx, struct connection_id cid, struct connection *conn,
                     __u16 is_tls, char *payload, __u64 ret, __u64 total_size) {
+    if (conn->protocol == PROTOCOL_HTTP2) {
+        return emit_http2(cid, conn, payload, ret, METHOD_HTTP2_SERVER_FRAMES);
+    }
+
     int zero = 0;
     struct l7_request_key k = {.pid = cid.pid, .fd = cid.fd, .is_tls = is_tls, .stream_id = -1};
     struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
@@ -671,12 +707,9 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
                 return 0;
             }
             response = 1;
-        } else if (looks_like_http2_frame(payload, ret, METHOD_HTTP2_SERVER_FRAMES)) {
-            e->protocol = PROTOCOL_HTTP2;
-            e->method = METHOD_HTTP2_SERVER_FRAMES;
-            e->duration = bpf_ktime_get_ns();
-            SEND_EVENT(e, cid, conn, payload, ret);
-            return 0;
+        } else if (conn->protocol == PROTOCOL_UNKNOWN && is_http2(payload, ret)) {
+            conn->protocol = PROTOCOL_HTTP2;
+            return emit_http2(cid, conn, payload, ret, METHOD_HTTP2_SERVER_FRAMES);
         } else {
             return 0;
         }
@@ -685,6 +718,9 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
     e->protocol = req->protocol;
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
+        if (response) {
+            conn->protocol = PROTOCOL_HTTP;
+        }
     } else if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
         if (req->request_type == POSTGRES_FRAME_PARSE) {
@@ -807,25 +843,56 @@ struct mmsghdr {
 	__u32 msg_len;
 };
 
+// Separate 1M-insn subprog so sys_enter_sendmmsg can bpf_loop over mmsghdr
+// without inlining handle_request once per slot.
+static __attribute__((noinline))
+int do_enter_write(struct l7_write_args *a) {
+    if (!a) {
+        return 0;
+    }
+    return trace_enter_write(a->ctx, a->fd, a->is_tls, a->socket_only, a->buf, a->size, a->iovlen);
+}
+
+static long sendmmsg_cb(__u32 i, void *ctx) {
+    struct sendmmsg_iter *it = ctx;
+    struct mmsghdr h = {};
+    struct l7_write_args a = {};
+    __u64 off;
+    if (!it || i >= it->vlen) {
+        return 1;
+    }
+    off = (__u64)i * sizeof(h);
+    if (bpf_probe_read(&h, sizeof(h), it->mmsg + off)) {
+        return 1;
+    }
+    a.ctx = it->ctx;
+    a.fd = it->fd;
+    a.buf = (char *)h.msg_hdr.msg_iov;
+    a.socket_only = 1;
+    a.iovlen = h.msg_hdr.msg_iovlen;
+    do_enter_write(&a);
+    return 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_sendmmsg")
 int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
+    struct sendmmsg_iter it = {};
+    __u32 n = SENDMMSG_MAX_MSGS;
     if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
         return 0;
     }
-    __u64 offset = 0;
-    #pragma unroll
-    for (int i = 0; i <= 1; i++) {
-        if (i >= ctx->size) {
-            break;
-        }
-        struct mmsghdr h = {};
-        if (bpf_probe_read(&h , sizeof(h), (void *)(ctx->buf + offset))) {
-            return 0;
-        }
-        offset += sizeof(h);
-        trace_enter_write(ctx, ctx->fd, 0, 1, (char*)h.msg_hdr.msg_iov, 0, h.msg_hdr.msg_iovlen);
+    if (ctx->size < n) {
+        n = ctx->size;
     }
+    if (!n) {
+        return 0;
+    }
+    it.ctx = ctx;
+    it.mmsg = ctx->buf;
+    it.fd = ctx->fd;
+    it.vlen = n;
+    bpf_loop(n, sendmmsg_cb, &it, 0);
     return 0;
 }
 

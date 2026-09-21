@@ -99,7 +99,8 @@ struct connection {
     __u64 bytes_sent;
     __u64 bytes_received;
     __u8 is_inbound;
-    __u8 pad[7];
+    __u8 protocol;
+    __u8 pad[6];
 };
 
 struct {
