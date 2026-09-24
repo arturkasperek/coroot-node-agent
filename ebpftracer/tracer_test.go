@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -35,7 +36,27 @@ import (
 	"inet.af/netaddr"
 )
 
+func TestMain(m *testing.M) {
+	if os.Getenv("VM") != "" {
+		if err := startSharedTracer(); err != nil {
+			fmt.Fprintf(os.Stderr, "start tracer: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	code := m.Run()
+	stopSharedTracer()
+	os.Exit(code)
+}
+
 func skipIfNotVM(t *testing.T) {
+	if os.Getenv("VM") == "" {
+		t.SkipNow()
+	}
+	t.Parallel()
+}
+
+// TestTcpEvents installs a loss qdisc on lo, which drops traffic for every test.
+func skipIfNotVMSerial(t *testing.T) {
 	if os.Getenv("VM") == "" {
 		t.SkipNow()
 	}
@@ -122,12 +143,13 @@ func TestProcessEvents(t *testing.T) {
 	require.NoError(t, os.WriteFile(program+".go", []byte(src), 0644))
 	require.NoError(t, exec.Command("go", "build", "-o", program, program+".go").Run())
 
-	getEvent, stop := runTracer(t, true)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	p := exec.Command(program, "1", "200ms")
 	require.NoError(t, p.Start())
 	pid := uint32(p.Process.Pid)
+	watchPID(t, pid)
 	waitForEvent(t, getEvent, Event{Type: EventTypeProcessStart, Pid: pid})
 	require.NoError(t, p.Wait())
 	waitForEvent(t, getEvent, Event{Type: EventTypeProcessExit, Pid: pid})
@@ -142,9 +164,10 @@ func TestProcessEvents(t *testing.T) {
 }
 
 func TestTcpEvents(t *testing.T) {
-	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, true)
+	skipIfNotVMSerial(t)
+	getEvent, stop := runTracer(t)
 	defer stop()
+	watchSelf(t)
 
 	pid := uint32(os.Getpid())
 	waitTCP := func(typ EventType, sAddr, dAddr string, eventPid uint32) {
@@ -231,27 +254,23 @@ func TestFileEvents(t *testing.T) {
 	require.Equal(t, "", string(out))
 	require.NoError(t, err)
 
-	origWD, err := os.Getwd()
-	require.NoError(t, err)
-	require.NoError(t, os.Chdir(dir))
-	t.Cleanup(func() { _ = os.Chdir(origWD) })
+	absSrc := filepath.Join(dir, "program.go")
+	absBin := filepath.Join(dir, "program")
 
-	absSrc, err := filepath.Abs("program.go")
-	require.NoError(t, err)
-	absBin, err := filepath.Abs("program")
-	require.NoError(t, err)
-
-	getEvent, stop := runTracer(t, true)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	for _, call := range []int{syscall.SYS_OPEN, syscall.SYS_OPENAT} {
 		run := func(file string, flag int) (uint32, <-chan error) {
 			t.Helper()
 			p := exec.Command(absBin, strconv.Itoa(call), file, strconv.Itoa(flag))
+			p.Dir = dir
 			require.NoError(t, p.Start())
+			pid := uint32(p.Process.Pid)
+			watchPID(t, pid)
 			ch := make(chan error, 1)
 			go func() { ch <- p.Wait() }()
-			return uint32(p.Process.Pid), ch
+			return pid, ch
 		}
 		reap := func(ch <-chan error, wantErr bool) {
 			t.Helper()
@@ -293,7 +312,7 @@ func TestFileEvents(t *testing.T) {
 
 func TestHttpIngressEvents(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	serverPid, addr, stopServer := startHTTPUsersServer(t)
@@ -357,7 +376,7 @@ func TestHttpEgressEvents(t *testing.T) {
 	require.Equal(t, "", string(out))
 	require.NoError(t, err)
 
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	_, addr, stopServer := startHTTPUsersServer(t)
@@ -366,6 +385,7 @@ func TestHttpEgressEvents(t *testing.T) {
 	cmd := exec.Command(clientBin, "http://"+addr+"/users")
 	require.NoError(t, cmd.Start())
 	clientPid := uint32(cmd.Process.Pid)
+	watchPID(t, clientPid)
 	require.NoError(t, cmd.Wait())
 
 	var conn, l7ev *Event
@@ -418,7 +438,8 @@ func TestHttpPayloadCopies1024(t *testing.T) {
 
 func assertHTTPPayloadCopies1024(t *testing.T, writev bool) {
 	t.Helper()
-	getEvent, stop := runTracer(t, false)
+	t.Parallel()
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	_, addr, stopServer := startHTTPUsersServer(t)
@@ -426,6 +447,7 @@ func assertHTTPPayloadCopies1024(t *testing.T, writev bool) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const markerIdx = MaxPayloadSize - 1
@@ -484,7 +506,7 @@ func paddedHTTPGetUsers(addr string, total, markerIdx int, marker byte) []byte {
 
 func TestHttp2IngressEvents(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	serverPid, addr, stopServer := startHTTP2UsersServer(t)
@@ -501,7 +523,7 @@ func TestHttp2EgressEvents(t *testing.T) {
 	skipIfNotVM(t)
 	clientBin := buildHTTP2Prog(t, "http2client", http2ClientSrc)
 
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	_, addr, stopServer := startHTTP2UsersServer(t)
@@ -510,6 +532,7 @@ func TestHttp2EgressEvents(t *testing.T) {
 	cmd := exec.Command(clientBin, "http://"+addr+"/users")
 	require.NoError(t, cmd.Start())
 	clientPid := uint32(cmd.Process.Pid)
+	watchPID(t, clientPid)
 	require.NoError(t, cmd.Wait())
 
 	conn, l7ev := waitHTTP2Egress(t, getEvent, clientPid, addr)
@@ -519,7 +542,8 @@ func TestHttp2EgressEvents(t *testing.T) {
 }
 
 func TestHttp2TlsIngressEvents(t *testing.T) {
-	tr, getEvent, stop := startTracer(t, false)
+	skipIfNotVM(t)
+	tr, getEvent, stop := startTracer(t)
 	defer stop()
 
 	serverPid, addr, stopServer := startHTTP2TlsUsersServer(t)
@@ -536,7 +560,7 @@ func TestHttp2TlsIngressEvents(t *testing.T) {
 
 func TestHttp2TlsEgressEvents(t *testing.T) {
 	skipIfNotVM(t)
-	tr, getEvent, stop := startTracer(t, false)
+	tr, getEvent, stop := startTracer(t)
 	defer stop()
 
 	_, addr, stopServer := startHTTP2TlsUsersServer(t)
@@ -554,7 +578,7 @@ func TestHttp2TlsEgressEvents(t *testing.T) {
 
 func TestHttp2TlsCutHeadersTopsUpRestOfFrame(t *testing.T) {
 	skipIfNotVM(t)
-	tr, getEvent, stop := startTracer(t, false)
+	tr, getEvent, stop := startTracer(t)
 	defer stop()
 
 	addr, stopServer := startTLSDiscard(t)
@@ -565,6 +589,7 @@ func TestHttp2TlsCutHeadersTopsUpRestOfFrame(t *testing.T) {
 	cmd := exec.Command(clientBin, addr, ready)
 	require.NoError(t, cmd.Start())
 	clientPid := uint32(cmd.Process.Pid)
+	watchPID(t, clientPid)
 	attachGoTls(t, tr, clientPid)
 	require.NoError(t, os.WriteFile(ready, []byte("1"), 0644))
 	require.NoError(t, cmd.Wait())
@@ -578,7 +603,7 @@ func TestHttp2TlsCutHeadersTopsUpRestOfFrame(t *testing.T) {
 
 func TestHttp2WriteTilesDataThenHeaders(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -586,6 +611,7 @@ func TestHttp2WriteTilesDataThenHeaders(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	headers := http2HeadersGETUsers(t, addr)
@@ -605,7 +631,7 @@ func TestHttp2WriteTilesDataThenHeaders(t *testing.T) {
 
 func TestHttp2SkipLeftThenHeaders(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -613,6 +639,7 @@ func TestHttp2SkipLeftThenHeaders(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	headers := http2HeadersGETUsers(t, addr)
@@ -636,7 +663,7 @@ func TestHttp2SkipLeftThenHeaders(t *testing.T) {
 
 func TestHttp2CutHeadersTopsUpRestOfFrame(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -644,6 +671,7 @@ func TestHttp2CutHeadersTopsUpRestOfFrame(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const payloadLen = 400
@@ -661,7 +689,7 @@ func TestHttp2CutHeadersTopsUpRestOfFrame(t *testing.T) {
 
 func TestHttp2FirstWriteCutHeadersTopsUpRestOfFrame(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -669,6 +697,7 @@ func TestHttp2FirstWriteCutHeadersTopsUpRestOfFrame(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const payloadLen = 400
@@ -684,7 +713,7 @@ func TestHttp2FirstWriteCutHeadersTopsUpRestOfFrame(t *testing.T) {
 
 func TestHttp2CutHeadersTopsUpAcrossTinyWrites(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -692,6 +721,7 @@ func TestHttp2CutHeadersTopsUpAcrossTinyWrites(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const payloadLen = 400
@@ -717,7 +747,7 @@ func TestHttp2CutHeadersTopsUpAcrossTinyWrites(t *testing.T) {
 
 func TestHttp2CutHeadersStopsAtOneKB(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -725,6 +755,7 @@ func TestHttp2CutHeadersStopsAtOneKB(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const payloadLen = 3000
@@ -750,7 +781,7 @@ func TestHttp2CutHeadersStopsAtOneKB(t *testing.T) {
 
 func TestHttp2CutDataTopsUpRestOfFrame(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -758,6 +789,7 @@ func TestHttp2CutDataTopsUpRestOfFrame(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const payloadLen = 400
@@ -775,7 +807,7 @@ func TestHttp2CutDataTopsUpRestOfFrame(t *testing.T) {
 
 func TestHttp2DataCapturesOneKBOnItsOwn(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -783,6 +815,7 @@ func TestHttp2DataCapturesOneKBOnItsOwn(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const captured = MaxPayloadSize - http2FrameHeaderLen
@@ -803,7 +836,7 @@ func TestHttp2DataCapturesOneKBOnItsOwn(t *testing.T) {
 
 func TestHttp2EmptyHeadersFrameIsEmitted(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -811,6 +844,7 @@ func TestHttp2EmptyHeadersFrameIsEmitted(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
@@ -831,7 +865,7 @@ func TestHttp2EmptyHeadersFrameIsEmitted(t *testing.T) {
 
 func TestHttp2EmitsWholeDataBuffer(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -839,6 +873,7 @@ func TestHttp2EmitsWholeDataBuffer(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
@@ -875,7 +910,7 @@ func TestHttp2EmitsWholeDataBuffer(t *testing.T) {
 
 func TestHttp2EmitsEveryEmptyHeadersFrame(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -883,6 +918,7 @@ func TestHttp2EmitsEveryEmptyHeadersFrame(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const frames = 200
@@ -917,7 +953,7 @@ func TestHttp2EmitsEveryEmptyHeadersFrame(t *testing.T) {
 
 func TestHttp2HeadersPast4KBInOneWrite(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -925,6 +961,7 @@ func TestHttp2HeadersPast4KBInOneWrite(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	headers := http2HeadersGETUsers(t, addr)
@@ -948,7 +985,7 @@ func TestHttp2HeadersPast4KBInOneWrite(t *testing.T) {
 
 func TestHttp2WritevFramesPastFirstKB(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -956,6 +993,7 @@ func TestHttp2WritevFramesPastFirstKB(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const frames = 40
@@ -975,7 +1013,7 @@ func TestHttp2WritevFramesPastFirstKB(t *testing.T) {
 
 func TestHttp2WritevFirstSyscallFramesPastFirstKB(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -983,6 +1021,7 @@ func TestHttp2WritevFirstSyscallFramesPastFirstKB(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const frames = 40
@@ -1000,7 +1039,7 @@ func TestHttp2WritevFirstSyscallFramesPastFirstKB(t *testing.T) {
 
 func TestHttp2WritevHeadersPast4KBInOneVector(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -1008,6 +1047,7 @@ func TestHttp2WritevHeadersPast4KBInOneVector(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	headers := http2HeadersGETUsers(t, addr)
@@ -1028,7 +1068,7 @@ func TestHttp2WritevHeadersPast4KBInOneVector(t *testing.T) {
 
 func TestHttp2WritevHeaderAndBodyAreSeparateVectors(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -1036,6 +1076,7 @@ func TestHttp2WritevHeaderAndBodyAreSeparateVectors(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
@@ -1058,7 +1099,7 @@ func TestHttp2WritevHeaderAndBodyAreSeparateVectors(t *testing.T) {
 
 func TestHttp2WritevHeaderSplitAcrossVectors(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -1066,6 +1107,7 @@ func TestHttp2WritevHeaderSplitAcrossVectors(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
@@ -1087,7 +1129,7 @@ func TestHttp2WritevHeaderSplitAcrossVectors(t *testing.T) {
 
 func TestHttp2WritevDataStopsAt1KBThenLaterHeaders(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -1095,6 +1137,7 @@ func TestHttp2WritevDataStopsAt1KBThenLaterHeaders(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	const captured = MaxPayloadSize - http2FrameHeaderLen
@@ -1114,7 +1157,7 @@ func TestHttp2WritevDataStopsAt1KBThenLaterHeaders(t *testing.T) {
 
 func TestHttp2WritevTwoStreamsPastFirstKB(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -1122,6 +1165,7 @@ func TestHttp2WritevTwoStreamsPastFirstKB(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
@@ -1146,7 +1190,7 @@ func TestHttp2WritevTwoStreamsPastFirstKB(t *testing.T) {
 
 func TestHttp2WritevCutHeadersTopsUpOnNextWrite(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -1154,6 +1198,7 @@ func TestHttp2WritevCutHeadersTopsUpOnNextWrite(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
@@ -1176,7 +1221,7 @@ func TestHttp2WritevCutHeadersTopsUpOnNextWrite(t *testing.T) {
 
 func TestHttp2ReadvFramesPastFirstKB(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	const frames = 40
@@ -1205,6 +1250,7 @@ func TestHttp2ReadvFramesPastFirstKB(t *testing.T) {
 
 	srv, err := ln.Accept()
 	require.NoError(t, err)
+	watchConn(t, srv)
 	defer srv.Close()
 
 	vecs := make([][]byte, 0, frames+1)
@@ -1228,7 +1274,7 @@ func TestHttp2ReadvFramesPastFirstKB(t *testing.T) {
 
 func TestHttp2ReadvHeadersPast4KBInOneVector(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
@@ -1254,6 +1300,7 @@ func TestHttp2ReadvHeadersPast4KBInOneVector(t *testing.T) {
 
 	srv, err := ln.Accept()
 	require.NoError(t, err)
+	watchConn(t, srv)
 	defer srv.Close()
 
 	require.NoError(t, <-errc)
@@ -1277,7 +1324,7 @@ func TestHttp2ReadvHeadersPast4KBInOneVector(t *testing.T) {
 
 func TestHttp2ReadvSecondSyscallFramesPastFirstKB(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	client, srv := dialAcceptedTCP(t)
@@ -1306,7 +1353,7 @@ func TestHttp2ReadvSecondSyscallFramesPastFirstKB(t *testing.T) {
 
 func TestHttp2ReadvIgnoresBytesPastSyscallReturn(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	client, srv := dialAcceptedTCP(t)
@@ -1336,13 +1383,13 @@ func TestHttp2ReadvIgnoresBytesPastSyscallReturn(t *testing.T) {
 			}
 			continue
 		}
-		quiet = 0
 		if e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
 			continue
 		}
 		if e.L7Request.Protocol != l7.ProtocolHTTP2 || !e.L7Request.IsInbound {
 			continue
 		}
+		quiet = 0
 		got = append(got, e.L7Request.Payload...)
 		if bytes.Contains(got, planted) {
 			break
@@ -1354,7 +1401,7 @@ func TestHttp2ReadvIgnoresBytesPastSyscallReturn(t *testing.T) {
 
 func TestHttp2ReadvCutHeadersTopsUpOnNextRead(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	client, srv := dialAcceptedTCP(t)
@@ -1411,6 +1458,8 @@ func dialAcceptedTCP(t *testing.T) (client, server net.Conn) {
 	require.NoError(t, err)
 	require.NoError(t, <-errc)
 	client = <-cc
+	watchConn(t, client)
+	watchConn(t, server)
 	t.Cleanup(func() {
 		_ = client.Close()
 		_ = server.Close()
@@ -1477,7 +1526,7 @@ func writevConn(t *testing.T, conn net.Conn, vecs [][]byte) {
 
 func TestHttp2HeadersNear72MiBInOneWrite(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -1485,6 +1534,7 @@ func TestHttp2HeadersNear72MiBInOneWrite(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	headers := http2HeadersGETUsers(t, addr)
@@ -1521,7 +1571,7 @@ func TestHttp2HeadersNear72MiBInOneWrite(t *testing.T) {
 
 func TestHttp2SendmmsgWalksMoreThanTwoMessages(t *testing.T) {
 	skipIfNotVM(t)
-	getEvent, stop := runTracer(t, false)
+	getEvent, stop := runTracer(t)
 	defer stop()
 
 	addr, stopDiscard := startTCPDiscard(t)
@@ -1529,6 +1579,7 @@ func TestHttp2SendmmsgWalksMoreThanTwoMessages(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
+	watchConn(t, conn)
 	defer conn.Close()
 
 	tcp, ok := conn.(*net.TCPConn)
@@ -1609,6 +1660,7 @@ func startHTTPUsersServer(t *testing.T) (uint32, string, func()) {
 	addrFile := path.Join(dir, "addr")
 	cmd := exec.Command(program, addrFile)
 	require.NoError(t, cmd.Start())
+	watchPID(t, uint32(cmd.Process.Pid))
 	stop := func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -1650,6 +1702,7 @@ func startHTTP2UsersServer(t *testing.T) (uint32, string, func()) {
 	addrFile := path.Join(path.Dir(program), "addr")
 	cmd := exec.Command(program, addrFile)
 	require.NoError(t, cmd.Start())
+	watchPID(t, uint32(cmd.Process.Pid))
 	stop := func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -1678,6 +1731,7 @@ func startHTTP2TlsUsersServer(t *testing.T) (uint32, string, func()) {
 	addrFile := path.Join(path.Dir(program), "addr")
 	cmd := exec.Command(program, addrFile, certFile, keyFile)
 	require.NoError(t, cmd.Start())
+	watchPID(t, uint32(cmd.Process.Pid))
 	stop := func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -1704,6 +1758,7 @@ func runHTTP2TlsClient(t *testing.T, clientBin, addr string, tr *Tracer) uint32 
 	cmd := exec.Command(clientBin, "https://"+addr+"/users", ready)
 	require.NoError(t, cmd.Start())
 	pid := uint32(cmd.Process.Pid)
+	watchPID(t, pid)
 	attachGoTls(t, tr, pid)
 	require.NoError(t, os.WriteFile(ready, []byte("1"), 0644))
 	require.NoError(t, cmd.Wait())
@@ -2632,6 +2687,7 @@ func startInMemoryCgroup(t *testing.T, cmd *exec.Cmd, limit int64) {
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = control.Delete() })
 		require.NoError(t, cmd.Start())
+		watchPID(t, uint32(cmd.Process.Pid))
 		require.NoError(t, control.Add(cgroups.Process{Pid: cmd.Process.Pid}))
 	case cgroups.Unified:
 		control, err := cgroupsV2.NewManager("/sys/fs/cgroup", name, &cgroupsV2.Resources{
@@ -2644,73 +2700,342 @@ func startInMemoryCgroup(t *testing.T, cmd *exec.Cmd, limit int64) {
 		t.Cleanup(func() { _ = unix.Close(fd) })
 		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: fd}
 		require.NoError(t, cmd.Start())
+		watchPID(t, uint32(cmd.Process.Pid))
 	default:
 		t.Fatal("cgroups are not available")
 	}
 }
 
-func runTracer(t *testing.T, disableL7Tracing bool) (func() *Event, func()) {
+const (
+	tracerSubBuf = 8192
+	tracerRecent = 8192
+)
+
+var (
+	hubMu      sync.Mutex
+	tracerMu   sync.Mutex
+	sharedTr   *Tracer
+	sharedDone chan struct{}
+	sharedRun  chan struct{}
+	subs       = map[*tracerSub]struct{}{}
+	sessions   = map[*testing.T]*tracerSub{}
+	recentBuf  [tracerRecent]remembered
+	recentLen  int
+	recentPos  int
+)
+
+type remembered struct {
+	at time.Time
+	e  Event
+}
+
+type tracerSub struct {
+	ch      chan Event
+	mu      sync.Mutex
+	dead    bool
+	stopped bool
+	pids    map[uint32]struct{}
+	fds     map[uint64]struct{}
+	selfAll bool
+}
+
+func runTracer(t *testing.T) (func() *Event, func()) {
 	t.Helper()
-	_, get, stop := startTracer(t, disableL7Tracing)
+	_, get, stop := startTracer(t)
 	return get, stop
 }
 
-func startTracer(t *testing.T, disableL7Tracing bool) (*Tracer, func() *Event, func()) {
+func startTracer(t *testing.T) (*Tracer, func() *Event, func()) {
 	t.Helper()
-	events := make(chan Event, 65536)
-	done := make(chan struct{})
-	type ready struct {
-		tr  *Tracer
-		err error
+	if sharedTr == nil {
+		t.Fatal("shared tracer is not running")
 	}
-	started := make(chan ready, 1)
-
-	var uname unix.Utsname
-	require.NoError(t, unix.Uname(&uname))
-	require.NoError(t, common.SetKernelVersion(string(bytes.Split(uname.Release[:], []byte{0})[0])))
-
-	hostNs, err := proc.GetHostNetNs()
-	require.NoError(t, err)
-	selfNs, err := proc.GetSelfNetNs()
-	require.NoError(t, err)
-
-	go func() {
-		tt := NewTracer(hostNs, selfNs, disableL7Tracing)
-		err := tt.Run(events)
-		started <- ready{tr: tt, err: err}
-		if err != nil {
-			return
-		}
-		<-done
-		tt.Close()
-	}()
-	r := <-started
-	require.NoError(t, r.err)
-
-	// init() snapshots every host pid when tests share the host PID namespace.
-	// Drop that burst so the VM tests wait on events from the actions below.
-	drainUntil := time.Now().Add(2 * time.Second)
-	for time.Now().Before(drainUntil) {
-		select {
-		case <-events:
-		case <-time.After(20 * time.Millisecond):
-		}
+	tracerMu.Lock()
+	s := &tracerSub{
+		ch:   make(chan Event, tracerSubBuf),
+		pids: map[uint32]struct{}{},
+		fds:  map[uint64]struct{}{},
 	}
+	hubMu.Lock()
+	subs[s] = struct{}{}
+	sessions[t] = s
+	hubMu.Unlock()
 
-	stop := func() {
-		select {
-		case <-done:
-		default:
-			close(done)
-		}
-	}
 	get := func() *Event {
 		select {
-		case e := <-events:
+		case e := <-s.ch:
 			return &e
 		case <-time.After(200 * time.Millisecond):
 			return nil
 		}
 	}
-	return r.tr, get, stop
+	stop := func() {
+		if s.close(t) {
+			tracerMu.Unlock()
+		}
+	}
+	t.Cleanup(stop)
+	return sharedTr, get, stop
+}
+
+func (s *tracerSub) close(t *testing.T) bool {
+	hubMu.Lock()
+	if s.stopped {
+		hubMu.Unlock()
+		return false
+	}
+	s.stopped = true
+	delete(subs, s)
+	if sessions[t] == s {
+		delete(sessions, t)
+	}
+	hubMu.Unlock()
+	s.mu.Lock()
+	s.dead = true
+	s.mu.Unlock()
+	return true
+}
+
+func (s *tracerSub) match(e Event) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dead {
+		return false
+	}
+	self := uint32(os.Getpid())
+	if s.selfAll && (e.Pid == self || e.Pid == 0) {
+		return true
+	}
+	if e.Pid == self {
+		if e.Type != EventTypeL7Request {
+			return false
+		}
+		_, ok := s.fds[e.Fd]
+		return ok
+	}
+	_, ok := s.pids[e.Pid]
+	return ok
+}
+
+func subFor(t *testing.T) *tracerSub {
+	t.Helper()
+	hubMu.Lock()
+	s := sessions[t]
+	hubMu.Unlock()
+	if s == nil {
+		t.Fatal("tracer subscription missing; call runTracer first")
+	}
+	return s
+}
+
+func watchSelf(t *testing.T) {
+	t.Helper()
+	s := subFor(t)
+	s.mu.Lock()
+	s.selfAll = true
+	s.mu.Unlock()
+}
+
+func watchPID(t *testing.T, pid uint32) {
+	t.Helper()
+	s := subFor(t)
+	after := time.Now().Add(-time.Second)
+	if started, ok := pidStartedAt(pid); ok {
+		after = started.Add(-250 * time.Millisecond)
+	}
+	var replay []Event
+	hubMu.Lock()
+	s.mu.Lock()
+	s.pids[pid] = struct{}{}
+	if !s.dead {
+		replay = replayPID(pid, after)
+	}
+	s.mu.Unlock()
+	for _, e := range replay {
+		offer(s, e)
+	}
+	hubMu.Unlock()
+}
+
+func watchConn(t *testing.T, c net.Conn) {
+	t.Helper()
+	s := subFor(t)
+	fd := connFD(t, c)
+	s.mu.Lock()
+	s.fds[fd] = struct{}{}
+	s.mu.Unlock()
+}
+
+func connFD(t *testing.T, c net.Conn) uint64 {
+	t.Helper()
+	sc, ok := c.(syscall.Conn)
+	require.True(t, ok, "conn does not expose a socket fd")
+	raw, err := sc.SyscallConn()
+	require.NoError(t, err)
+	var fd uint64
+	require.NoError(t, raw.Control(func(f uintptr) { fd = uint64(f) }))
+	return fd
+}
+
+func offer(s *tracerSub, e Event) {
+	select {
+	case s.ch <- e:
+	default:
+	}
+}
+
+func cloneEvent(e Event) Event {
+	if e.L7Request != nil {
+		req := *e.L7Request
+		if len(req.Payload) > 0 {
+			req.Payload = append([]byte(nil), req.Payload...)
+		}
+		e.L7Request = &req
+	}
+	if e.TrafficStats != nil {
+		stats := *e.TrafficStats
+		e.TrafficStats = &stats
+	}
+	return e
+}
+
+func replayPID(pid uint32, after time.Time) []Event {
+	var out []Event
+	start := recentPos - recentLen
+	if start < 0 {
+		start += tracerRecent
+	}
+	for i := 0; i < recentLen; i++ {
+		rec := recentBuf[(start+i)%tracerRecent]
+		if rec.e.Pid == pid && !rec.at.Before(after) {
+			out = append(out, rec.e)
+		}
+	}
+	return out
+}
+
+func pidStartedAt(pid uint32) (time.Time, bool) {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return time.Time{}, false
+	}
+	i := bytes.LastIndex(stat, []byte(")"))
+	if i < 0 || i+2 >= len(stat) {
+		return time.Time{}, false
+	}
+	fields := bytes.Fields(stat[i+2:])
+	if len(fields) < 20 {
+		return time.Time{}, false
+	}
+	ticks, err := strconv.ParseInt(string(fields[19]), 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	upRaw, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return time.Time{}, false
+	}
+	var up float64
+	if _, err := fmt.Sscanf(string(upRaw), "%f", &up); err != nil {
+		return time.Time{}, false
+	}
+	const hz = 100
+	booted := time.Now().Add(-time.Duration(up * float64(time.Second)))
+	return booted.Add(time.Duration(ticks) * time.Second / time.Duration(hz)), true
+}
+
+func publish(e Event) {
+	e = cloneEvent(e)
+	hubMu.Lock()
+	recentBuf[recentPos] = remembered{at: time.Now(), e: e}
+	recentPos = (recentPos + 1) % tracerRecent
+	if recentLen < tracerRecent {
+		recentLen++
+	}
+	var dst []*tracerSub
+	for s := range subs {
+		if s.match(e) {
+			dst = append(dst, s)
+		}
+	}
+	hubMu.Unlock()
+	for _, s := range dst {
+		offer(s, e)
+	}
+}
+
+func startSharedTracer() error {
+	var uname unix.Utsname
+	if err := unix.Uname(&uname); err != nil {
+		return err
+	}
+	if err := common.SetKernelVersion(string(bytes.Split(uname.Release[:], []byte{0})[0])); err != nil {
+		return err
+	}
+	hostNs, err := proc.GetHostNetNs()
+	if err != nil {
+		return err
+	}
+	selfNs, err := proc.GetSelfNetNs()
+	if err != nil {
+		return err
+	}
+
+	events := make(chan Event, 65536)
+	sharedDone = make(chan struct{})
+	sharedRun = make(chan struct{})
+	started := make(chan error, 1)
+	go func() {
+		defer close(sharedRun)
+		tt := NewTracer(hostNs, selfNs, false)
+		err := tt.Run(events)
+		if err != nil {
+			started <- err
+			return
+		}
+		sharedTr = tt
+		started <- nil
+		<-sharedDone
+		tt.Close()
+	}()
+	if err := <-started; err != nil {
+		return err
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case <-events:
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+		close(drained)
+		for {
+			select {
+			case e := <-events:
+				publish(e)
+			case <-sharedRun:
+				for {
+					select {
+					case e := <-events:
+						publish(e)
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
+	<-drained
+	return nil
+}
+
+func stopSharedTracer() {
+	if sharedDone == nil {
+		return
+	}
+	close(sharedDone)
+	<-sharedRun
 }
