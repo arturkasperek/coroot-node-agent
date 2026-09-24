@@ -318,17 +318,13 @@ static long http2_iov_cb(__u32 i, void *ctx) {
     struct http2_trim_args *a = ctx;
     struct http2_iovec_table *t;
     unsigned char hdr[HTTP2_FRAME_HEADER_SIZE];
-    unsigned char nh[HTTP2_FRAME_HEADER_SIZE];
     __u32 zero = 0;
     __u32 remain;
-    __u32 length;
-    __u32 stream_id;
     __u32 take;
     __u32 copied;
-    __u32 out;
-    __u32 expect;
+    __u32 body_off;
     __u32 rest;
-    __u8 type;
+    int rc;
     (void)i;
 
     if (!a || !a->dst) {
@@ -360,9 +356,6 @@ static long http2_iov_cb(__u32 i, void *ctx) {
         http2_iov_pull(&hdr[6]) || http2_iov_pull(&hdr[7]) || http2_iov_pull(&hdr[8])) {
         return 1;
     }
-    length = ((__u32)hdr[0] << 16) | ((__u32)hdr[1] << 8) | hdr[2];
-    type = hdr[3];
-    stream_id = ((__u32)hdr[5] << 24) | ((__u32)hdr[6] << 16) | ((__u32)hdr[7] << 8) | hdr[8];
     t = bpf_map_lookup_elem(&http2_iovecs, &zero);
     if (!t) {
         return 1;
@@ -371,103 +364,42 @@ static long http2_iov_cb(__u32 i, void *ctx) {
     if (t->consumed < t->total) {
         remain = t->total - t->consumed;
     }
-    take = length;
-    if (take > remain) {
-        take = remain;
+
+    rc = http2_classify_frame(a, hdr, remain, &take, &copied, &body_off);
+    if (rc == 2) {
+        /* Cut copyable frame: the iovec cursor already consumed the header,
+           so — unlike the contiguous walker, which just rewinds a->pos —
+           the header bytes and the captured-so-far body length must be
+           stashed for http2_iov_impl to replay after the loop. */
+        t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+        if (!t) {
+            return 1;
+        }
+        t->cut_body = copied;
+        t->cut_length = ((__u32)hdr[0] << 16) | ((__u32)hdr[1] << 8) | hdr[2];
+        t->cut_hdr[0] = hdr[0];
+        t->cut_hdr[1] = hdr[1];
+        t->cut_hdr[2] = hdr[2];
+        t->cut_hdr[3] = hdr[3];
+        t->cut_hdr[4] = hdr[4];
+        t->cut_hdr[5] = hdr[5];
+        t->cut_hdr[6] = hdr[6];
+        t->cut_hdr[7] = hdr[7];
+        t->cut_hdr[8] = hdr[8];
+        a->skip_data = HTTP2_SKIP_CUT;
+        return 1;
     }
-    HTTP2_SRC_BOUND(take);
-    if (take < length) {
-        a->skip = length - take;
-        a->skip_stream = stream_id;
-        a->skip_data = type == HTTP2_FRAME_DATA;
-    } else {
-        a->skip = 0;
-        a->skip_data = 0;
+    if (rc) {
+        return 1;
     }
-    if (http2_copyable(type)) {
-        out = a->out_len;
-        if (out > MAX_PAYLOAD_SIZE) {
-            return 1;
-        }
-        PAYLOAD_BOUND(out);
-        if (type == HTTP2_FRAME_DATA && out > 0) {
-            http2_flush(a);
-            out = 0;
-        }
-        if (out > 0 &&
-            take <= MAX_PAYLOAD_SIZE - HTTP2_FRAME_HEADER_SIZE &&
-            out + HTTP2_FRAME_HEADER_SIZE + take > MAX_PAYLOAD_SIZE) {
-            http2_flush(a);
-            out = 0;
-        } else if (out + HTTP2_FRAME_HEADER_SIZE > MAX_PAYLOAD_SIZE) {
-            http2_flush(a);
-            out = 0;
-        }
-        copied = take;
-        if (out + HTTP2_FRAME_HEADER_SIZE + copied > MAX_PAYLOAD_SIZE) {
-            copied = MAX_PAYLOAD_SIZE - out - HTTP2_FRAME_HEADER_SIZE;
-        }
-        copied = http2_bound_body(copied);
-        if (take < length && copied == take) {
-            expect = length;
-            if (expect > HTTP2_CAPTURE_MAX) {
-                expect = HTTP2_CAPTURE_MAX;
-            }
-            if (copied < expect) {
-                t = bpf_map_lookup_elem(&http2_iovecs, &zero);
-                if (!t) {
-                    return 1;
-                }
-                t->cut_body = copied;
-                t->cut_length = length;
-                t->cut_hdr[0] = hdr[0];
-                t->cut_hdr[1] = hdr[1];
-                t->cut_hdr[2] = hdr[2];
-                t->cut_hdr[3] = hdr[3];
-                t->cut_hdr[4] = hdr[4];
-                t->cut_hdr[5] = hdr[5];
-                t->cut_hdr[6] = hdr[6];
-                t->cut_hdr[7] = hdr[7];
-                t->cut_hdr[8] = hdr[8];
-                a->skip_data = HTTP2_SKIP_CUT;
-                return 1;
-            }
-        }
-        nh[0] = copied >> 16;
-        nh[1] = copied >> 8;
-        nh[2] = copied;
-        nh[3] = hdr[3];
-        nh[4] = hdr[4];
-        nh[5] = hdr[5];
-        nh[6] = hdr[6];
-        nh[7] = hdr[7];
-        nh[8] = hdr[8];
-        if (copy_to_payload(a->dst, out, HTTP2_FRAME_HEADER_SIZE, nh)) {
-            return 1;
-        }
-        if (copied && http2_iov_copy(a->dst, out + HTTP2_FRAME_HEADER_SIZE, copied)) {
-            return 1;
-        }
-        if (take > copied) {
-            rest = http2_iov_skip(take - copied);
-            if (rest) {
-                t = bpf_map_lookup_elem(&http2_iovecs, &zero);
-                if (!t) {
-                    return 1;
-                }
-                if (t->idx >= t->n) {
-                    a->skip = rest;
-                    return 1;
-                }
-                t->skip_left = rest;
-            }
-        }
-        a->out_len = out + HTTP2_FRAME_HEADER_SIZE + copied;
-        if (!a->first_stream) {
-            a->first_stream = stream_id;
-        }
-    } else if (take) {
-        rest = http2_iov_skip(take);
+    if (copied && http2_iov_copy(a->dst, body_off, copied)) {
+        return 1;
+    }
+    /* Whatever of `take` wasn't copied — either a non-copyable frame's
+       whole body, or a copyable frame's tail beyond the capture cap — is
+       still sitting in the iovec cursor and must be walked past for real. */
+    if (take > copied) {
+        rest = http2_iov_skip(take - copied);
         if (rest) {
             t = bpf_map_lookup_elem(&http2_iovecs, &zero);
             if (!t) {
@@ -478,26 +410,9 @@ static long http2_iov_cb(__u32 i, void *ctx) {
                 return 1;
             }
             t->skip_left = rest;
-            return 0;
         }
     }
     return 0;
-}
-
-static __always_inline
-void http2_iov_save_skip(struct connection *conn, __u8 is_req, __u32 skip, __u32 packed, __u8 data) {
-    if (!conn) {
-        return;
-    }
-    if (is_req) {
-        conn->h2_skip_req = skip;
-        conn->h2_skip_req_stream = packed;
-        conn->h2_skip_req_data = data;
-    } else {
-        conn->h2_skip_resp = skip;
-        conn->h2_skip_resp_stream = packed;
-        conn->h2_skip_resp_data = data;
-    }
 }
 
 static __always_inline
@@ -536,15 +451,7 @@ int http2_iov_impl(void *ctx) {
     if (!conn) {
         return 0;
     }
-    if (is_req) {
-        skip = conn->h2_skip_req;
-        packed = conn->h2_skip_req_stream;
-        data = conn->h2_skip_req_data;
-    } else {
-        skip = conn->h2_skip_resp;
-        packed = conn->h2_skip_resp_stream;
-        data = conn->h2_skip_resp_data;
-    }
+    http2_skip_load(conn, is_req, &skip, &packed, &data);
     dst = bpf_map_lookup_elem(&http2_emit_heap, &zero);
     if (!dst) {
         return 0;
@@ -612,7 +519,7 @@ int http2_iov_impl(void *ctx) {
             }
             if (iovs->consumed >= iovs->total || data == HTTP2_SKIP_HEADER) {
                 conn = bpf_map_lookup_elem(&active_connections, &cid);
-                http2_iov_save_skip(conn, is_req, skip, packed, data);
+                http2_skip_save(conn, is_req, skip, packed, data);
                 return 0;
             }
             skip = 0;
@@ -621,7 +528,7 @@ int http2_iov_impl(void *ctx) {
         }
     }
     conn = bpf_map_lookup_elem(&active_connections, &cid);
-    http2_iov_save_skip(conn, is_req, skip, packed, data);
+    http2_skip_save(conn, is_req, skip, packed, data);
     iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
     if (iovs && iovs->n && iovs->v[0].len >= HTTP2_PREFACE_SIZE && iovs->idx == 0 && iovs->off == 0) {
         char p[6];
@@ -650,15 +557,7 @@ int http2_iov_impl(void *ctx) {
             n = expect;
         }
         PAYLOAD_BOUND(n);
-        nh[0] = expect >> 16;
-        nh[1] = expect >> 8;
-        nh[2] = expect;
-        nh[3] = iovs->cut_hdr[3];
-        nh[4] = iovs->cut_hdr[4];
-        nh[5] = iovs->cut_hdr[5];
-        nh[6] = iovs->cut_hdr[6];
-        nh[7] = iovs->cut_hdr[7];
-        nh[8] = iovs->cut_hdr[8];
+        http2_encode_frame_header(nh, expect, iovs->cut_hdr);
         if (copy_to_payload(dst, 0, HTTP2_FRAME_HEADER_SIZE, nh)) {
             return 0;
         }
@@ -676,11 +575,11 @@ int http2_iov_impl(void *ctx) {
         } else {
             skip = 0;
         }
-        http2_iov_save_skip(conn, is_req, skip, (expect << 16) | (n & 0xffffu), HTTP2_SKIP_HEADER);
+        http2_skip_save(conn, is_req, skip, (expect << 16) | (n & 0xffffu), HTTP2_SKIP_HEADER);
         return 0;
     }
     conn = bpf_map_lookup_elem(&active_connections, &cid);
-    http2_iov_save_skip(conn, is_req, t.skip, t.skip_stream, t.skip_data);
+    http2_skip_save(conn, is_req, t.skip, t.skip_stream, t.skip_data);
     return 0;
 }
 

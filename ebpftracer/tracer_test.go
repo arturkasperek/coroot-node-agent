@@ -2735,7 +2735,13 @@ type tracerSub struct {
 	dead    bool
 	stopped bool
 	pids    map[uint32]struct{}
-	fds     map[uint64]struct{}
+	// fds maps a watched fd to the kernel connection_timestamp observed at
+	// watchConn time. fd numbers get reused across parallel tests running in
+	// the same process, so matching on fd alone would let a later, unrelated
+	// connection on a recycled fd leak into this subscription; the timestamp
+	// is the kernel's per-connection generation marker (reset on every
+	// accept()/connect()) and disambiguates that case.
+	fds     map[uint64]uint64
 	selfAll bool
 }
 
@@ -2754,7 +2760,7 @@ func startTracer(t *testing.T) (*Tracer, func() *Event, func()) {
 	s := &tracerSub{
 		ch:   make(chan Event, tracerSubBuf),
 		pids: map[uint32]struct{}{},
-		fds:  map[uint64]struct{}{},
+		fds:  map[uint64]uint64{},
 	}
 	hubMu.Lock()
 	subs[s] = struct{}{}
@@ -2810,8 +2816,8 @@ func (s *tracerSub) match(e Event) bool {
 		if e.Type != EventTypeL7Request {
 			return false
 		}
-		_, ok := s.fds[e.Fd]
-		return ok
+		ts, ok := s.fds[e.Fd]
+		return ok && ts == e.Timestamp
 	}
 	_, ok := s.pids[e.Pid]
 	return ok
@@ -2861,8 +2867,11 @@ func watchConn(t *testing.T, c net.Conn) {
 	t.Helper()
 	s := subFor(t)
 	fd := connFD(t, c)
+	cid := ConnectionId{FD: fd, PID: uint32(os.Getpid())}
+	conn, ok := sharedTr.LookupActiveConnection(cid)
+	require.True(t, ok, "no active_connections entry for watched fd; the accept()/connect() tracepoint may not have run yet")
 	s.mu.Lock()
-	s.fds[fd] = struct{}{}
+	s.fds[fd] = conn.Timestamp
 	s.mu.Unlock()
 }
 

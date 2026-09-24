@@ -1387,15 +1387,7 @@ int http2_resume_impl(void *ctx, void *tail_progs) {
     if (!conn) {
         return 0;
     }
-    if (is_req) {
-        skip = conn->h2_skip_req;
-        packed = conn->h2_skip_req_stream;
-        data = conn->h2_skip_req_data;
-    } else {
-        skip = conn->h2_skip_resp;
-        packed = conn->h2_skip_resp_stream;
-        data = conn->h2_skip_resp_data;
-    }
+    http2_skip_load(conn, is_req, &skip, &packed, &data);
     pos = 0;
     if (size > HTTP2_SRC_MAX) {
         size = HTTP2_SRC_MAX;
@@ -1453,15 +1445,7 @@ int http2_resume_impl(void *ctx, void *tail_progs) {
                 if (!conn) {
                     return 0;
                 }
-                if (is_req) {
-                    conn->h2_skip_req = skip;
-                    conn->h2_skip_req_stream = packed;
-                    conn->h2_skip_req_data = data;
-                } else {
-                    conn->h2_skip_resp = skip;
-                    conn->h2_skip_resp_stream = packed;
-                    conn->h2_skip_resp_data = data;
-                }
+                http2_skip_save(conn, is_req, skip, packed, data);
                 return 0;
             }
             skip = 0;
@@ -1473,15 +1457,7 @@ int http2_resume_impl(void *ctx, void *tail_progs) {
     if (!conn) {
         return 0;
     }
-    if (is_req) {
-        conn->h2_skip_req = skip;
-        conn->h2_skip_req_stream = packed;
-        conn->h2_skip_req_data = data;
-    } else {
-        conn->h2_skip_resp = skip;
-        conn->h2_skip_resp_stream = packed;
-        conn->h2_skip_resp_data = data;
-    }
+    http2_skip_save(conn, is_req, skip, packed, data);
     s = bpf_map_lookup_elem(&http2_tail_state, &zero);
     if (!s) {
         return 0;
@@ -1532,15 +1508,7 @@ int http2_walk_impl(void *ctx, void *tail_progs) {
     if (!conn) {
         return 0;
     }
-    if (is_req) {
-        t.skip = conn->h2_skip_req;
-        t.skip_stream = conn->h2_skip_req_stream;
-        t.skip_data = conn->h2_skip_req_data;
-    } else {
-        t.skip = conn->h2_skip_resp;
-        t.skip_stream = conn->h2_skip_resp_stream;
-        t.skip_data = conn->h2_skip_resp_data;
-    }
+    http2_skip_load(conn, is_req, &t.skip, &t.skip_stream, &t.skip_data);
     dst = bpf_map_lookup_elem(&http2_emit_heap, &zero);
     if (!dst) {
         return 0;
@@ -1560,15 +1528,7 @@ int http2_walk_impl(void *ctx, void *tail_progs) {
     if (!conn) {
         return 0;
     }
-    if (is_req) {
-        conn->h2_skip_req = t.skip;
-        conn->h2_skip_req_stream = t.skip_stream;
-        conn->h2_skip_req_data = t.skip_data;
-    } else {
-        conn->h2_skip_resp = t.skip;
-        conn->h2_skip_resp_stream = t.skip_stream;
-        conn->h2_skip_resp_data = t.skip_data;
-    }
+    http2_skip_save(conn, is_req, t.skip, t.skip_stream, t.skip_data);
     return 0;
 }
 
@@ -1656,15 +1616,7 @@ int http2_cut_impl(void *ctx) {
     if (n >= expect || n != take) {
         return 0;
     }
-    nh[0] = expect >> 16;
-    nh[1] = expect >> 8;
-    nh[2] = expect;
-    nh[3] = hdr[3];
-    nh[4] = hdr[4];
-    nh[5] = hdr[5];
-    nh[6] = hdr[6];
-    nh[7] = hdr[7];
-    nh[8] = hdr[8];
+    http2_encode_frame_header(nh, expect, hdr);
     dst = bpf_map_lookup_elem(&http2_emit_heap, &zero);
     if (!dst) {
         return 0;
@@ -1683,15 +1635,7 @@ int http2_cut_impl(void *ctx) {
     if (!conn) {
         return 0;
     }
-    if (is_req) {
-        conn->h2_skip_req = length - take;
-        conn->h2_skip_req_stream = (expect << 16) | (n & 0xffffu);
-        conn->h2_skip_req_data = HTTP2_SKIP_HEADER;
-    } else {
-        conn->h2_skip_resp = length - take;
-        conn->h2_skip_resp_stream = (expect << 16) | (n & 0xffffu);
-        conn->h2_skip_resp_data = HTTP2_SKIP_HEADER;
-    }
+    http2_skip_save(conn, is_req, length - take, (expect << 16) | (n & 0xffffu), HTTP2_SKIP_HEADER);
     return 0;
 }
 

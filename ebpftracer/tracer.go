@@ -220,6 +220,18 @@ func (t *Tracer) DeleteActiveConnection(cid ConnectionId) error {
 	return t.collection.Maps["active_connections"].Delete(&cid)
 }
 
+// LookupActiveConnection returns the kernel's current connection state for cid, if any.
+// Connection.Timestamp uniquely identifies the connection generation living at cid's
+// (pid, fd): the kernel resets it on every accept()/connect(), so it lets a caller tell
+// a still-live connection apart from a later, unrelated one that reused the same fd.
+func (t *Tracer) LookupActiveConnection(cid ConnectionId) (Connection, bool) {
+	var conn Connection
+	if err := t.collection.Maps["active_connections"].Lookup(&cid, &conn); err != nil {
+		return Connection{}, false
+	}
+	return conn, true
+}
+
 func (t *Tracer) LostSamples() uint64 {
 	return t.lostSamples.Load() + t.ringbufDrops("l7_events_dropped") + t.ringbufDrops("tcp_connect_events_dropped")
 }

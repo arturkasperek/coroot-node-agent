@@ -266,6 +266,56 @@ static __always_inline __u32 http2_bound_body(__u32 n) {
    frame start. Not stored on the connection — http2_cut handles it. */
 #define HTTP2_SKIP_CUT 3
 
+/* h2_skip_req/h2_skip_resp on struct connection hold the same three fields
+   (skip, packed stream/progress, data kind) for the two directions. Both
+   the contiguous walker (l7.c) and the iovec walker (http2_iov.c) resume
+   from and save to this state, so the load/save pair lives here once. */
+static __always_inline
+void http2_skip_save(struct connection *conn, __u8 is_req, __u32 skip, __u32 packed, __u8 data) {
+    if (!conn) {
+        return;
+    }
+    if (is_req) {
+        conn->h2_skip_req = skip;
+        conn->h2_skip_req_stream = packed;
+        conn->h2_skip_req_data = data;
+    } else {
+        conn->h2_skip_resp = skip;
+        conn->h2_skip_resp_stream = packed;
+        conn->h2_skip_resp_data = data;
+    }
+}
+
+static __always_inline
+void http2_skip_load(struct connection *conn, __u8 is_req, __u32 *skip, __u32 *packed, __u8 *data) {
+    if (is_req) {
+        *skip = conn->h2_skip_req;
+        *packed = conn->h2_skip_req_stream;
+        *data = conn->h2_skip_req_data;
+    } else {
+        *skip = conn->h2_skip_resp;
+        *packed = conn->h2_skip_resp_stream;
+        *data = conn->h2_skip_resp_data;
+    }
+}
+
+/* Builds a frame header with a (possibly trimmed) length field, keeping
+   type/flags/stream_id from the original. Shared by every place that emits
+   a frame: the two walkers and the two cut-frame completions. */
+static __always_inline
+void http2_encode_frame_header(unsigned char nh[HTTP2_FRAME_HEADER_SIZE], __u32 len,
+                                const unsigned char hdr[HTTP2_FRAME_HEADER_SIZE]) {
+    nh[0] = len >> 16;
+    nh[1] = len >> 8;
+    nh[2] = len;
+    nh[3] = hdr[3];
+    nh[4] = hdr[4];
+    nh[5] = hdr[5];
+    nh[6] = hdr[6];
+    nh[7] = hdr[7];
+    nh[8] = hdr[8];
+}
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, int);
@@ -297,23 +347,115 @@ int http2_copyable(__u8 type) {
     return type == HTTP2_FRAME_DATA || type == HTTP2_FRAME_HEADERS || type == HTTP2_FRAME_CONTINUATION;
 }
 
+/* Pure frame-header bookkeeping shared by the contiguous and iovec frame
+   walkers: parses length/type/stream_id, decides how much of the frame is
+   present (take) vs. missing from this buffer (a->skip), applies the
+   MAX_PAYLOAD_SIZE flush timing, and — unless the frame turns out to be a
+   copyable frame cut short of its captured length — writes the (possibly
+   trimmed) frame header to a->dst and reserves the body's slot in a->dst.
+   Body bytes themselves are NOT copied here: that is the one truly
+   source-specific step (a contiguous bpf_probe_read vs. a multi-vector
+   iovec-cursor copy), left to the caller.
+   remain is the number of source bytes available right after the header.
+   Returns 0 with *copied_out (possibly 0) bytes to be copied by the caller
+   at *body_off_out; 1 to stop the walk (space/read error); 2 if a copyable
+   frame is cut short of its captured length — *copied_out and *take_out are
+   still valid so the caller can stash a cut-resume record, but no header
+   or body has been written to a->dst. */
+static __always_inline
+int http2_classify_frame(struct http2_trim_args *a, const unsigned char hdr[HTTP2_FRAME_HEADER_SIZE],
+                          __u32 remain, __u32 *take_out, __u32 *copied_out, __u32 *body_off_out) {
+    unsigned char nh[HTTP2_FRAME_HEADER_SIZE];
+    __u32 length;
+    __u32 stream_id;
+    __u32 take;
+    __u32 copied;
+    __u32 out;
+    __u32 expect;
+    __u8 type;
+
+    length = ((__u32)hdr[0] << 16) | ((__u32)hdr[1] << 8) | hdr[2];
+    type = hdr[3];
+    stream_id = ((__u32)hdr[5] << 24) | ((__u32)hdr[6] << 16) | ((__u32)hdr[7] << 8) | hdr[8];
+
+    take = length;
+    if (take > remain) {
+        take = remain;
+    }
+    HTTP2_SRC_BOUND(take);
+    if (take < length) {
+        a->skip = length - take;
+        a->skip_stream = stream_id;
+        a->skip_data = type == HTTP2_FRAME_DATA;
+    } else {
+        a->skip = 0;
+        a->skip_data = 0;
+    }
+    *take_out = take;
+    *copied_out = 0;
+    if (!http2_copyable(type)) {
+        return 0;
+    }
+
+    out = a->out_len;
+    if (out > MAX_PAYLOAD_SIZE) {
+        return 1;
+    }
+    PAYLOAD_BOUND(out);
+    /* DATA has its own 1KB slot, not the space left after headers. */
+    if (type == HTTP2_FRAME_DATA && out > 0) {
+        http2_flush(a);
+        out = 0;
+    }
+    if (out > 0 &&
+        take <= MAX_PAYLOAD_SIZE - HTTP2_FRAME_HEADER_SIZE &&
+        out + HTTP2_FRAME_HEADER_SIZE + take > MAX_PAYLOAD_SIZE) {
+        http2_flush(a);
+        out = 0;
+    } else if (out + HTTP2_FRAME_HEADER_SIZE > MAX_PAYLOAD_SIZE) {
+        http2_flush(a);
+        out = 0;
+    }
+    copied = take;
+    if (out + HTTP2_FRAME_HEADER_SIZE + copied > MAX_PAYLOAD_SIZE) {
+        copied = MAX_PAYLOAD_SIZE - out - HTTP2_FRAME_HEADER_SIZE;
+    }
+    copied = http2_bound_body(copied);
+    *copied_out = copied;
+    if (take < length && copied == take) {
+        expect = length;
+        if (expect > HTTP2_CAPTURE_MAX) {
+            expect = HTTP2_CAPTURE_MAX;
+        }
+        if (copied < expect) {
+            return 2;
+        }
+    }
+    http2_encode_frame_header(nh, copied, hdr);
+    if (copy_to_payload(a->dst, out, HTTP2_FRAME_HEADER_SIZE, nh)) {
+        return 1;
+    }
+    a->out_len = out + HTTP2_FRAME_HEADER_SIZE + copied;
+    if (!a->first_stream) {
+        a->first_stream = stream_id;
+    }
+    *body_off_out = out + HTTP2_FRAME_HEADER_SIZE;
+    return 0;
+}
+
 /* Frame walk for the tail-call path. A HEADERS, CONTINUATION or DATA frame
    cut before 1KB is captured stops the loop (HTTP2_SKIP_CUT) so http2_cut
    can promise the length without growing this callback. */
 static long http2_topup_cb(__u32 i, void *ctx) {
     struct http2_trim_args *a = ctx;
     unsigned char hdr[HTTP2_FRAME_HEADER_SIZE];
-    unsigned char nh[HTTP2_FRAME_HEADER_SIZE];
     __u32 pos;
     __u32 remain;
-    __u32 length;
-    __u32 stream_id;
-    __u32 take;
     __u32 start;
+    __u32 take;
     __u32 copied;
-    __u32 out;
-    __u32 expect;
-    __u8 type;
+    __u32 body_off;
+    int rc;
     (void)i;
     if (!a || !a->src || !a->dst) {
         return 1;
@@ -336,9 +478,6 @@ static long http2_topup_cb(__u32 i, void *ctx) {
     }
     pos += HTTP2_FRAME_HEADER_SIZE;
     HTTP2_SRC_BOUND(pos);
-    length = ((__u32)hdr[0] << 16) | ((__u32)hdr[1] << 8) | hdr[2];
-    type = hdr[3];
-    stream_id = ((__u32)hdr[5] << 24) | ((__u32)hdr[6] << 16) | ((__u32)hdr[7] << 8) | hdr[8];
     remain = 0;
     if (pos < a->src_size && pos < HTTP2_SRC_MAX) {
         remain = a->src_size - pos;
@@ -346,72 +485,17 @@ static long http2_topup_cb(__u32 i, void *ctx) {
             remain = HTTP2_SRC_MAX;
         }
     }
-    take = length;
-    if (take > remain) {
-        take = remain;
+    rc = http2_classify_frame(a, hdr, remain, &take, &copied, &body_off);
+    if (rc == 2) {
+        a->pos = start;
+        a->skip_data = HTTP2_SKIP_CUT;
+        return 1;
     }
-    HTTP2_SRC_BOUND(take);
-    if (take < length) {
-        a->skip = length - take;
-        a->skip_stream = stream_id;
-        a->skip_data = type == HTTP2_FRAME_DATA;
-    } else {
-        a->skip = 0;
-        a->skip_data = 0;
+    if (rc) {
+        return 1;
     }
-    if (http2_copyable(type)) {
-        out = a->out_len;
-        if (out > MAX_PAYLOAD_SIZE) {
-            return 1;
-        }
-        PAYLOAD_BOUND(out);
-        /* DATA has its own 1KB slot, not the space left after headers. */
-        if (type == HTTP2_FRAME_DATA && out > 0) {
-            http2_flush(a);
-            out = 0;
-        }
-        if (out > 0 &&
-            take <= MAX_PAYLOAD_SIZE - HTTP2_FRAME_HEADER_SIZE &&
-            out + HTTP2_FRAME_HEADER_SIZE + take > MAX_PAYLOAD_SIZE) {
-            http2_flush(a);
-            out = 0;
-        } else if (out + HTTP2_FRAME_HEADER_SIZE > MAX_PAYLOAD_SIZE) {
-            http2_flush(a);
-            out = 0;
-        }
-        copied = take;
-        if (out + HTTP2_FRAME_HEADER_SIZE + copied > MAX_PAYLOAD_SIZE) {
-            copied = MAX_PAYLOAD_SIZE - out - HTTP2_FRAME_HEADER_SIZE;
-        }
-        copied = http2_bound_body(copied);
-        if (take < length && copied == take) {
-            expect = length;
-            if (expect > HTTP2_CAPTURE_MAX) {
-                expect = HTTP2_CAPTURE_MAX;
-            }
-            if (copied < expect) {
-                a->pos = start;
-                a->skip_data = HTTP2_SKIP_CUT;
-                return 1;
-            }
-        }
-        nh[0] = copied >> 16;
-        nh[1] = copied >> 8;
-        nh[2] = copied;
-        nh[3] = hdr[3];
-        nh[4] = hdr[4];
-        nh[5] = hdr[5];
-        nh[6] = hdr[6];
-        nh[7] = hdr[7];
-        nh[8] = hdr[8];
-        if (copy_to_payload(a->dst, out, HTTP2_FRAME_HEADER_SIZE, nh) ||
-            copy_to_payload(a->dst, out + HTTP2_FRAME_HEADER_SIZE, copied, a->src + pos)) {
-            return 1;
-        }
-        a->out_len = out + HTTP2_FRAME_HEADER_SIZE + copied;
-        if (!a->first_stream) {
-            a->first_stream = stream_id;
-        }
+    if (copied && copy_to_payload(a->dst, body_off, copied, a->src + pos)) {
+        return 1;
     }
     a->pos = pos + take;
     return 0;
