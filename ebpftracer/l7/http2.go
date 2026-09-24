@@ -14,6 +14,9 @@ import (
 const (
 	http2FrameHeaderLength = 9
 	http2DecoderGcInterval = uint64(10 * time.Minute)
+	// A ring message is at most 1KB. A frame whose declared length is within
+	// that bound can arrive split across several messages.
+	http2ReassemblyMax = 1024
 )
 
 type Http2FrameHeader struct {
@@ -34,11 +37,20 @@ type Http2Request struct {
 	kernelTime uint64
 }
 
+type http2PartialFrame struct {
+	header Http2FrameHeader
+	body   []byte
+}
+
 type Http2Parser struct {
 	clientDecoder  *hpack.Decoder
 	serverDecoder  *hpack.Decoder
 	activeRequests map[uint32]*Http2Request
 	lastGcTime     uint64
+	clientPartial  *http2PartialFrame
+	serverPartial  *http2PartialFrame
+	clientHeader   []byte
+	serverHeader   []byte
 }
 
 func NewHttp2Parser() *Http2Parser {
@@ -61,83 +73,69 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 	}
 
 	var decoder *hpack.Decoder
+	var partial **http2PartialFrame
+	var header *[]byte
 	statuses := map[uint32]Status{}
 	grpcStatuses := map[uint32]Status{}
-
-	offset := 0
 
 	switch method {
 	case MethodHttp2ClientFrames:
 		decoder = p.clientDecoder
+		partial = &p.clientPartial
+		header = &p.clientHeader
 	case MethodHttp2ServerFrames:
 		decoder = p.serverDecoder
+		partial = &p.serverPartial
+		header = &p.serverHeader
 	default:
 		return nil
 	}
 	defer decoder.Close()
 
+	rest := payload
+	if *partial == nil && len(*header) > 0 {
+		rest = append(append([]byte{}, *header...), rest...)
+		*header = nil
+	}
+	if *partial != nil {
+		need := (*partial).header.Length - len((*partial).body)
+		if need > len(rest) {
+			(*partial).body = append((*partial).body, rest...)
+			return nil
+		}
+		body := append((*partial).body, rest[:need]...)
+		h := (*partial).header
+		rest = rest[need:]
+		*partial = nil
+		p.decodeHeaders(method, decoder, h, body, kernelTime, statuses, grpcStatuses)
+	}
+
 	for {
-		if len(payload)-offset < http2FrameHeaderLength {
+		if len(rest) < http2FrameHeaderLength {
+			if len(rest) > 0 {
+				*header = append([]byte(nil), rest...)
+			}
 			break
 		}
 		h := Http2FrameHeader{
-			Length:   int(binary.BigEndian.Uint32(payload[offset:]) >> 8),
-			Type:     http2.FrameType(payload[offset+3]),
-			Flags:    http2.Flags(payload[offset+4]),
-			StreamId: binary.BigEndian.Uint32(payload[offset+5:]) & (1<<31 - 1),
+			Length:   int(binary.BigEndian.Uint32(rest) >> 8),
+			Type:     http2.FrameType(rest[3]),
+			Flags:    http2.Flags(rest[4]),
+			StreamId: binary.BigEndian.Uint32(rest[5:]) & (1<<31 - 1),
 		}
-		if len(payload)-offset-http2FrameHeaderLength < h.Length {
+		if h.Length < 0 || len(rest)-http2FrameHeaderLength < h.Length {
+			if h.Length >= 0 && h.Length <= http2ReassemblyMax {
+				body := append([]byte(nil), rest[http2FrameHeaderLength:]...)
+				*partial = &http2PartialFrame{header: h, body: body}
+			}
 			break
 		}
-		offset += http2FrameHeaderLength
+		body := rest[http2FrameHeaderLength : http2FrameHeaderLength+h.Length]
+		rest = rest[http2FrameHeaderLength+h.Length:]
 		if h.Type != http2.FrameHeaders {
-			offset += h.Length
 			continue
 		}
-		switch method {
-		case MethodHttp2ClientFrames:
-			req := p.activeRequests[h.StreamId]
-			if req == nil {
-				req = &Http2Request{kernelTime: kernelTime}
-				p.activeRequests[h.StreamId] = req
-			}
-			decoder.SetEmitFunc(func(hf hpack.HeaderField) {
-				switch hf.Name {
-				case ":method":
-					if req.Method == "" && isHttpMethod(hf.Value) {
-						req.Method = hf.Value
-					}
-				case ":path":
-					if req.Path == "" && isHttpPath(hf.Value) {
-						req.Path = hf.Value
-					}
-				case ":scheme":
-					if req.Scheme == "" && isHttpScheme(hf.Value) {
-						req.Scheme = hf.Value
-					}
-				}
-			})
-		case MethodHttp2ServerFrames:
-			if _, ok := statuses[h.StreamId]; !ok {
-				statuses[h.StreamId] = 0
-			}
-			decoder.SetEmitFunc(func(hf hpack.HeaderField) {
-				switch hf.Name {
-				case ":status":
-					s, _ := strconv.Atoi(hf.Value)
-					statuses[h.StreamId] = Status(s)
-				case "grpc-status":
-					s, _ := strconv.Atoi(hf.Value)
-					grpcStatuses[h.StreamId] = Status(s)
-				}
-			})
-		}
-		next := offset + h.Length
-		_, err := decoder.Write(payload[offset:next])
-		offset = next
-		if err != nil {
-			continue
-		}
+		p.decodeHeaders(method, decoder, h, body, kernelTime, statuses, grpcStatuses)
 	}
 	var res []Http2Request
 	for streamId, status := range statuses {
@@ -170,6 +168,53 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 	}
 
 	return res
+}
+
+func (p *Http2Parser) decodeHeaders(method Method, decoder *hpack.Decoder, h Http2FrameHeader, body []byte, kernelTime uint64, statuses, grpcStatuses map[uint32]Status) {
+	if h.Type != http2.FrameHeaders {
+		return
+	}
+	switch method {
+	case MethodHttp2ClientFrames:
+		req := p.activeRequests[h.StreamId]
+		if req == nil {
+			req = &Http2Request{kernelTime: kernelTime}
+			p.activeRequests[h.StreamId] = req
+		}
+		decoder.SetEmitFunc(func(hf hpack.HeaderField) {
+			switch hf.Name {
+			case ":method":
+				if req.Method == "" && isHttpMethod(hf.Value) {
+					req.Method = hf.Value
+				}
+			case ":path":
+				if req.Path == "" && isHttpPath(hf.Value) {
+					req.Path = hf.Value
+				}
+			case ":scheme":
+				if req.Scheme == "" && isHttpScheme(hf.Value) {
+					req.Scheme = hf.Value
+				}
+			}
+		})
+	case MethodHttp2ServerFrames:
+		if _, ok := statuses[h.StreamId]; !ok {
+			statuses[h.StreamId] = 0
+		}
+		decoder.SetEmitFunc(func(hf hpack.HeaderField) {
+			switch hf.Name {
+			case ":status":
+				s, _ := strconv.Atoi(hf.Value)
+				statuses[h.StreamId] = Status(s)
+			case "grpc-status":
+				s, _ := strconv.Atoi(hf.Value)
+				grpcStatuses[h.StreamId] = Status(s)
+			}
+		})
+	default:
+		return
+	}
+	_, _ = decoder.Write(body)
 }
 
 func isHttpMethod(s string) bool {

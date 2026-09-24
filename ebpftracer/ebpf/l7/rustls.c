@@ -42,5 +42,5 @@ int rustls_read_exit(struct pt_regs *ctx) {
 
     int ret = (int)RUSTLS_RET_SIZE(ctx);
     __u32 pid = pid_tgid >> 32;
-    return trace_exit_read(ctx, id, pid, 1, ret);
+    return trace_exit_read(ctx, id, pid, 1, ret, &http2_tail_progs_kprobe);
 }

@@ -28,6 +28,10 @@ go-imports:
 go-test:
 	go test ./...
 
+.PHONY: build-ebpf
+build-ebpf:
+	$(MAKE) -C ebpftracer build
+
 # The agent only builds on linux, so on any other host `go test ./...` fails while
 # resolving platform-specific packages. This runs the same suite in a container.
 #

@@ -100,8 +100,18 @@ struct connection {
     __u64 bytes_received;
     __u8 is_inbound;
     __u8 protocol;
-    __u8 pad[6];
+    __u8 is_tls;
+    __u8 pad;
+    __u32 h2_skip_req;
+    __u32 h2_skip_resp;
+    __u32 h2_skip_req_stream;
+    __u32 h2_skip_resp_stream;
+    __u8 h2_skip_req_data;
+    __u8 h2_skip_resp_data;
+    __u8 pad2[2];
 };
+
+_Static_assert(sizeof(struct connection) == 48, "connection map value");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);

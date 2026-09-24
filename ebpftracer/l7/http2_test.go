@@ -122,3 +122,71 @@ func TestHttp2ParserIncompleteHeadersDoesNotCreateRequest(t *testing.T) {
 	require.Empty(t, p.Parse(MethodHttp2ClientFrames, complete[:http2FrameHeaderLength+1], 1))
 	require.Empty(t, p.activeRequests)
 }
+
+func TestHttp2ParserHeadersSplitAcrossReads(t *testing.T) {
+	frame := encodeHeadersFrame(t, 1, []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":path", Value: "/submit"},
+		{Name: ":scheme", Value: "http"},
+	})
+	require.Greater(t, len(frame), http2FrameHeaderLength+4)
+
+	p := NewHttp2Parser()
+	cut := http2FrameHeaderLength + 1
+	require.Empty(t, p.Parse(MethodHttp2ClientFrames, frame[:cut], 1))
+	require.Empty(t, p.activeRequests)
+	require.Empty(t, p.Parse(MethodHttp2ClientFrames, frame[cut:cut+2], 2))
+	require.Empty(t, p.activeRequests)
+	require.Empty(t, p.Parse(MethodHttp2ClientFrames, frame[cut+2:], 3))
+
+	req := p.activeRequests[1]
+	require.NotNil(t, req)
+	require.Equal(t, "POST", req.Method)
+	require.Equal(t, "/submit", req.Path)
+	require.Equal(t, "http", req.Scheme)
+}
+
+func TestHttp2ParserPartialHeadersThenNextFrame(t *testing.T) {
+	first := encodeHeadersFrame(t, 1, []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":path", Value: "/submit"},
+		{Name: ":scheme", Value: "http"},
+	})
+	second := encodeHeadersFrame(t, 3, []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":path", Value: "/users"},
+		{Name: ":scheme", Value: "https"},
+	})
+	cut := http2FrameHeaderLength + 1
+
+	p := NewHttp2Parser()
+	require.Empty(t, p.Parse(MethodHttp2ClientFrames, first[:cut], 1))
+	require.Empty(t, p.Parse(MethodHttp2ClientFrames, append(append([]byte{}, first[cut:]...), second...), 2))
+
+	submit := p.activeRequests[1]
+	require.NotNil(t, submit)
+	require.Equal(t, "POST", submit.Method)
+	require.Equal(t, "/submit", submit.Path)
+	users := p.activeRequests[3]
+	require.NotNil(t, users)
+	require.Equal(t, "GET", users.Method)
+	require.Equal(t, "/users", users.Path)
+	require.Equal(t, "https", users.Scheme)
+}
+
+func TestHttp2ParserHeadersOneByteAtATime(t *testing.T) {
+	frame := encodeHeadersFrame(t, 5, []hpack.HeaderField{
+		{Name: ":method", Value: "PUT"},
+		{Name: ":path", Value: "/items"},
+		{Name: ":scheme", Value: "http"},
+	})
+
+	p := NewHttp2Parser()
+	for i, b := range frame {
+		p.Parse(MethodHttp2ClientFrames, []byte{b}, uint64(i+1))
+	}
+	req := p.activeRequests[5]
+	require.NotNil(t, req)
+	require.Equal(t, "PUT", req.Method)
+	require.Equal(t, "/items", req.Path)
+}

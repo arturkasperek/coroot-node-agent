@@ -4,6 +4,7 @@ package ebpftracer
 
 import (
 	"bytes"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -518,7 +519,6 @@ func TestHttp2EgressEvents(t *testing.T) {
 }
 
 func TestHttp2TlsIngressEvents(t *testing.T) {
-	t.Skip("pre-existing: HTTP2 HEADERS often arrive split, so GET /users is not in one L7 event")
 	tr, getEvent, stop := startTracer(t, false)
 	defer stop()
 
@@ -552,6 +552,30 @@ func TestHttp2TlsEgressEvents(t *testing.T) {
 	require.False(t, l7ev.L7Request.IsInbound)
 }
 
+func TestHttp2TlsCutHeadersTopsUpRestOfFrame(t *testing.T) {
+	skipIfNotVM(t)
+	tr, getEvent, stop := startTracer(t, false)
+	defer stop()
+
+	addr, stopServer := startTLSDiscard(t)
+	defer stopServer()
+
+	clientBin := buildStdGoProg(t, "http2tlscut", http2TlsCutClientSrc)
+	ready := path.Join(t.TempDir(), "ready")
+	cmd := exec.Command(clientBin, addr, ready)
+	require.NoError(t, cmd.Start())
+	clientPid := uint32(cmd.Process.Pid)
+	attachGoTls(t, tr, clientPid)
+	require.NoError(t, os.WriteFile(ready, []byte("1"), 0644))
+	require.NoError(t, cmd.Wait())
+
+	const payloadLen = 400
+	got := collectHTTP2Until(t, getEvent, clientPid, func(payload []byte) bool {
+		return bytes.Count(payload, []byte{0xab}) >= payloadLen
+	})
+	require.Equal(t, payloadLen, bytes.Count(got, []byte{0xab}))
+}
+
 func TestHttp2WriteTilesDataThenHeaders(t *testing.T) {
 	skipIfNotVM(t)
 	getEvent, stop := runTracer(t, false)
@@ -573,7 +597,923 @@ func TestHttp2WriteTilesDataThenHeaders(t *testing.T) {
 	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
 		return e.Type == EventTypeL7Request && e.Pid == uint32(os.Getpid()) &&
 			e.L7Request != nil && e.L7Request.Protocol == l7.ProtocolHTTP2 &&
-			!e.L7Request.IsInbound && bytes.Equal(e.L7Request.Payload, payload)
+			!e.L7Request.IsInbound && bytes.Contains(e.L7Request.Payload, headers)
+	})
+	require.Equal(t, l7.ProtocolHTTP2, got.L7Request.Protocol)
+	require.False(t, got.L7Request.IsInbound)
+}
+
+func TestHttp2SkipLeftThenHeaders(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	headers := http2HeadersGETUsers(t, addr)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	data := http2DataFrame(make([]byte, 2000), 1, false)
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(data[:9+100])
+	require.NoError(t, err)
+	_, err = conn.Write(append(data[9+100:], headers...))
+	require.NoError(t, err)
+
+	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		return e.Type == EventTypeL7Request && e.Pid == uint32(os.Getpid()) &&
+			e.L7Request != nil && e.L7Request.Protocol == l7.ProtocolHTTP2 &&
+			!e.L7Request.IsInbound && bytes.Contains(e.L7Request.Payload, headers)
+	})
+	require.Equal(t, l7.ProtocolHTTP2, got.L7Request.Protocol)
+	require.False(t, got.L7Request.IsInbound)
+}
+
+func TestHttp2CutHeadersTopsUpRestOfFrame(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const payloadLen = 400
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(frame[:http2FrameHeaderLen+40])
+	require.NoError(t, err)
+	_, err = conn.Write(frame[http2FrameHeaderLen+40:])
+	require.NoError(t, err)
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+func TestHttp2FirstWriteCutHeadersTopsUpRestOfFrame(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const payloadLen = 400
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(append(settings, frame[:http2FrameHeaderLen+40]...))
+	require.NoError(t, err)
+	_, err = conn.Write(frame[http2FrameHeaderLen+40:])
+	require.NoError(t, err)
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+func TestHttp2CutHeadersTopsUpAcrossTinyWrites(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const payloadLen = 400
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	off := http2FrameHeaderLen + 20
+	_, err = conn.Write(frame[:off])
+	require.NoError(t, err)
+	for off < len(frame) {
+		n := 7
+		if off+n > len(frame) {
+			n = len(frame) - off
+		}
+		_, err = conn.Write(frame[off : off+n])
+		require.NoError(t, err)
+		off += n
+	}
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+func TestHttp2CutHeadersStopsAtOneKB(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const payloadLen = 3000
+	const captured = MaxPayloadSize - http2FrameHeaderLen
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xcd}, payloadLen), 1)
+	headers := http2HeadersGETUsers(t, addr)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(frame[:http2FrameHeaderLen+100])
+	require.NoError(t, err)
+	_, err = conn.Write(frame[http2FrameHeaderLen+100:])
+	require.NoError(t, err)
+	_, err = conn.Write(headers)
+	require.NoError(t, err)
+
+	got := collectClientHTTP2Until(t, getEvent, func(payload []byte) bool {
+		return bytes.Contains(payload, headers)
+	})
+	require.Equal(t, captured, bytes.Count(got, []byte{0xcd}))
+	require.True(t, bytes.Contains(got, headers))
+}
+
+func TestHttp2CutDataTopsUpRestOfFrame(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const payloadLen = 400
+	frame := http2DataFrame(bytes.Repeat([]byte{0xab}, payloadLen), 1, false)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(frame[:http2FrameHeaderLen+40])
+	require.NoError(t, err)
+	_, err = conn.Write(frame[http2FrameHeaderLen+40:])
+	require.NoError(t, err)
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+func TestHttp2DataCapturesOneKBOnItsOwn(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const captured = MaxPayloadSize - http2FrameHeaderLen
+	headers := http2HeadersRaw(bytes.Repeat([]byte{0x11}, 200), 1)
+	data := http2DataFrame(bytes.Repeat([]byte{0xab}, 3000), 1, false)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(append(headers, data...))
+	require.NoError(t, err)
+
+	got := collectClientHTTP2Until(t, getEvent, func(payload []byte) bool {
+		return bytes.Count(payload, []byte{0xab}) >= captured && bytes.Contains(payload, headers)
+	})
+	require.Equal(t, captured, bytes.Count(got, []byte{0xab}))
+	require.True(t, bytes.Contains(got, headers))
+}
+
+func TestHttp2EmptyHeadersFrameIsEmitted(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	empty := []byte{0, 0, 0, 1, 0, 0, 0, 0, 1}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(empty)
+	require.NoError(t, err)
+
+	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		return e.Type == EventTypeL7Request && e.Pid == uint32(os.Getpid()) &&
+			e.L7Request != nil && e.L7Request.Protocol == l7.ProtocolHTTP2 &&
+			!e.L7Request.IsInbound && bytes.Contains(e.L7Request.Payload, empty)
+	})
+	require.Equal(t, uint32(1), got.L7Request.StatementId)
+	require.False(t, got.L7Request.IsInbound)
+}
+
+func TestHttp2EmitsWholeDataBuffer(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	// Frames stay under 1KB so each one is copied whole. Together they are
+	// bigger than one ring message.
+	first := bytes.Repeat(http2DataFrame(bytes.Repeat([]byte{0x11}, 200), 1, false), 10)
+	second := bytes.Repeat(http2DataFrame(bytes.Repeat([]byte{0x22}, 200), 1, false), 10)
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(first)
+	require.NoError(t, err)
+	_, err = conn.Write(second)
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	var n11, n22, events int
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && (n11 < 2000 || n22 < 2000) {
+		e := getEvent()
+		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP2 || e.L7Request.IsInbound {
+			continue
+		}
+		events++
+		n11 += bytes.Count(e.L7Request.Payload, []byte{0x11})
+		n22 += bytes.Count(e.L7Request.Payload, []byte{0x22})
+	}
+	require.Equal(t, 2000, n11)
+	require.Equal(t, 2000, n22)
+	require.Greater(t, events, 1, "a write bigger than 1KB must span more than one ring message")
+}
+
+func TestHttp2EmitsEveryEmptyHeadersFrame(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const frames = 200
+	one := []byte{0, 0, 0, 1, 0, 0, 0, 0, 1}
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(bytes.Repeat(one, frames))
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	var got, events int
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && got < frames {
+		e := getEvent()
+		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP2 || e.L7Request.IsInbound {
+			continue
+		}
+		n := bytes.Count(e.L7Request.Payload, one)
+		if n == 0 {
+			continue
+		}
+		events++
+		got += n
+	}
+	require.Equal(t, frames, got)
+	require.Greater(t, events, 1, "200 empty HEADERS are 1800 bytes, more than one 1KB message")
+}
+
+func TestHttp2HeadersPast4KBInOneWrite(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	headers := http2HeadersGETUsers(t, addr)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(http2DataFrame(bytes.Repeat([]byte{0x11}, 2000), 1, false))
+	require.NoError(t, err)
+	// One syscall: DATA body sits past 4KB, HEADERS follow it in the same buffer.
+	_, err = conn.Write(append(http2DataFrame(make([]byte, 5000), 1, false), headers...))
+	require.NoError(t, err)
+
+	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		return e.Type == EventTypeL7Request && e.Pid == uint32(os.Getpid()) &&
+			e.L7Request != nil && e.L7Request.Protocol == l7.ProtocolHTTP2 &&
+			!e.L7Request.IsInbound && bytes.Contains(e.L7Request.Payload, headers)
+	})
+	require.Equal(t, l7.ProtocolHTTP2, got.L7Request.Protocol)
+	require.False(t, got.L7Request.IsInbound)
+}
+
+func TestHttp2WritevFramesPastFirstKB(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const frames = 40
+	const payloadLen = 40
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+
+	vecs := make([][]byte, frames)
+	for i := 0; i < frames; i++ {
+		vecs[i] = http2DataFrame(bytes.Repeat([]byte{0xab}, payloadLen), 1, false)
+	}
+	writevConn(t, conn, vecs)
+
+	require.Equal(t, frames*payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, frames*payloadLen))
+}
+
+func TestHttp2WritevFirstSyscallFramesPastFirstKB(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const frames = 40
+	const payloadLen = 40
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	vecs := make([][]byte, 0, frames+1)
+	vecs = append(vecs, settings)
+	for i := 0; i < frames; i++ {
+		vecs = append(vecs, http2DataFrame(bytes.Repeat([]byte{0xab}, payloadLen), 1, false))
+	}
+	writevConn(t, conn, vecs)
+
+	require.Equal(t, frames*payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, frames*payloadLen))
+}
+
+func TestHttp2WritevHeadersPast4KBInOneVector(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	headers := http2HeadersGETUsers(t, addr)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	body := append(http2DataFrame(make([]byte, 5000), 1, false), headers...)
+	writevConn(t, conn, [][]byte{body})
+
+	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		return e.Type == EventTypeL7Request && e.Pid == uint32(os.Getpid()) &&
+			e.L7Request != nil && e.L7Request.Protocol == l7.ProtocolHTTP2 &&
+			!e.L7Request.IsInbound && bytes.Contains(e.L7Request.Payload, headers)
+	})
+	require.Equal(t, l7.ProtocolHTTP2, got.L7Request.Protocol)
+	require.False(t, got.L7Request.IsInbound)
+}
+
+func TestHttp2WritevHeaderAndBodyAreSeparateVectors(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+
+	const prefix = 40
+	const payloadLen = 20
+	vecs := make([][]byte, 0, prefix*2+2)
+	for i := 0; i < prefix; i++ {
+		frame := http2DataFrame(bytes.Repeat([]byte{0x11}, payloadLen), 1, false)
+		vecs = append(vecs, frame[:http2FrameHeaderLen], frame[http2FrameHeaderLen:])
+	}
+	marker := http2DataFrame(bytes.Repeat([]byte{0xcd}, payloadLen), 3, false)
+	vecs = append(vecs, marker[:http2FrameHeaderLen], marker[http2FrameHeaderLen:])
+	writevConn(t, conn, vecs)
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xcd, payloadLen))
+}
+
+func TestHttp2WritevHeaderSplitAcrossVectors(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+
+	const prefix = 30
+	vecs := make([][]byte, 0, prefix+3)
+	for i := 0; i < prefix; i++ {
+		vecs = append(vecs, http2DataFrame(bytes.Repeat([]byte{0x11}, 40), 1, false))
+	}
+	const payloadLen = 24
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xcd}, payloadLen), 7)
+	vecs = append(vecs, frame[:4], frame[4:http2FrameHeaderLen], frame[http2FrameHeaderLen:])
+	writevConn(t, conn, vecs)
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xcd, payloadLen))
+}
+
+func TestHttp2WritevDataStopsAt1KBThenLaterHeaders(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const captured = MaxPayloadSize - http2FrameHeaderLen
+	headers := http2HeadersGETUsers(t, addr)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	data := http2DataFrame(bytes.Repeat([]byte{0xab}, 3000), 1, false)
+	writevConn(t, conn, [][]byte{data, headers})
+
+	got := collectClientHTTP2Until(t, getEvent, func(payload []byte) bool {
+		return bytes.Count(payload, []byte{0xab}) >= captured && bytes.Contains(payload, headers)
+	})
+	require.Equal(t, captured, bytes.Count(got, []byte{0xab}))
+	require.True(t, bytes.Contains(got, headers))
+}
+
+func TestHttp2WritevTwoStreamsPastFirstKB(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+
+	vecs := make([][]byte, 0, 34)
+	for i := 0; i < 30; i++ {
+		vecs = append(vecs, http2DataFrame(bytes.Repeat([]byte{0x11}, 40), 1, false))
+	}
+	stream1 := http2HeadersRaw(bytes.Repeat([]byte{0x21}, 16), 1)
+	stream2 := http2HeadersRaw(bytes.Repeat([]byte{0x22}, 16), 3)
+	vecs = append(vecs, stream1, http2DataFrame(bytes.Repeat([]byte{0x33}, 32), 1, false), stream2)
+	writevConn(t, conn, vecs)
+
+	got := collectClientHTTP2Until(t, getEvent, func(payload []byte) bool {
+		return bytes.Contains(payload, stream1) && bytes.Contains(payload, stream2)
+	})
+	require.True(t, bytes.Contains(got, stream1))
+	require.True(t, bytes.Contains(got, stream2))
+}
+
+func TestHttp2WritevCutHeadersTopsUpOnNextWrite(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+
+	const payloadLen = 400
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	vecs := make([][]byte, 0, 32)
+	for i := 0; i < 30; i++ {
+		vecs = append(vecs, http2DataFrame(bytes.Repeat([]byte{0x11}, 40), 1, false))
+	}
+	vecs = append(vecs, frame[:http2FrameHeaderLen+40])
+	writevConn(t, conn, vecs)
+	_, err = conn.Write(frame[http2FrameHeaderLen+40:])
+	require.NoError(t, err)
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+func TestHttp2ReadvFramesPastFirstKB(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	const frames = 40
+	const payloadLen = 40
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	stream := append([]byte{}, settings...)
+	for i := 0; i < frames; i++ {
+		stream = append(stream, http2DataFrame(bytes.Repeat([]byte{0xab}, payloadLen), 1, false)...)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	errc := make(chan error, 1)
+	go func() {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			errc <- err
+			return
+		}
+		defer c.Close()
+		_, err = c.Write(stream)
+		errc <- err
+	}()
+
+	srv, err := ln.Accept()
+	require.NoError(t, err)
+	defer srv.Close()
+
+	vecs := make([][]byte, 0, frames+1)
+	off := 0
+	vecs = append(vecs, make([]byte, len(settings)))
+	off += len(settings)
+	frameLen := http2FrameHeaderLen + payloadLen
+	for off < len(stream) {
+		n := frameLen
+		if off+n > len(stream) {
+			n = len(stream) - off
+		}
+		vecs = append(vecs, make([]byte, n))
+		off += n
+	}
+	require.NoError(t, <-errc)
+	require.Equal(t, len(stream), readvConn(t, srv, vecs))
+
+	require.Equal(t, frames*payloadLen, countInboundHTTP2Byte(t, getEvent, 0xab, frames*payloadLen))
+}
+
+func TestHttp2ReadvHeadersPast4KBInOneVector(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	headers := http2HeadersRaw(bytes.Repeat([]byte{0xcd}, 24), 1)
+	stream := append(append([]byte{}, settings...), http2DataFrame(make([]byte, 5000), 1, false)...)
+	stream = append(stream, headers...)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	errc := make(chan error, 1)
+	go func() {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			errc <- err
+			return
+		}
+		defer c.Close()
+		_, err = c.Write(stream)
+		errc <- err
+	}()
+
+	srv, err := ln.Accept()
+	require.NoError(t, err)
+	defer srv.Close()
+
+	require.NoError(t, <-errc)
+	require.Equal(t, len(stream), readvConn(t, srv, [][]byte{make([]byte, len(stream))}))
+
+	pid := uint32(os.Getpid())
+	var got []byte
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && !bytes.Contains(got, headers) {
+		e := getEvent()
+		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP2 || !e.L7Request.IsInbound {
+			continue
+		}
+		got = append(got, e.L7Request.Payload...)
+	}
+	require.True(t, bytes.Contains(got, headers))
+}
+
+func TestHttp2ReadvSecondSyscallFramesPastFirstKB(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	client, srv := dialAcceptedTCP(t)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err := client.Write(settings)
+	require.NoError(t, err)
+	require.Equal(t, len(settings), readvConn(t, srv, [][]byte{make([]byte, len(settings))}))
+
+	const frames = 40
+	const payloadLen = 40
+	stream := make([]byte, 0, frames*(http2FrameHeaderLen+payloadLen))
+	for i := 0; i < frames; i++ {
+		stream = append(stream, http2DataFrame(bytes.Repeat([]byte{0xab}, payloadLen), 1, false)...)
+	}
+	_, err = client.Write(stream)
+	require.NoError(t, err)
+
+	frameLen := http2FrameHeaderLen + payloadLen
+	vecs := make([][]byte, frames)
+	for i := 0; i < frames; i++ {
+		vecs[i] = make([]byte, frameLen)
+	}
+	require.Equal(t, len(stream), readvConn(t, srv, vecs))
+	require.Equal(t, frames*payloadLen, countInboundHTTP2Byte(t, getEvent, 0xab, frames*payloadLen))
+}
+
+func TestHttp2ReadvIgnoresBytesPastSyscallReturn(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	client, srv := dialAcceptedTCP(t)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	stream := append(append([]byte{}, settings...), http2DataFrame(bytes.Repeat([]byte{0xab}, 40), 1, false)...)
+	planted := http2HeadersRaw(bytes.Repeat([]byte{0xcd}, 24), 1)
+	buf := make([]byte, len(stream)+len(planted))
+	copy(buf[len(stream):], planted)
+
+	_, err := client.Write(stream)
+	require.NoError(t, err)
+	require.Equal(t, len(stream), readvConn(t, srv, [][]byte{buf}))
+	require.Equal(t, planted, buf[len(stream):])
+
+	pid := uint32(os.Getpid())
+	var got []byte
+	quiet := 0
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		e := getEvent()
+		if e == nil {
+			if bytes.Count(got, []byte{0xab}) >= 40 {
+				quiet++
+				if quiet >= 3 {
+					break
+				}
+			}
+			continue
+		}
+		quiet = 0
+		if e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP2 || !e.L7Request.IsInbound {
+			continue
+		}
+		got = append(got, e.L7Request.Payload...)
+		if bytes.Contains(got, planted) {
+			break
+		}
+	}
+	require.GreaterOrEqual(t, bytes.Count(got, []byte{0xab}), 40)
+	require.False(t, bytes.Contains(got, planted))
+}
+
+func TestHttp2ReadvCutHeadersTopsUpOnNextRead(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	client, srv := dialAcceptedTCP(t)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err := client.Write(settings)
+	require.NoError(t, err)
+	require.Equal(t, len(settings), readvConn(t, srv, [][]byte{make([]byte, len(settings))}))
+
+	const payloadLen = 400
+	const prefix = 30
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	cut := http2FrameHeaderLen + 40
+	body := make([]byte, 0, prefix*(http2FrameHeaderLen+40)+len(frame))
+	for i := 0; i < prefix; i++ {
+		body = append(body, http2DataFrame(bytes.Repeat([]byte{0x11}, 40), 1, false)...)
+	}
+	body = append(body, frame...)
+	_, err = client.Write(body)
+	require.NoError(t, err)
+
+	vecs := make([][]byte, 0, prefix+1)
+	for i := 0; i < prefix; i++ {
+		vecs = append(vecs, make([]byte, http2FrameHeaderLen+40))
+	}
+	vecs = append(vecs, make([]byte, cut))
+	readLen := prefix*(http2FrameHeaderLen+40) + cut
+	require.Equal(t, readLen, readvConn(t, srv, vecs))
+
+	rest := make([]byte, len(frame)-cut)
+	_, err = io.ReadFull(srv, rest)
+	require.NoError(t, err)
+	require.Equal(t, payloadLen, countInboundHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+func dialAcceptedTCP(t *testing.T) (client, server net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	errc := make(chan error, 1)
+	cc := make(chan net.Conn, 1)
+	go func() {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			errc <- err
+			return
+		}
+		cc <- c
+		errc <- nil
+	}()
+
+	server, err = ln.Accept()
+	require.NoError(t, err)
+	require.NoError(t, <-errc)
+	client = <-cc
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	return client, server
+}
+
+func readvConn(t *testing.T, conn net.Conn, vecs [][]byte) int {
+	t.Helper()
+	tcp, ok := conn.(*net.TCPConn)
+	require.True(t, ok)
+	raw, err := tcp.SyscallConn()
+	require.NoError(t, err)
+	var n int
+	var rerr error
+	require.NoError(t, raw.Read(func(fd uintptr) bool {
+		n, rerr = unix.Readv(int(fd), vecs)
+		return rerr != unix.EAGAIN && rerr != unix.EWOULDBLOCK
+	}))
+	require.NoError(t, rerr)
+	return n
+}
+
+func countInboundHTTP2Byte(t *testing.T, getEvent func() *Event, marker byte, want int) int {
+	t.Helper()
+	pid := uint32(os.Getpid())
+	var got []byte
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		e := getEvent()
+		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP2 || !e.L7Request.IsInbound {
+			continue
+		}
+		got = append(got, e.L7Request.Payload...)
+		if bytes.Count(got, []byte{marker}) >= want {
+			break
+		}
+	}
+	return bytes.Count(got, []byte{marker})
+}
+
+func writevConn(t *testing.T, conn net.Conn, vecs [][]byte) {
+	t.Helper()
+	tcp, ok := conn.(*net.TCPConn)
+	require.True(t, ok)
+	raw, err := tcp.SyscallConn()
+	require.NoError(t, err)
+	want := 0
+	for _, v := range vecs {
+		want += len(v)
+	}
+	var wrote int
+	require.NoError(t, raw.Write(func(fd uintptr) bool {
+		n, werr := unix.Writev(int(fd), vecs)
+		require.NoError(t, werr)
+		wrote = n
+		return true
+	}))
+	require.Equal(t, want, wrote)
+}
+
+func TestHttp2HeadersNear72MiBInOneWrite(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t, false)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	headers := http2HeadersGETUsers(t, addr)
+	const walkMax = 72 << 20
+	const maxPayload = 16777215
+	require.Less(t, len(headers), walkMax)
+	headersAt := walkMax - len(headers)
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+	_, err = conn.Write(http2DataFrame(bytes.Repeat([]byte{0x11}, 2000), 1, false))
+	require.NoError(t, err)
+
+	payload := make([]byte, 0, walkMax)
+	for headersAt-len(payload) >= 9+maxPayload {
+		payload = appendHTTP2DataZeros(payload, maxPayload, 1)
+	}
+	payload = appendHTTP2DataZeros(payload, headersAt-len(payload)-9, 1)
+	require.Equal(t, headersAt, len(payload))
+	payload = append(payload, headers...)
+	require.Equal(t, walkMax, len(payload))
+	_, err = conn.Write(payload)
+	require.NoError(t, err)
+
+	got := waitFor(t, getEvent, 15*time.Second, func(e *Event) bool {
+		return e.Type == EventTypeL7Request && e.Pid == uint32(os.Getpid()) &&
+			e.L7Request != nil && e.L7Request.Protocol == l7.ProtocolHTTP2 &&
+			!e.L7Request.IsInbound && bytes.Contains(e.L7Request.Payload, headers)
 	})
 	require.Equal(t, l7.ProtocolHTTP2, got.L7Request.Protocol)
 	require.False(t, got.L7Request.IsInbound)
@@ -597,12 +1537,12 @@ func TestHttp2SendmmsgWalksMoreThanTwoMessages(t *testing.T) {
 	require.NoError(t, err)
 
 	const nmsg = 5
-	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	hdr := http2HeadersGETUsers(t, addr)
 	bufs := make([][]byte, nmsg)
 	iov := make([]unix.Iovec, nmsg)
 	msgs := make([]mmsghdr, nmsg)
 	for i := 0; i < nmsg; i++ {
-		bufs[i] = append([]byte(nil), settings...)
+		bufs[i] = append([]byte(nil), hdr...)
 		iov[i].Base = &bufs[i][0]
 		iov[i].Len = uint64(len(bufs[i]))
 		msgs[i].Hdr.Iov = &iov[i]
@@ -858,6 +1798,81 @@ func http2HeadersGETUsers(t *testing.T, addr string) []byte {
 		EndHeaders:    true,
 	}))
 	return buf.Bytes()
+}
+
+func appendHTTP2DataZeros(dst []byte, payloadLen, streamID int) []byte {
+	dst = append(dst,
+		byte(payloadLen>>16), byte(payloadLen>>8), byte(payloadLen),
+		0, 0,
+		byte(streamID>>24), byte(streamID>>16), byte(streamID>>8), byte(streamID),
+	)
+	return append(dst, make([]byte, payloadLen)...)
+}
+
+const http2FrameHeaderLen = 9
+
+func http2HeadersRaw(payload []byte, streamID uint32) []byte {
+	n := len(payload)
+	hdr := [http2FrameHeaderLen]byte{
+		byte(n >> 16), byte(n >> 8), byte(n),
+		1, 0x5, // HEADERS, END_STREAM|END_HEADERS
+		byte(streamID >> 24), byte(streamID >> 16), byte(streamID >> 8), byte(streamID),
+	}
+	return append(hdr[:], payload...)
+}
+
+func countClientHTTP2Byte(t *testing.T, getEvent func() *Event, marker byte, want int) int {
+	t.Helper()
+	return bytes.Count(collectClientHTTP2Until(t, getEvent, func(payload []byte) bool {
+		return bytes.Count(payload, []byte{marker}) >= want
+	}), []byte{marker})
+}
+
+func startTLSDiscard(t *testing.T) (string, func()) {
+	t.Helper()
+	certFile, keyFile := writeTlsTestCerts(t, t.TempDir())
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	require.NoError(t, err)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	require.NoError(t, err)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(io.Discard, c)
+				_ = c.Close()
+			}()
+		}
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+func collectClientHTTP2Until(t *testing.T, getEvent func() *Event, done func(payload []byte) bool) []byte {
+	t.Helper()
+	return collectHTTP2Until(t, getEvent, uint32(os.Getpid()), done)
+}
+
+func collectHTTP2Until(t *testing.T, getEvent func() *Event, pid uint32, done func(payload []byte) bool) []byte {
+	t.Helper()
+	var got []byte
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		e := getEvent()
+		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP2 || e.L7Request.IsInbound {
+			continue
+		}
+		got = append(got, e.L7Request.Payload...)
+		if done(got) {
+			return got
+		}
+	}
+	return got
 }
 
 func http2DataFrame(payload []byte, streamID uint32, endStream bool) []byte {
@@ -1123,6 +2138,60 @@ func main() {
 	}
 	_ = srv.ServeTLS(ln, "", "")
 }
+`
+
+const http2TlsCutClientSrc = `package main
+
+import (
+	"crypto/tls"
+	"os"
+	"time"
+)
+
+func main() {
+	ready := os.Args[2]
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			os.Exit(1)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	conn, err := tls.Dial("tcp", os.Args[1], &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		os.Exit(1)
+	}
+	defer conn.Close()
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	payload := make([]byte, 400)
+	for i := range payload {
+		payload[i] = 0xab
+	}
+	frame := make([]byte, 9+len(payload))
+	frame[0] = byte(len(payload) >> 16)
+	frame[1] = byte(len(payload) >> 8)
+	frame[2] = byte(len(payload))
+	frame[3] = 1
+	frame[4] = 0x5
+	frame[8] = 1
+	copy(frame[9:], payload)
+	if _, err = conn.Write(settings); err != nil {
+		os.Exit(1)
+	}
+	if _, err = conn.Write(frame[:9+40]); err != nil {
+		os.Exit(1)
+	}
+	if _, err = conn.Write(frame[9+40:]); err != nil {
+		os.Exit(1)
+	}
+	_ = conn.SetReadDeadline(time.Now())
+	buf := make([]byte, 1)
+	_, _ = conn.Read(buf)
+}
+
 `
 
 const http2TlsClientSrc = `package main

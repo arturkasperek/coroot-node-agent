@@ -312,11 +312,20 @@ type ConnectionId struct {
 }
 
 type Connection struct {
-	Timestamp     uint64
-	BytesSent     uint64
-	BytesReceived uint64
-	IsInbound     uint8
-	_             [7]uint8
+	Timestamp        uint64
+	BytesSent        uint64
+	BytesReceived    uint64
+	IsInbound        uint8
+	Protocol         uint8
+	IsTLS            uint8
+	_                uint8
+	H2SkipReq        uint32
+	H2SkipResp       uint32
+	H2SkipReqStream  uint32
+	H2SkipRespStream uint32
+	H2SkipReqData    uint8
+	H2SkipRespData   uint8
+	_                [2]uint8
 }
 
 type perfMap struct {
@@ -324,6 +333,132 @@ type perfMap struct {
 	perCPUBufferSizePages int
 	typ                   perfMapType
 	readTimeout           time.Duration
+}
+
+type loadedProgram struct {
+	name string
+	prog *ebpf.Program
+	err  error
+}
+
+// loadCollection creates maps once, then verifies programs in parallel.
+// Privileged BPF_PROG_LOAD is not serialized by bpf_verifier_lock, so the
+// wall time is about the slowest program instead of the sum.
+func loadCollection(spec *ebpf.CollectionSpec) (*ebpf.Collection, error) {
+	mapsSpec := spec.Copy()
+	mapsSpec.Programs = map[string]*ebpf.ProgramSpec{}
+	coll, err := ebpf.NewCollection(mapsSpec)
+	if err != nil {
+		return nil, fmt.Errorf("load maps: %w", err)
+	}
+
+	var names []string
+	for name, prog := range spec.Programs {
+		if prog.Type == ebpf.UnspecifiedProgram {
+			continue
+		}
+		names = append(names, name)
+	}
+
+	results := make(chan loadedProgram, len(names))
+	var wg sync.WaitGroup
+	for _, name := range names {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			one := spec.Copy()
+			one.Programs = map[string]*ebpf.ProgramSpec{name: one.Programs[name]}
+			loaded, err := ebpf.NewCollectionWithOptions(one, ebpf.CollectionOptions{
+				MapReplacements: coll.Maps,
+			})
+			if err != nil {
+				var vErr *ebpf.VerifierError
+				if errors.As(err, &vErr) {
+					klog.Errorf("%s: %+v", name, vErr)
+				}
+				results <- loadedProgram{name: name, err: err}
+				return
+			}
+			prog := loaded.DetachProgram(name)
+			loaded.Close()
+			if prog == nil {
+				results <- loadedProgram{name: name, err: fmt.Errorf("program missing after load")}
+				return
+			}
+			results <- loadedProgram{name: name, prog: prog}
+		}(name)
+	}
+	wg.Wait()
+	close(results)
+
+	progs := make(map[string]*ebpf.Program, len(names))
+	var errs []error
+	for result := range results {
+		if result.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", result.name, result.err))
+			continue
+		}
+		progs[result.name] = result.prog
+	}
+	if len(errs) > 0 {
+		for _, prog := range progs {
+			prog.Close()
+		}
+		coll.Close()
+		return nil, errors.Join(errs...)
+	}
+	coll.Programs = progs
+	return coll, nil
+}
+
+func installHTTP2TailProgs(c *ebpf.Collection) error {
+	if err := putHTTP2TailProgs(c, "http2_tail_progs", "http2_resume", "http2_walk", "http2_cut", "http2_iov"); err != nil {
+		return err
+	}
+	if err := putHTTP2TailProgs(c, "http2_tail_progs_kprobe", "http2_resume_kp", "http2_walk_kp", "http2_cut_kp", "http2_iov_kp"); err != nil {
+		return err
+	}
+	return putHTTP2ReadTailProgs(c, "http2_tail_progs", "http2_readv", "http2_read_exit")
+}
+
+func putHTTP2ReadTailProgs(c *ebpf.Collection, mapName, readvName, exitName string) error {
+	m := c.Maps[mapName]
+	readv := c.Programs[readvName]
+	readExit := c.Programs[exitName]
+	if m == nil || readv == nil || readExit == nil {
+		return fmt.Errorf("http2 read tail programs missing: %s", mapName)
+	}
+	if err := m.Put(uint32(4), readv); err != nil {
+		return fmt.Errorf("readv %s: %w", mapName, err)
+	}
+	if err := m.Put(uint32(5), readExit); err != nil {
+		return fmt.Errorf("read exit %s: %w", mapName, err)
+	}
+	return nil
+}
+
+func putHTTP2TailProgs(c *ebpf.Collection, mapName, resumeName, walkName, cutName, iovName string) error {
+	m := c.Maps[mapName]
+	resume := c.Programs[resumeName]
+	walk := c.Programs[walkName]
+	cut := c.Programs[cutName]
+	iov := c.Programs[iovName]
+	if m == nil || resume == nil || walk == nil || cut == nil || iov == nil {
+		return fmt.Errorf("http2 tail programs missing: %s", mapName)
+	}
+	if err := m.Put(uint32(0), resume); err != nil {
+		return fmt.Errorf("resume %s: %w", mapName, err)
+	}
+	if err := m.Put(uint32(1), walk); err != nil {
+		return fmt.Errorf("walk %s: %w", mapName, err)
+	}
+	if err := m.Put(uint32(2), cut); err != nil {
+		return fmt.Errorf("cut %s: %w", mapName, err)
+	}
+	if err := m.Put(uint32(3), iov); err != nil {
+		return fmt.Errorf("iov %s: %w", mapName, err)
+	}
+	return nil
 }
 
 func (t *Tracer) ebpf(ch chan<- Event) error {
@@ -376,16 +511,16 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("failed to load collection spec: %w", err)
 	}
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
-	c, err := ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
-		//Programs: ebpf.ProgramOptions{LogLevel: 2, LogSize: 20 * 1024 * 1024},
-	})
+	loadStarted := time.Now()
+	c, err := loadCollection(collectionSpec)
 	if err != nil {
-		var vErr *ebpf.VerifierError
-		if errors.As(err, &vErr) {
-			klog.Errorf("%+v", vErr)
-		}
 		return fmt.Errorf("failed to load collection: %w", err)
 	}
+	if err = installHTTP2TailProgs(c); err != nil {
+		c.Close()
+		return fmt.Errorf("http2 tail calls: %w", err)
+	}
+	klog.Infof("loaded ebpf collection in %s", time.Since(loadStarted).Round(time.Millisecond))
 	t.collection = c
 
 	for _, programSpec := range collectionSpec.Programs {
@@ -437,6 +572,10 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 func (t *Tracer) attachPrograms() error {
 	for _, programSpec := range t.collectionSpec.Programs {
 		program := t.collection.Programs[programSpec.Name]
+		switch programSpec.Name {
+		case "http2_resume", "http2_walk", "http2_cut", "http2_iov", "http2_readv", "http2_read_exit", "http2_resume_kp", "http2_walk_kp", "http2_cut_kp", "http2_iov_kp":
+			continue
+		}
 		if t.disableL7Tracing {
 			switch programSpec.Name {
 			case "sys_enter_writev", "sys_enter_write", "sys_enter_sendto", "sys_enter_sendmsg", "sys_enter_sendmmsg":

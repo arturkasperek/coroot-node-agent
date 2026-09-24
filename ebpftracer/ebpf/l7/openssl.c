@@ -60,5 +60,5 @@ int openssl_SSL_read_exit(struct pt_regs *ctx) {
     trace_enter_read(id, pid, fd, 1, buf, ret_ptr, 0);
 
     int ret = (int)PT_REGS_RC(ctx);
-    return trace_exit_read(ctx, id, pid, 1, ret);
+    return trace_exit_read(ctx, id, pid, 1, ret, &http2_tail_progs_kprobe);
 }

@@ -31,7 +31,7 @@ func TestL7EventsMapIsRingbuf(t *testing.T) {
 	m, ok := spec.Maps["l7_events"]
 	require.True(t, ok, "l7_events map missing")
 	require.Equal(t, ebpf.RingBuf, m.Type)
-	require.GreaterOrEqual(t, m.MaxEntries, uint32(8<<20), "ringbuf should be at least 8MiB")
+	require.Equal(t, uint32(128<<20), m.MaxEntries)
 
 	dropped, ok := spec.Maps["l7_events_dropped"]
 	require.True(t, ok, "l7_events_dropped map missing")

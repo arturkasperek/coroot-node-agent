@@ -49,6 +49,10 @@ func TestParseL7EventHeaderSize(t *testing.T) {
 	require.Equal(t, 48, binary.Size(l7Event{}))
 }
 
+func TestConnectionMapValueSize(t *testing.T) {
+	require.Equal(t, 48, binary.Size(Connection{}))
+}
+
 func TestParseL7EventVariableRecord(t *testing.T) {
 	body := []byte("GET / HTTP/1.1\r\n\r\n")
 	raw := encodeL7Sample(t, l7Event{
