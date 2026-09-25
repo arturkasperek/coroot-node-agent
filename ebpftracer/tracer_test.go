@@ -747,6 +747,73 @@ func TestHttp2CutHeadersTopsUpAcrossTinyWrites(t *testing.T) {
 	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, payloadLen))
 }
 
+// TestHttp2WriteHeaderSplitMidHeaderTopsUpOnNextWrite checks the case where a
+// write boundary cuts the 9-byte frame header itself, not just the body
+// after it — e.g. only 5 of the 9 header bytes land in one write() and the
+// rest arrive in the next. Unlike a header split across writev's iovec
+// vectors within one syscall (TestHttp2WritevHeaderSplitAcrossVectors), or a
+// cut body with the header already fully read (TestHttp2CutHeadersTopsUpRestOfFrame),
+// this is a cut *within* the header bytes across two separate syscalls.
+func TestHttp2WriteHeaderSplitMidHeaderTopsUpOnNextWrite(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+
+	const payloadLen = 400
+	const headerSplit = 5 // < http2FrameHeaderLen: cuts the header itself
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	_, err = conn.Write(frame[:headerSplit])
+	require.NoError(t, err)
+	_, err = conn.Write(frame[headerSplit:])
+	require.NoError(t, err)
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+// TestHttp2WriteHeaderSplitOneByteAtATimeTopsUpAcrossWrites is the extreme
+// version of the above: every one of the header's 9 bytes arrives in its own
+// write(), each a separate syscall (not just a separate iovec).
+func TestHttp2WriteHeaderSplitOneByteAtATimeTopsUpAcrossWrites(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err = conn.Write(settings)
+	require.NoError(t, err)
+
+	const payloadLen = 400
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	for i := 0; i < http2FrameHeaderLen; i++ {
+		_, err = conn.Write(frame[i : i+1])
+		require.NoError(t, err)
+	}
+	_, err = conn.Write(frame[http2FrameHeaderLen:])
+	require.NoError(t, err)
+
+	require.Equal(t, payloadLen, countClientHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
 // TestHttp2CutHeadersTopsUpThenResumesNormalWalk checks that a HEADERS frame
 // cut across a write boundary gets topped up on the next write, and that the
 // walk correctly resumes with the next frame afterward. The resume tops up
@@ -1445,6 +1512,66 @@ func TestHttp2ReadvCutHeadersTopsUpOnNextRead(t *testing.T) {
 	rest := make([]byte, len(frame)-cut)
 	_, err = io.ReadFull(srv, rest)
 	require.NoError(t, err)
+	require.Equal(t, payloadLen, countInboundHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+// TestHttp2ReadvHeaderSplitMidHeaderTopsUpOnNextRead checks a readv()
+// boundary (not a vector boundary within one readv, and not a plain read())
+// that cuts the 9-byte frame header itself: one readv() returns only 5 of
+// those bytes, the next readv() returns the rest.
+func TestHttp2ReadvHeaderSplitMidHeaderTopsUpOnNextRead(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	client, srv := dialAcceptedTCP(t)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err := client.Write(settings)
+	require.NoError(t, err)
+	require.Equal(t, len(settings), readvConn(t, srv, [][]byte{make([]byte, len(settings))}))
+
+	const payloadLen = 400
+	const headerSplit = 5 // < http2FrameHeaderLen: cuts the header itself
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	_, err = client.Write(frame)
+	require.NoError(t, err)
+
+	require.Equal(t, headerSplit, readvConn(t, srv, [][]byte{make([]byte, headerSplit)}))
+	rest := make([]byte, len(frame)-headerSplit)
+	require.Equal(t, len(rest), readvConn(t, srv, [][]byte{rest}))
+
+	require.Equal(t, payloadLen, countInboundHTTP2Byte(t, getEvent, 0xab, payloadLen))
+}
+
+// TestHttp2ReadHeaderSplitMidHeaderTopsUpOnNextRead is the plain-read
+// counterpart of TestHttp2WriteHeaderSplitMidHeaderTopsUpOnNextWrite: a
+// read() boundary (not a writev/readv vector boundary) cuts the 9-byte frame
+// header itself, with only some of those bytes landing in the first read()
+// and the rest in the next.
+func TestHttp2ReadHeaderSplitMidHeaderTopsUpOnNextRead(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	client, srv := dialAcceptedTCP(t)
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	_, err := client.Write(settings)
+	require.NoError(t, err)
+	_, err = io.ReadFull(srv, make([]byte, len(settings)))
+	require.NoError(t, err)
+
+	const payloadLen = 400
+	const headerSplit = 5 // < http2FrameHeaderLen: cuts the header itself
+	frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), 1)
+	_, err = client.Write(frame)
+	require.NoError(t, err)
+
+	_, err = io.ReadFull(srv, make([]byte, headerSplit))
+	require.NoError(t, err)
+	rest := make([]byte, len(frame)-headerSplit)
+	_, err = io.ReadFull(srv, rest)
+	require.NoError(t, err)
+
 	require.Equal(t, payloadLen, countInboundHTTP2Byte(t, getEvent, 0xab, payloadLen))
 }
 

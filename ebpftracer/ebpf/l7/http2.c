@@ -328,6 +328,32 @@ struct {
     __uint(max_entries, 8192);
 } http2_stream_budget SEC(".maps");
 
+/* Keyed the same way as http2_stream_budget and for the same reason (fd
+   reuse). A syscall boundary can land anywhere in the byte stream, including
+   inside a frame's own 9-byte header — not just after it, which is all
+   HTTP2_SKIP_HEADER/HTTP2_SKIP_DATA/HTTP2_SKIP_RAW (all *body*-continuation
+   states) cover. This holds however many of those 9 header bytes a previous
+   buffer for this connection+direction (is_req) already delivered but
+   couldn't complete, so the next buffer can pick up in the middle of the
+   header instead of misreading its leading bytes as a fresh one. */
+struct http2_partial_hdr_key {
+    __u64 conn_ts;
+    __u8 is_req;
+    __u8 pad[7];
+};
+
+struct http2_partial_hdr_val {
+    __u8 hdr[HTTP2_FRAME_HEADER_SIZE - 1];
+    __u8 len;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(struct http2_partial_hdr_key));
+    __uint(value_size, sizeof(struct http2_partial_hdr_val));
+    __uint(max_entries, 4096);
+} http2_partial_hdr SEC(".maps");
+
 /* noinline: called from within bpf_loop callbacks that already juggle a lot
    of scalar-range state (frame parsing, ring-slot math); inlining another
    map lookup's branches into them was enough to blow up verifier state
@@ -964,13 +990,11 @@ int http2_iov_pull(__u8 *out) {
    fits entirely within the iovec segment currently under the cursor, so it
    reads in one bpf_probe_read_user instead of nine separate
    map-lookup-plus-probe_read_user round trips (each with its own
-   fault-safe user-copy overhead — see http2_iov_pull). A writev() CAN
-   split a header across vectors (TestHttp2WritevHeaderSplitAcrossVectors
-   exercises exactly that), so this still falls back to the byte-at-a-time
-   path when the fast check doesn't hold; that path's behavior and cost are
-   unchanged. */
+   fault-safe user-copy overhead — see http2_iov_pull). Touches nothing and
+   returns -1 if the header doesn't fit the current segment — callers fall
+   back to pulling it a byte at a time. */
 static __attribute__((noinline))
-int http2_iov_pull_header(unsigned char hdr[HTTP2_FRAME_HEADER_SIZE]) {
+int http2_iov_pull_header_fast(unsigned char hdr[HTTP2_FRAME_HEADER_SIZE]) {
     struct http2_iovec_table *t;
     __u32 zero = 0;
     __u32 idx;
@@ -1003,9 +1027,55 @@ int http2_iov_pull_header(unsigned char hdr[HTTP2_FRAME_HEADER_SIZE]) {
         t->consumed += HTTP2_FRAME_HEADER_SIZE;
         return 0;
     }
-    return http2_iov_pull(&hdr[0]) || http2_iov_pull(&hdr[1]) || http2_iov_pull(&hdr[2]) ||
-           http2_iov_pull(&hdr[3]) || http2_iov_pull(&hdr[4]) || http2_iov_pull(&hdr[5]) ||
-           http2_iov_pull(&hdr[6]) || http2_iov_pull(&hdr[7]) || http2_iov_pull(&hdr[8]);
+    return -1;
+}
+
+/* http2_iov_pull_header_fast, falling back to a byte-at-a-time pull when the
+   header doesn't fit the current iovec segment — a writev() CAN split a
+   header across vectors within the one syscall
+   (TestHttp2WritevHeaderSplitAcrossVectors exercises exactly that) — and
+   resumable across syscalls: if a previous http2_tail_emit call for this
+   connection+direction ran out of source bytes partway through these same 9
+   header bytes, picks up where it left off (http2_partial_hdr) instead of
+   misreading this buffer's leading bytes as a fresh header. Returns 0 with
+   a complete header in `hdr`, or 1 if the source ran out again — in which
+   case whatever was pulled this call (which may be nothing) has been
+   folded into the saved partial record. */
+static __always_inline
+int http2_iov_pull_header_resumable(__u64 conn_ts, __u8 is_req, unsigned char hdr[HTTP2_FRAME_HEADER_SIZE]) {
+    struct http2_partial_hdr_key key = {.conn_ts = conn_ts, .is_req = is_req};
+    struct http2_partial_hdr_val *ph;
+    struct http2_partial_hdr_val save;
+    __u8 have = 0;
+    int i;
+
+    ph = bpf_map_lookup_elem(&http2_partial_hdr, &key);
+    if (ph && ph->len && ph->len < HTTP2_FRAME_HEADER_SIZE) {
+        /* Already bounded to 0..8 by the check above — have is only ever
+           compared against the unrolled loop's compile-time index below,
+           never used to index memory, so it needs no verifier-facing mask
+           (unlike idx/off elsewhere in this file, which do). */
+        have = ph->len;
+        __builtin_memcpy(hdr, ph->hdr, sizeof(ph->hdr));
+    }
+    if (!have && !http2_iov_pull_header_fast(hdr)) {
+        return 0;
+    }
+#pragma unroll
+    for (i = 0; i < HTTP2_FRAME_HEADER_SIZE; i++) {
+        if (i < have) {
+            continue;
+        }
+        if (http2_iov_pull(&hdr[i])) {
+            __builtin_memset(&save, 0, sizeof(save));
+            __builtin_memcpy(save.hdr, hdr, sizeof(save.hdr));
+            save.len = i;
+            bpf_map_update_elem(&http2_partial_hdr, &key, &save, BPF_ANY);
+            return 1;
+        }
+    }
+    bpf_map_delete_elem(&http2_partial_hdr, &key);
+    return 0;
 }
 
 /* Bytes still not skipped. One step can cross a whole vector. */
@@ -1183,7 +1253,7 @@ static long http2_iov_cb(__u32 i, void *ctx) {
             return 0;
         }
     }
-    if (http2_iov_pull_header(hdr)) {
+    if (http2_iov_pull_header_resumable(a->conn_ts, a->is_req, hdr)) {
         return 1;
     }
     t = bpf_map_lookup_elem(&http2_iovecs, &zero);
