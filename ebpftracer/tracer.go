@@ -33,6 +33,12 @@ import (
 
 const MaxPayloadSize = 1024
 
+// Http2StreamCaptureMax is the cumulative number of HTTP2 body bytes the
+// kernel side captures per (connection, direction, stream) — across as many
+// frames and events as it takes — not per individual frame. Must match
+// HTTP2_STREAM_CAPTURE_MAX in ebpf/l7/http2.c.
+const Http2StreamCaptureMax = 4096
+
 type EventType uint32
 type EventReason uint32
 

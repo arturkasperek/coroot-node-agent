@@ -104,6 +104,10 @@ struct connection {
     __u8 pad;
     __u32 h2_skip_req;
     __u32 h2_skip_resp;
+    /* HTTP2 stream ID a pending cross-syscall capture resume belongs to
+       (the capture budget itself lives in http2_stream_budget, keyed by
+       this ID; there is no cumulative have/expect counter to persist
+       here anymore, so this field just carries the ID across calls). */
     __u32 h2_skip_req_stream;
     __u32 h2_skip_resp_stream;
     __u8 h2_skip_req_data;
