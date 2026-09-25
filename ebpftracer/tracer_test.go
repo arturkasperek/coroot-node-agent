@@ -1664,18 +1664,23 @@ func TestHttp2HeadersAndDataHaveIndependentBudgets(t *testing.T) {
 }
 
 // TestHttp2ConcurrentCutResumeSharedScratchCorruption is a reproducer for a
-// known, pre-existing architectural issue, not a regression test for
-// anything fixed in this file: http2_tail_state and http2_iovecs are
-// BPF_MAP_TYPE_PERCPU_ARRAY with max_entries=1 — one scratch slot per CPU
-// core, shared by every HTTP2 connection currently being walked on that
-// core, not just one. A HEADERS/DATA frame bigger than one ring slot needs a
-// cross-syscall cut/resume: the kernel side stashes cid/buf/size/pos in that
-// shared slot, tail-calls out, and waits for the NEXT real syscall to
-// resume. If an unrelated HTTP2 write/read from a DIFFERENT connection lands
-// on the same core in that window, it overwrites the shared slot before the
-// original resume reads it back — reading a wildly wrong skip count
-// (observed once, live, as skip=126992 for a test whose entire frame was a
-// few KB) and losing sync for that stream.
+// pre-existing architectural issue that has since been fixed (see
+// http2_tail_state.owner / http2_owner_mismatch in http2.c), not a
+// regression test tied to anything else in this file: http2_tail_state and
+// http2_iovecs are BPF_MAP_TYPE_PERCPU_ARRAY with max_entries=1 — one
+// scratch slot per CPU core, shared by every HTTP2 connection currently
+// being walked on that core, not just one. A HEADERS/DATA frame bigger than
+// one ring slot needs a cross-syscall cut/resume: the kernel side stashes
+// cid/buf/size/pos in that shared slot, tail-calls out, and waits for the
+// NEXT real syscall to resume. If an unrelated HTTP2 write/read from a
+// DIFFERENT connection lands on the same core in that window, it used to
+// overwrite the shared slot before the original resume read it back —
+// reading a wildly wrong skip count (observed once, live, as skip=126992
+// for a test whose entire frame was a few KB) and losing sync for that
+// stream. The fix stamps the slot with bpf_get_current_pid_tgid() on the
+// task that last claimed it, and every later stage of that task's own
+// chain re-checks it, bailing out (dropping just that one capture round)
+// on a mismatch instead of touching a stream that was never its to touch.
 //
 // This showed up by accident: TestHttp2HeadersAndDataHaveIndependentBudgets
 // was flaky specifically while the machine's k3s (metrics-server, etc. —
@@ -1683,12 +1688,12 @@ func TestHttp2HeadersAndDataHaveIndependentBudgets(t *testing.T) {
 // stopped. This test tries to manufacture that same collision deliberately,
 // with many concurrent connections all doing cross-syscall cut/resume at
 // once, instead of depending on incidental background traffic. Being a
-// genuine data race over shared kernel state, it cannot be guaranteed to
-// reproduce on every run or every machine — a pass here does not prove the
-// bug is gone, only that this attempt didn't hit the window. A fix belongs
-// in the tracer's cut/resume design (e.g. keying the scratch slot by
-// connection instead of by CPU, or validating a generation/nonce on
-// resume), not in this test.
+// genuine data race over shared kernel state, it was never guaranteed to
+// reproduce on every run or every machine even before the fix (it did not,
+// in practice — see the fix's own commit for how the bug was actually
+// confirmed and verified instead). A pass here was never proof the bug was
+// present, and isn't proof it's gone either; it stays as a standing attempt
+// in case a future change reopens this window.
 func TestHttp2ConcurrentCutResumeSharedScratchCorruption(t *testing.T) {
 	skipIfNotVM(t)
 	getEvent, stop := runTracer(t)

@@ -1032,6 +1032,53 @@ int http2_iov_pull(__u8 *out) {
     return 0;
 }
 
+/* Fast path for the overwhelmingly common case: the 9-byte frame header
+   fits entirely within the iovec segment currently under the cursor, so it
+   reads in one bpf_probe_read_user instead of nine separate
+   map-lookup-plus-probe_read_user round trips (each with its own
+   fault-safe user-copy overhead — see http2_iov_pull). A writev() CAN
+   split a header across vectors (TestHttp2WritevHeaderSplitAcrossVectors
+   exercises exactly that), so this still falls back to the byte-at-a-time
+   path when the fast check doesn't hold; that path's behavior and cost are
+   unchanged. */
+static __attribute__((noinline))
+int http2_iov_pull_header(unsigned char hdr[HTTP2_FRAME_HEADER_SIZE]) {
+    struct http2_iovec_table *t;
+    __u32 zero = 0;
+    __u32 idx;
+    __u32 off;
+    __u32 len;
+    __u64 addr;
+
+    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    if (!t) {
+        return -1;
+    }
+    if (t->idx >= t->n || t->idx >= HTTP2_MAX_VECS) {
+        return -1;
+    }
+    idx = t->idx;
+    asm volatile("%0 &= %1" : "+r"(idx) : "i"(HTTP2_MAX_VECS - 1));
+    len = t->v[idx].len;
+    if (len > HTTP2_SRC_MAX) {
+        len = HTTP2_SRC_MAX;
+    }
+    off = t->off;
+    HTTP2_SRC_BOUND(off);
+    if (off < len && len - off >= HTTP2_FRAME_HEADER_SIZE) {
+        addr = t->v[idx].base + off;
+        if (bpf_probe_read_user(hdr, HTTP2_FRAME_HEADER_SIZE, (void *)addr)) {
+            return -1;
+        }
+        t->off = off + HTTP2_FRAME_HEADER_SIZE;
+        t->consumed += HTTP2_FRAME_HEADER_SIZE;
+        return 0;
+    }
+    return http2_iov_pull(&hdr[0]) || http2_iov_pull(&hdr[1]) || http2_iov_pull(&hdr[2]) ||
+           http2_iov_pull(&hdr[3]) || http2_iov_pull(&hdr[4]) || http2_iov_pull(&hdr[5]) ||
+           http2_iov_pull(&hdr[6]) || http2_iov_pull(&hdr[7]) || http2_iov_pull(&hdr[8]);
+}
+
 /* Bytes still not skipped. One step can cross a whole vector. */
 static __attribute__((noinline))
 __u32 http2_iov_skip(__u32 n) {
@@ -1207,9 +1254,7 @@ static long http2_iov_cb(__u32 i, void *ctx) {
             return 0;
         }
     }
-    if (http2_iov_pull(&hdr[0]) || http2_iov_pull(&hdr[1]) || http2_iov_pull(&hdr[2]) ||
-        http2_iov_pull(&hdr[3]) || http2_iov_pull(&hdr[4]) || http2_iov_pull(&hdr[5]) ||
-        http2_iov_pull(&hdr[6]) || http2_iov_pull(&hdr[7]) || http2_iov_pull(&hdr[8])) {
+    if (http2_iov_pull_header(hdr)) {
         return 1;
     }
     t = bpf_map_lookup_elem(&http2_iovecs, &zero);
