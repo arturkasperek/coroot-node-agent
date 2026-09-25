@@ -13,9 +13,11 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1565,6 +1567,249 @@ func assertHttp2StreamCaptureCap(t *testing.T, mode string, singleFrame bool, ma
 	require.Equal(t, Http2StreamCaptureMax, got, "stream capture must stop at the cap regardless of frame count/size")
 }
 
+// TestHttp2HeadersAndDataHaveIndependentBudgets checks that a stream's
+// HEADERS/CONTINUATION capture budget (Http2StreamCaptureMax) is tracked
+// separately from its DATA budget on the same stream: exhausting one must
+// not starve the other. It sends DATA well past the cap first, then a
+// HEADERS frame — as gRPC trailers do, after the body — whose own body is
+// also well past the cap. If the two shared one budget, the DATA alone
+// would exhaust it and the trailing HEADERS would capture nothing; with
+// independent budgets, both cap at Http2StreamCaptureMax on their own.
+// TestHttp2HeadersAndDataHaveIndependentBudgets checks that a stream's
+// HEADERS/CONTINUATION capture budget (Http2StreamCaptureMax) is tracked
+// separately from its DATA budget on the same stream: exhausting one must
+// not starve the other. It sends DATA well past the cap first, then a
+// HEADERS frame — as gRPC trailers do, after the body — whose own body is
+// also well past the cap. If the two shared one budget, the DATA alone
+// would exhaust it and the trailing HEADERS would capture nothing; with
+// independent budgets, both cap at Http2StreamCaptureMax on their own.
+//
+// A long single HEADERS frame needs many consecutive cross-syscall
+// cut/resume rounds to reach the cap, all chained through one shared
+// per-CPU scratch slot (http2_tail_state) that any HTTP2 traffic on the
+// machine — including unrelated real traffic the VM happens to be carrying
+// — passes through between rounds. A resume landing on a CPU right as that
+// scratch slot is mid-use by unrelated traffic reads back nonsense (a wildly
+// wrong skip count), breaking the chain for that one attempt — a
+// pre-existing tracer property, not something this test controls. Retrying
+// the whole exchange on a fresh connection tolerates that without weakening
+// what's actually asserted (HEADERS and DATA stay independent within a
+// single, un-derailed attempt).
+func TestHttp2HeadersAndDataHaveIndependentBudgets(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	const streamID = 1
+	const dataMarker = 0xd1
+	const headersMarker = 0xd2
+	// Over the cap, but only just: every byte past the cap has to be
+	// skipped (not captured) before the trailing HEADERS frame can even be
+	// reached, and each skip round is another chance for a resume to land
+	// on a shared scratch slot mid-use by unrelated traffic (see the type
+	// doc above). Keeping the overshoot small keeps that window small.
+	const total = Http2StreamCaptureMax + 200
+	const frameBody = 500 // stays under the ring-slot cap on its own
+	// Same reasoning as assertHttp2StreamCaptureCap: deliver in modest
+	// pieces over several real syscalls so accumulation past one ring
+	// slot's worth has a fair chance to reach each cap.
+	const chunkSize = 700
+	const perPhaseTimeout = 5 * time.Second
+
+	pid := uint32(os.Getpid())
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	var gotData, gotHeaders int
+	const attempts = 10
+	for attempt := 0; attempt < attempts; attempt++ {
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		watchConn(t, conn)
+
+		_, err = conn.Write(settings)
+		require.NoError(t, err)
+
+		var dataFrames []byte
+		count := total/frameBody + 1
+		for i := 0; i < count; i++ {
+			dataFrames = append(dataFrames, http2DataFrame(bytes.Repeat([]byte{dataMarker}, frameBody), streamID, false)...)
+		}
+		for off := 0; off < len(dataFrames); off += chunkSize {
+			end := min(off+chunkSize, len(dataFrames))
+			_, err := conn.Write(dataFrames[off:end])
+			require.NoError(t, err)
+		}
+		gotData = collectHTTP2StreamBytesWithin(t, getEvent, pid, false, dataMarker, Http2StreamCaptureMax, perPhaseTimeout)
+
+		// Now the trailers: a HEADERS frame after the body, as gRPC status
+		// trailers do. Sent as its own phase so chunk boundaries never
+		// straddle the DATA/HEADERS frame-type transition.
+		headersFrame := http2HeadersRaw(bytes.Repeat([]byte{headersMarker}, total), streamID)
+		for off := 0; off < len(headersFrame); off += chunkSize {
+			end := min(off+chunkSize, len(headersFrame))
+			_, err := conn.Write(headersFrame[off:end])
+			require.NoError(t, err)
+		}
+		gotHeaders = collectHTTP2StreamBytesWithin(t, getEvent, pid, false, headersMarker, Http2StreamCaptureMax, perPhaseTimeout)
+
+		conn.Close()
+		if gotData == Http2StreamCaptureMax && gotHeaders == Http2StreamCaptureMax {
+			return
+		}
+	}
+	require.Equal(t, Http2StreamCaptureMax, gotData, "DATA capture must stop at its own cap")
+	require.Equal(t, Http2StreamCaptureMax, gotHeaders, "trailing HEADERS must still get its own full budget despite DATA exhausting its cap first")
+}
+
+// TestHttp2ConcurrentCutResumeSharedScratchCorruption is a reproducer for a
+// known, pre-existing architectural issue, not a regression test for
+// anything fixed in this file: http2_tail_state and http2_iovecs are
+// BPF_MAP_TYPE_PERCPU_ARRAY with max_entries=1 — one scratch slot per CPU
+// core, shared by every HTTP2 connection currently being walked on that
+// core, not just one. A HEADERS/DATA frame bigger than one ring slot needs a
+// cross-syscall cut/resume: the kernel side stashes cid/buf/size/pos in that
+// shared slot, tail-calls out, and waits for the NEXT real syscall to
+// resume. If an unrelated HTTP2 write/read from a DIFFERENT connection lands
+// on the same core in that window, it overwrites the shared slot before the
+// original resume reads it back — reading a wildly wrong skip count
+// (observed once, live, as skip=126992 for a test whose entire frame was a
+// few KB) and losing sync for that stream.
+//
+// This showed up by accident: TestHttp2HeadersAndDataHaveIndependentBudgets
+// was flaky specifically while the machine's k3s (metrics-server, etc. —
+// real background HTTP2 traffic) was running, and reliable once it was
+// stopped. This test tries to manufacture that same collision deliberately,
+// with many concurrent connections all doing cross-syscall cut/resume at
+// once, instead of depending on incidental background traffic. Being a
+// genuine data race over shared kernel state, it cannot be guaranteed to
+// reproduce on every run or every machine — a pass here does not prove the
+// bug is gone, only that this attempt didn't hit the window. A fix belongs
+// in the tracer's cut/resume design (e.g. keying the scratch slot by
+// connection instead of by CPU, or validating a generation/nonce on
+// resume), not in this test.
+func TestHttp2ConcurrentCutResumeSharedScratchCorruption(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	numConns := runtime.NumCPU() * 2
+	if numConns < 8 {
+		numConns = 8
+	}
+	if numConns > 32 {
+		numConns = 32
+	}
+	const bodyLen = 4000 // many cut/resume rounds, still under the 4KB cap
+	const chunkSize = 40
+
+	pid := uint32(os.Getpid())
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+
+	markers := make([]byte, numConns)
+	for i := range markers {
+		markers[i] = byte(0x40 + i)
+	}
+
+	conns := make([]net.Conn, numConns)
+	for i := 0; i < numConns; i++ {
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		watchConn(t, conn)
+		conns[i] = conn
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	counts := make([]int64, numConns)
+	collectDone := make(chan struct{})
+	stopCollecting := make(chan struct{})
+	go func() {
+		defer close(collectDone)
+		deadline := time.Now().Add(25 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case <-stopCollecting:
+				return
+			default:
+			}
+			e := getEvent()
+			if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+				continue
+			}
+			if e.L7Request.Protocol != l7.ProtocolHTTP2 || e.L7Request.IsInbound {
+				continue
+			}
+			for i, m := range markers {
+				if n := bytes.Count(e.L7Request.Payload, []byte{m}); n > 0 {
+					atomic.AddInt64(&counts[i], int64(n))
+				}
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < numConns; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			conn := conns[i]
+			frame := http2HeadersRaw(bytes.Repeat([]byte{markers[i]}, bodyLen), 1)
+			if _, err := conn.Write(settings); err != nil {
+				return
+			}
+			<-start
+			for off := 0; off < len(frame); off += chunkSize {
+				end := min(off+chunkSize, len(frame))
+				if _, err := conn.Write(frame[off:end]); err != nil {
+					return
+				}
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// Give the tracer a little time to finish walking the last rounds
+	// before the collector stops.
+	waitDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		done := true
+		for i := range counts {
+			if int(atomic.LoadInt64(&counts[i])) < bodyLen {
+				done = false
+				break
+			}
+		}
+		if done {
+			break
+		}
+	}
+	close(stopCollecting)
+	<-collectDone
+
+	var corrupted []string
+	for i := 0; i < numConns; i++ {
+		got := int(atomic.LoadInt64(&counts[i]))
+		if got != bodyLen {
+			corrupted = append(corrupted, fmt.Sprintf("conn %d (marker %#x): got %d bytes, want %d", i, markers[i], got, bodyLen))
+		}
+	}
+	if len(corrupted) > 0 {
+		t.Logf("reproduced shared per-CPU http2_tail_state corruption under %d concurrent cut/resume connections:\n%s",
+			numConns, strings.Join(corrupted, "\n"))
+	}
+	require.Empty(t, corrupted, "all concurrent connections' HEADERS captures must be uncorrupted despite sharing the per-CPU tail-state scratch slot")
+}
+
 func dialAcceptedTCP(t *testing.T) (client, server net.Conn) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1624,8 +1869,15 @@ func countInboundHTTP2Byte(t *testing.T, getEvent func() *Event, marker byte, wa
 // across several emitted events.
 func collectHTTP2StreamBytes(t *testing.T, getEvent func() *Event, pid uint32, inbound bool, marker byte, want int) int {
 	t.Helper()
+	return collectHTTP2StreamBytesWithin(t, getEvent, pid, inbound, marker, want, 15*time.Second)
+}
+
+// collectHTTP2StreamBytesWithin is collectHTTP2StreamBytes with a caller-set
+// deadline, for callers that retry on a shorter budget per attempt.
+func collectHTTP2StreamBytesWithin(t *testing.T, getEvent func() *Event, pid uint32, inbound bool, marker byte, want int, timeout time.Duration) int {
+	t.Helper()
 	var got []byte
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		e := getEvent()
 		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
