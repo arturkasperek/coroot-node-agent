@@ -33,6 +33,11 @@ import (
 
 const MaxPayloadSize = 1024
 
+// Http1CaptureMax mirrors HTTP1_CAPTURE_MAX in ebpf/l7/http1.c: the
+// independent per-direction cap on HTTP/1 HEADERS and DATA capture,
+// analogous to HTTP2_STREAM_CAPTURE_MAX.
+const Http1CaptureMax = 4096
+
 // Http2StreamCaptureMax is the cumulative number of HTTP2 body bytes the
 // kernel side captures per (connection, direction, stream) — across as many
 // frames and events as it takes — not per individual frame. HEADERS and
@@ -440,7 +445,28 @@ func installHTTP2TailProgs(c *ebpf.Collection) error {
 	if err := putHTTP2TailProgs(c, "http2_tail_progs_kprobe", "http2_resume_kp", "http2_iov_kp"); err != nil {
 		return err
 	}
-	return putHTTP2ReadTailProgs(c, "http2_tail_progs", "http2_readv", "http2_read_exit")
+	if err := putHTTP2ReadTailProgs(c, "http2_tail_progs", "http2_readv", "http2_read_exit"); err != nil {
+		return err
+	}
+	// HTTP/1's own verifier-budget-isolated stage (see http1.c) shares these
+	// same prog arrays with HTTP2 — one more program-type-keyed jump table
+	// slot, not a second set of maps.
+	if err := putHTTP1TailProg(c, "http2_tail_progs", "http1_walk"); err != nil {
+		return err
+	}
+	return putHTTP1TailProg(c, "http2_tail_progs_kprobe", "http1_walk_kp")
+}
+
+func putHTTP1TailProg(c *ebpf.Collection, mapName, walkName string) error {
+	m := c.Maps[mapName]
+	walk := c.Programs[walkName]
+	if m == nil || walk == nil {
+		return fmt.Errorf("http1 tail program missing: %s", mapName)
+	}
+	if err := m.Put(uint32(4), walk); err != nil {
+		return fmt.Errorf("walk %s: %w", mapName, err)
+	}
+	return nil
 }
 
 func putHTTP2ReadTailProgs(c *ebpf.Collection, mapName, readvName, exitName string) error {
@@ -587,7 +613,8 @@ func (t *Tracer) attachPrograms() error {
 	for _, programSpec := range t.collectionSpec.Programs {
 		program := t.collection.Programs[programSpec.Name]
 		switch programSpec.Name {
-		case "http2_resume", "http2_iov", "http2_readv", "http2_read_exit", "http2_resume_kp", "http2_iov_kp":
+		case "http2_resume", "http2_iov", "http2_readv", "http2_read_exit", "http2_resume_kp", "http2_iov_kp",
+			"http1_walk", "http1_walk_kp":
 			continue
 		}
 		if t.disableL7Tracing {

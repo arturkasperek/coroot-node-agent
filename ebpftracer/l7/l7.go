@@ -74,6 +74,10 @@ const (
 	MethodStatementClose    Method = 4
 	MethodHttp2ClientFrames Method = 5
 	MethodHttp2ServerFrames Method = 6
+	MethodHttpClientHeaders Method = 7
+	MethodHttpClientData    Method = 8
+	MethodHttpServerHeaders Method = 9
+	MethodHttpServerData    Method = 10
 )
 
 func (m Method) String() string {
@@ -92,6 +96,14 @@ func (m Method) String() string {
 		return "http2_client_frames"
 	case MethodHttp2ServerFrames:
 		return "http2_server_frames"
+	case MethodHttpClientHeaders:
+		return "http_client_headers"
+	case MethodHttpClientData:
+		return "http_client_data"
+	case MethodHttpServerHeaders:
+		return "http_server_headers"
+	case MethodHttpServerData:
+		return "http_server_data"
 	}
 	return "UNKNOWN:" + strconv.Itoa(int(m))
 }

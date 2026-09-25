@@ -708,6 +708,13 @@ int http2_classify_frame(struct http2_trim_args *a, const unsigned char hdr[HTTP
 #define HTTP2_TAIL_IOV 1
 #define HTTP2_TAIL_READV 2
 #define HTTP2_TAIL_READ_EXIT 3
+/* HTTP/1's own verifier-budget-isolated stage — see http1.c. Same prog
+   arrays as HTTP2's (all tracepoint-type / all kprobe-type programs, tail
+   calls only work within one PROG_ARRAY's program type), just one more
+   slot: the bpf_loop-heavy header scan blows a caller like sys_enter_write
+   or sys_exit_read's own budget if inlined directly into it, the same
+   reason HTTP2's walk needs its own stage. */
+#define HTTP1_TAIL_WALK 4
 
 /* One writev/readv/sendmsg. 1024 is IOV_MAX. 16 bytes per entry fits in a per-CPU map. */
 #define HTTP2_MAX_VECS 1024
@@ -790,7 +797,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 4);
+    __uint(max_entries, 5);
     __type(key, __u32);
     __type(value, __u32);
 } http2_tail_progs SEC(".maps");
@@ -800,7 +807,7 @@ struct {
    readv dispatch is tracepoint-only. */
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 4);
+    __uint(max_entries, 5);
     __type(key, __u32);
     __type(value, __u32);
 } http2_tail_progs_kprobe SEC(".maps");
@@ -1547,6 +1554,75 @@ int http2_iov_kp(void *ctx) {
 /* Inline: bpf_tail_call must see the caller's ctx, and tail_progs must be a
    constant map of the same program type. Every plaintext HTTP/2 buffer
    enters http2_resume, which tail-calls straight into the iovec walker. */
+/* Makes http2_iovecs ready to walk `size` bytes starting at `buf` (a real
+   userspace pointer) or, when from_heap is set, at iovec_buf_heap's scratch
+   buffer standing in for one — unless a real writev/readv/sendmsg vector
+   list is already loaded and ready (http2_load_iovecs), in which case that
+   takes priority and buf/size/from_heap are ignored. Shared by
+   http2_tail_emit and http1_tail_emit (see http1.c): every L7 protocol that
+   walks a byte stream through this same iovec abstraction funnels through
+   here first. Returns the ready table, or NULL if neither source is
+   available. */
+static __always_inline
+struct http2_iovec_table *http2_iov_adopt(char *buf, __u64 size, __u8 from_heap) {
+    __u32 zero = 0;
+    struct http2_iovec_table *iovs;
+    char *src;
+
+    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    /* A ready iovec table this task didn't itself just load (see
+       http2_load_iovecs) belongs to whatever unrelated syscall last won the
+       race for this CPU's scratch slot — not usable here. */
+    if (iovs && iovs->ready && http2_owner_mismatch(iovs->owner)) {
+        iovs = 0;
+    }
+    if (iovs && iovs->ready && iovs->total) {
+        iovs->idx = 0;
+        iovs->off = 0;
+        iovs->consumed = 0;
+        iovs->skip_left = 0;
+        iovs->ready = 0;
+        return iovs;
+    }
+    if (!size || (!from_heap && !buf)) {
+        return 0;
+    }
+    /* No real (writev/readv/sendmsg) vector list: adapt the single
+       contiguous buffer (a real userspace pointer for plain
+       write/read/TLS-decrypted data, or the kernel-side iovec_buf_heap
+       scratch standing in for one when from_heap) into a synthetic
+       one-entry vector table, so every source funnels through the one
+       walker instead of keeping a second, source-specific one just for
+       this case. */
+    src = buf;
+    if (from_heap) {
+        src = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
+        if (!src) {
+            return 0;
+        }
+    }
+    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    if (!iovs) {
+        return 0;
+    }
+    iovs->owner = bpf_get_current_pid_tgid();
+    iovs->n = 1;
+    iovs->idx = 0;
+    iovs->off = 0;
+    iovs->v[0].base = (__u64)src;
+    iovs->v[0].len = size;
+    if (iovs->v[0].len > HTTP2_SRC_MAX) {
+        iovs->v[0].len = HTTP2_SRC_MAX;
+    }
+    iovs->total = iovs->v[0].len;
+    iovs->consumed = 0;
+    iovs->skip_left = 0;
+    iovs->cut_body = 0;
+    iovs->cut_length = 0;
+    iovs->ready = 0;
+    return iovs;
+}
+
 static __always_inline
 int http2_tail_emit(void *ctx, struct connection_id cid, struct connection *conn,
                     char *buf, __u64 size, __u8 is_req, __u8 from_heap, void *tail_progs) {
@@ -1559,14 +1635,8 @@ int http2_tail_emit(void *ctx, struct connection_id cid, struct connection *conn
     if (conn->protocol != PROTOCOL_HTTP2) {
         return 0;
     }
-    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
-    /* A ready iovec table this task didn't itself just load (see
-       http2_load_iovecs) belongs to whatever unrelated syscall last won the
-       race for this CPU's scratch slot — not usable here. */
-    if (iovs && iovs->ready && http2_owner_mismatch(iovs->owner)) {
-        iovs = 0;
-    }
-    if (!(iovs && iovs->ready && iovs->total) && (!size || (!from_heap && !buf))) {
+    iovs = http2_iov_adopt(buf, size, from_heap);
+    if (!iovs) {
         return 0;
     }
     s = bpf_map_lookup_elem(&http2_tail_state, &zero);
@@ -1577,52 +1647,9 @@ int http2_tail_emit(void *ctx, struct connection_id cid, struct connection *conn
     s->cid = cid;
     s->is_req = is_req;
     s->method = is_req ? METHOD_HTTP2_CLIENT_FRAMES : METHOD_HTTP2_SERVER_FRAMES;
-    if (iovs && iovs->ready && iovs->total) {
-        s->size = iovs->total;
-        if (s->size > HTTP2_SRC_MAX) {
-            s->size = HTTP2_SRC_MAX;
-        }
-        iovs->idx = 0;
-        iovs->off = 0;
-        iovs->consumed = 0;
-        iovs->skip_left = 0;
-        iovs->ready = 0;
-    } else {
-        /* No real (writev/readv/sendmsg) vector list: adapt the single
-           contiguous buffer (a real userspace pointer for plain
-           write/read/TLS-decrypted data, or the kernel-side
-           iovec_buf_heap scratch standing in for one when from_heap) into
-           a synthetic one-entry vector table, so every source funnels
-           through the one walker (http2_iov_impl) instead of keeping a
-           second, source-specific one just for this case. */
-        char *src = buf;
-        if (from_heap) {
-            src = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
-            if (!src) {
-                return 0;
-            }
-        }
-        iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
-        if (!iovs) {
-            return 0;
-        }
-        iovs->owner = s->owner;
-        iovs->n = 1;
-        iovs->idx = 0;
-        iovs->off = 0;
-        iovs->v[0].base = (__u64)src;
-        iovs->v[0].len = size;
-        if (iovs->v[0].len > HTTP2_SRC_MAX) {
-            iovs->v[0].len = HTTP2_SRC_MAX;
-        }
-        iovs->total = iovs->v[0].len;
-        iovs->consumed = 0;
-        iovs->skip_left = 0;
-        iovs->cut_body = 0;
-        iovs->cut_length = 0;
-        iovs->ready = 0;
-
-        s->size = iovs->total;
+    s->size = iovs->total;
+    if (s->size > HTTP2_SRC_MAX) {
+        s->size = HTTP2_SRC_MAX;
     }
     bpf_tail_call(ctx, tail_progs, HTTP2_TAIL_RESUME);
     return 1;

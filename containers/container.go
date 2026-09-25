@@ -74,6 +74,7 @@ type ActiveConnection struct {
 	BytesSent     uint64
 	BytesReceived uint64
 
+	http1Parser    *l7.Http1Parser
 	http2Parser    *l7.Http2Parser
 	postgresParser *l7.PostgresParser
 	mysqlParser    *l7.MysqlParser
@@ -700,6 +701,7 @@ func (c *Container) onConnectionClose(e ebpftracer.Event) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if p := c.processes[e.Pid]; p != nil {
+			delete(p.inboundHttp1Parsers, e.Fd)
 			delete(p.inboundHttp2Parsers, e.Fd)
 		}
 		return
@@ -845,10 +847,14 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
-		method, path := l7.ParseHttp(r.Payload)
-		if !common.HttpFilter.ShouldBeSkipped(path) {
-			stats.observe(r.Status.Http(), "", r.Duration)
-			trace.HttpRequest(method, path, r.Status, r.Duration)
+		if conn.http1Parser == nil {
+			conn.http1Parser = l7.NewHttp1Parser()
+		}
+		for _, req := range conn.http1Parser.Parse(r.Method, r.Payload, uint64(r.Duration)) {
+			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
+				stats.observe(req.Status.Http(), "", req.Duration)
+				trace.HttpRequest(req.Method, req.Path, req.Status, req.Duration)
+			}
 		}
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
@@ -917,6 +923,35 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 
 func (c *Container) observeInboundL7(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) {
 	protocol := r.Protocol
+	if protocol == l7.ProtocolHTTP {
+		p := c.processes[pid]
+		if p == nil {
+			return
+		}
+		if p.inboundHttp1Parsers == nil {
+			p.inboundHttp1Parsers = map[uint64]*inboundHttp1State{}
+		}
+		state := p.inboundHttp1Parsers[fd]
+		if state == nil || state.connTimestamp != timestamp {
+			state = &inboundHttp1State{
+				parser:        l7.NewHttp1Parser(),
+				connTimestamp: timestamp,
+			}
+			p.inboundHttp1Parsers[fd] = state
+		}
+		requests := state.parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+		if len(requests) == 0 {
+			return
+		}
+		stats := c.l7InboundStats.get(l7.ProtocolHTTP)
+		for _, req := range requests {
+			if common.HttpFilter.ShouldBeSkipped(req.Path) {
+				continue
+			}
+			stats.observe(req.Status.Http(), "", req.Duration)
+		}
+		return
+	}
 	if protocol == l7.ProtocolHTTP2 {
 		p := c.processes[pid]
 		if p == nil {
@@ -955,8 +990,6 @@ func (c *Container) observeInboundL7(pid uint32, fd uint64, timestamp uint64, r 
 	}
 	stats := c.l7InboundStats.get(protocol)
 	switch protocol {
-	case l7.ProtocolHTTP:
-		stats.observe(r.Status.Http(), "", r.Duration)
 	case l7.ProtocolZookeeper:
 		stats.observe(r.Status.Zookeeper(), "", r.Duration)
 	default:
@@ -1304,13 +1337,18 @@ func (c *Container) gc(now time.Time) {
 	listens := map[netaddr.IPPort]string{}
 	seenNamespaces := map[string]bool{}
 	for _, p := range c.processes {
-		if len(p.inboundHttp2Parsers) > 0 {
+		if len(p.inboundHttp1Parsers) > 0 || len(p.inboundHttp2Parsers) > 0 {
 			fds, err := proc.ReadFds(p.Pid)
 			if err == nil {
 				openFds := map[uint64]struct{}{}
 				for _, fd := range fds {
 					if fd.SocketInode != "" {
 						openFds[fd.Fd] = struct{}{}
+					}
+				}
+				for fd := range p.inboundHttp1Parsers {
+					if _, ok := openFds[fd]; !ok {
+						delete(p.inboundHttp1Parsers, fd)
 					}
 				}
 				for fd := range p.inboundHttp2Parsers {

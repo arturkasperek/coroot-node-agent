@@ -337,7 +337,9 @@ func TestHttpIngressEvents(t *testing.T) {
 	method, uri := l7.ParseHttp(got.L7Request.Payload)
 	require.Equal(t, "GET", method)
 	require.Equal(t, "/users", uri)
-	require.Equal(t, l7.Status(http.StatusOK), got.L7Request.Status)
+	// Status correlation across the request-headers and response-headers
+	// events (METHOD_HTTP_CLIENT_HEADERS / METHOD_HTTP_SERVER_HEADERS) is a
+	// Go-side concern, not yet wired up — see the HTTP1 Etap 4 task.
 }
 
 func TestHttpEgressEvents(t *testing.T) {
@@ -424,7 +426,8 @@ func TestHttpEgressEvents(t *testing.T) {
 	method, uri := l7.ParseHttp(l7ev.L7Request.Payload)
 	require.Equal(t, "GET", method)
 	require.Equal(t, "/users", uri)
-	require.Equal(t, l7.Status(http.StatusOK), l7ev.L7Request.Status)
+	// Status correlation across events is a Go-side concern, not yet wired
+	// up — see the HTTP1 Etap 4 task.
 }
 
 func TestHttpPayloadCopies1024(t *testing.T) {
@@ -493,7 +496,439 @@ func assertHTTPPayloadCopies1024(t *testing.T, writev bool) {
 	})
 	require.Equal(t, MaxPayloadSize, len(got.L7Request.Payload), "captured payload must be 1024, not 1023")
 	require.Equal(t, byte(0x5a), got.L7Request.Payload[markerIdx])
-	require.Equal(t, l7.Status(http.StatusOK), got.L7Request.Status)
+	// Status correlation across events is a Go-side concern, not yet wired
+	// up — see the HTTP1 Etap 4 task.
+}
+
+// http1Headers builds a minimal GET request whose headers end in exactly
+// "\r\n\r\n", with padLen marker bytes (0xab) in an X-Pad header value so
+// tests can count exactly how many header bytes got captured.
+func http1Headers(padLen int) []byte {
+	head := []byte("GET /test HTTP/1.1\r\nHost: x\r\nX-Pad: ")
+	buf := append(head, bytes.Repeat([]byte{0xab}, padLen)...)
+	return append(buf, []byte("\r\n\r\n")...)
+}
+
+// TestHttp1HeadersSplitAcrossSyscalls checks that a write() boundary cutting
+// the headers block (well before "\r\n\r\n") doesn't lose any header bytes —
+// the HTTP1 analogue of TestHttp2WriteHeaderSplitMidHeaderTopsUpOnNextWrite,
+// but for a variable-length, delimiter-terminated block instead of a fixed
+// 9-byte one.
+func TestHttp1HeadersSplitAcrossSyscalls(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const padLen = 300
+	headers := http1Headers(padLen)
+	split := len(headers) / 2
+	_, err = conn.Write(headers[:split])
+	require.NoError(t, err)
+	_, err = conn.Write(headers[split:])
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, padLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xab, padLen))
+}
+
+// TestHttp1HeadersDelimiterSplitAcrossSyscalls cuts the write exactly inside
+// the "\r\n\r\n" terminator itself (first write ends in "...\r\n\r", second
+// is just "\n") — the header-end-detection equivalent of a frame header cut
+// mid-byte. If the split state (http1_state.tail) weren't carried across
+// the two writes, the second write's lone "\n" wouldn't complete the match,
+// and the body that follows would be misread as more headers.
+func TestHttp1HeadersDelimiterSplitAcrossSyscalls(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const padLen = 50
+	const bodyLen = 200
+	headers := http1Headers(padLen)
+	split := len(headers) - 1
+	_, err = conn.Write(headers[:split])
+	require.NoError(t, err)
+	_, err = conn.Write(headers[split:])
+	require.NoError(t, err)
+	_, err = conn.Write(bytes.Repeat([]byte{0xcd}, bodyLen))
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, padLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xab, padLen))
+	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xcd, bodyLen))
+}
+
+// TestHttp1HeadersOver4KBTruncated checks that headers past the 4KB cap stop
+// being captured but the walker keeps scanning (uncounted) for "\r\n\r\n" so
+// the body that follows is still correctly recognized as DATA, not more
+// headers.
+func TestHttp1HeadersOver4KBTruncated(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const padLen = 5000 // > Http1CaptureMax
+	const bodyLen = 100
+	headers := http1Headers(padLen)
+	_, err = conn.Write(headers)
+	require.NoError(t, err)
+	_, err = conn.Write(bytes.Repeat([]byte{0xcd}, bodyLen))
+	require.NoError(t, err)
+
+	// The cap is on total header bytes, not just the marker padding — the
+	// request-line/Host/X-Pad prefix before the padding counts against it too.
+	prefixLen := len(http1Headers(0)) - len("\r\n\r\n")
+	wantMarkers := Http1CaptureMax - prefixLen
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, wantMarkers, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xab, wantMarkers))
+	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xcd, bodyLen))
+}
+
+// TestHttp1DataSplitAcrossSyscalls checks that a write() boundary cutting
+// the body doesn't lose any bytes: the two writes' worth of body must
+// concatenate into the same DATA capture.
+func TestHttp1DataSplitAcrossSyscalls(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	_, err = conn.Write(http1Headers(10))
+	require.NoError(t, err)
+
+	const bodyLen = 500
+	body := bytes.Repeat([]byte{0xcd}, bodyLen)
+	_, err = conn.Write(body[:bodyLen/2])
+	require.NoError(t, err)
+	_, err = conn.Write(body[bodyLen/2:])
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xcd, bodyLen))
+}
+
+// TestHttp1DataOver4KBCapped checks that DATA capture stops at the 4KB cap
+// (Etap 1's flat cap — see the http1.c file comment on Content-Length).
+func TestHttp1DataOver4KBCapped(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	_, err = conn.Write(http1Headers(10))
+	require.NoError(t, err)
+
+	const bodyLen = 5000 // > Http1CaptureMax
+	_, err = conn.Write(bytes.Repeat([]byte{0xcd}, bodyLen))
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, Http1CaptureMax, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xcd, Http1CaptureMax))
+}
+
+// TestHttp1ServerHeadersAndDataSplit is the response-direction counterpart:
+// checks the server's own write (its response) gets the same split-headers
+// and split-data treatment as the client's request, independently.
+func TestHttp1ServerHeadersAndDataSplit(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	client, srv := dialAcceptedTCP(t)
+	_, err := client.Write([]byte("GET /test HTTP/1.1\r\nHost: x\r\n\r\n"))
+	require.NoError(t, err)
+	buf := make([]byte, 4096)
+	n, err := srv.Read(buf)
+	require.NoError(t, err)
+	require.True(t, n > 0)
+
+	const padLen = 300
+	const bodyLen = 200
+	respHeaders := append([]byte("HTTP/1.1 200 OK\r\nX-Pad: "), bytes.Repeat([]byte{0xab}, padLen)...)
+	respHeaders = append(respHeaders, []byte("\r\n\r\n")...)
+	split := len(respHeaders) / 2
+	_, err = srv.Write(respHeaders[:split])
+	require.NoError(t, err)
+	_, err = srv.Write(respHeaders[split:])
+	require.NoError(t, err)
+	_, err = srv.Write(bytes.Repeat([]byte{0xcd}, bodyLen))
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, padLen, collectHTTP1MethodBytes(t, getEvent, pid, true, l7.MethodHttpServerHeaders, 0xab, padLen))
+	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, true, l7.MethodHttpServerData, 0xcd, bodyLen))
+}
+
+// http1RequestWithBody builds a request whose Content-Length exactly
+// matches len(body), so http1.c's Content-Length parsing can find exactly
+// where the body ends.
+func http1RequestWithBody(path string, body []byte) []byte {
+	head := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", path, len(body))
+	return append([]byte(head), body...)
+}
+
+// TestHttp1ContentLengthPipelinedRequests is the Etap 2 test: on a
+// keep-alive connection, once exactly Content-Length body bytes have been
+// accounted for, the walker must recognize the very next bytes as a new
+// request's headers, not as this request's leftover data. Without
+// Content-Length awareness (Etap 1), request 2's marker would show up as
+// (more) DATA instead of HEADERS, or never show up as HEADERS at all.
+func TestHttp1ContentLengthPipelinedRequests(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const bodyLen = 200
+	const markerLen = 50
+	req1 := http1RequestWithBody("/one", bytes.Repeat([]byte{0xab}, bodyLen))
+	req2 := append([]byte("GET /two HTTP/1.1\r\nHost: x\r\nX-Pad: "), bytes.Repeat([]byte{0xef}, markerLen)...)
+	req2 = append(req2, []byte("\r\n\r\n")...)
+
+	_, err = conn.Write(req1)
+	require.NoError(t, err)
+	_, err = conn.Write(req2)
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xab, bodyLen))
+	require.Equal(t, markerLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xef, markerLen))
+}
+
+// TestHttp1ContentLengthOver4KBThenNextRequest checks the same pipelining
+// recognition when the first request's body is larger than the 4KB capture
+// cap: only 4KB of it is captured, but Content-Length still lets the walker
+// skip the uncaptured rest and correctly land on request 2's headers.
+func TestHttp1ContentLengthOver4KBThenNextRequest(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const bodyLen = 5000 // > Http1CaptureMax
+	const markerLen = 50
+	req1 := http1RequestWithBody("/one", bytes.Repeat([]byte{0xab}, bodyLen))
+	req2 := append([]byte("GET /two HTTP/1.1\r\nHost: x\r\nX-Pad: "), bytes.Repeat([]byte{0xef}, markerLen)...)
+	req2 = append(req2, []byte("\r\n\r\n")...)
+
+	_, err = conn.Write(req1)
+	require.NoError(t, err)
+	_, err = conn.Write(req2)
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, Http1CaptureMax, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xab, Http1CaptureMax))
+	require.Equal(t, markerLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xef, markerLen))
+}
+
+// TestHttp1ContentLengthSplitAcrossSyscalls checks that the "Content-Length"
+// header name and its digits are parsed correctly even when a write()
+// boundary cuts through them — the Content-Length analogue of
+// TestHttp1HeadersDelimiterSplitAcrossSyscalls.
+func TestHttp1ContentLengthSplitAcrossSyscalls(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const bodyLen = 200
+	const markerLen = 50
+	req1 := http1RequestWithBody("/one", bytes.Repeat([]byte{0xab}, bodyLen))
+	req2 := append([]byte("GET /two HTTP/1.1\r\nHost: x\r\nX-Pad: "), bytes.Repeat([]byte{0xef}, markerLen)...)
+	req2 = append(req2, []byte("\r\n\r\n")...)
+
+	// Cut in the middle of "Content-Length: 200" itself.
+	idx := bytes.Index(req1, []byte("Content-Length"))
+	require.True(t, idx >= 0)
+	split := idx + len("Content-Len")
+	_, err = conn.Write(req1[:split])
+	require.NoError(t, err)
+	_, err = conn.Write(req1[split:])
+	require.NoError(t, err)
+	_, err = conn.Write(req2)
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xab, bodyLen))
+	require.Equal(t, markerLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xef, markerLen))
+}
+
+// http1ChunkedRequest builds a Transfer-Encoding: chunked request with the
+// given chunks, terminated by the mandatory 0-size last chunk (no trailers).
+func http1ChunkedRequest(path string, chunks [][]byte) []byte {
+	head := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", path)
+	buf := []byte(head)
+	for _, c := range chunks {
+		buf = append(buf, []byte(fmt.Sprintf("%x\r\n", len(c)))...)
+		buf = append(buf, c...)
+		buf = append(buf, []byte("\r\n")...)
+	}
+	return append(buf, []byte("0\r\n\r\n")...)
+}
+
+// TestHttp1ChunkedBasic checks that a single-chunk Transfer-Encoding:
+// chunked body is captured as DATA, mirroring TestHttp1DataSplitAcrossSyscalls
+// but for chunked framing instead of Content-Length.
+func TestHttp1ChunkedBasic(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const chunkLen = 100
+	req := http1ChunkedRequest("/one", [][]byte{bytes.Repeat([]byte{0xab}, chunkLen)})
+	_, err = conn.Write(req)
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, chunkLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xab, chunkLen))
+}
+
+// TestHttp1ChunkedMultipleChunksThenNextRequest checks that multiple chunks
+// concatenate into one DATA capture, and that after the terminating 0-chunk
+// the walker correctly returns to HEADERS for the next pipelined request —
+// the chunked analogue of TestHttp1ContentLengthPipelinedRequests.
+func TestHttp1ChunkedMultipleChunksThenNextRequest(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const chunk1Len = 100
+	const chunk2Len = 150
+	const markerLen = 50
+	req1 := http1ChunkedRequest("/one", [][]byte{
+		bytes.Repeat([]byte{0xab}, chunk1Len),
+		bytes.Repeat([]byte{0xab}, chunk2Len),
+	})
+	req2 := append([]byte("GET /two HTTP/1.1\r\nHost: x\r\nX-Pad: "), bytes.Repeat([]byte{0xef}, markerLen)...)
+	req2 = append(req2, []byte("\r\n\r\n")...)
+
+	_, err = conn.Write(req1)
+	require.NoError(t, err)
+	_, err = conn.Write(req2)
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, chunk1Len+chunk2Len, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xab, chunk1Len+chunk2Len))
+	require.Equal(t, markerLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xef, markerLen))
+}
+
+// TestHttp1ChunkedSplitAcrossSyscalls cuts a chunked request at four points
+// that each exercise a different resumable sub-state in http1.c: mid
+// chunk-size hex digits, mid chunk data, mid the trailing "\r\n" after chunk
+// data, and mid the final "0\r\n\r\n" terminator.
+func TestHttp1ChunkedSplitAcrossSyscalls(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const chunkLen = 100
+	req := http1ChunkedRequest("/one", [][]byte{bytes.Repeat([]byte{0xab}, chunkLen)})
+	// req is "...\r\n\r\n" + "64\r\n" + 100*0xab + "\r\n" + "0\r\n\r\n".
+	headEnd := bytes.Index(req, []byte("\r\n\r\n")) + 4
+	chunkSizeLine := []byte("64\r\n") // hex(100) == "64"
+	require.Equal(t, string(chunkSizeLine), string(req[headEnd:headEnd+len(chunkSizeLine)]))
+
+	cuts := []int{
+		headEnd + 1,                      // mid chunk-size hex digits
+		headEnd + len(chunkSizeLine) + 50, // mid chunk data
+		headEnd + len(chunkSizeLine) + chunkLen + 1, // mid the post-chunk-data "\r\n"
+		len(req) - 2,                      // mid the final "0\r\n\r\n"
+	}
+	off := 0
+	for _, cut := range cuts {
+		_, err = conn.Write(req[off:cut])
+		require.NoError(t, err)
+		off = cut
+	}
+	_, err = conn.Write(req[off:])
+	require.NoError(t, err)
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, chunkLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xab, chunkLen))
 }
 
 func paddedHTTPGetUsers(addr string, total, markerIdx int, marker byte) []byte {
@@ -2002,6 +2437,30 @@ func countInboundHTTP2Byte(t *testing.T, getEvent func() *Event, marker byte, wa
 func collectHTTP2StreamBytes(t *testing.T, getEvent func() *Event, pid uint32, inbound bool, marker byte, want int) int {
 	t.Helper()
 	return collectHTTP2StreamBytesWithin(t, getEvent, pid, inbound, marker, want, 15*time.Second)
+}
+
+// collectHTTP1MethodBytes is collectHTTP2StreamBytes for HTTP/1's own
+// METHOD_HTTP_CLIENT_HEADERS/DATA and METHOD_HTTP_SERVER_HEADERS/DATA split
+// (see http1.c) — concatenates a given method's payloads for pid/inbound
+// until marker occurs want times (or the 15s deadline expires).
+func collectHTTP1MethodBytes(t *testing.T, getEvent func() *Event, pid uint32, inbound bool, method l7.Method, marker byte, want int) int {
+	t.Helper()
+	var got []byte
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		e := getEvent()
+		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP || e.L7Request.IsInbound != inbound || e.L7Request.Method != method {
+			continue
+		}
+		got = append(got, e.L7Request.Payload...)
+		if bytes.Count(got, []byte{marker}) >= want {
+			break
+		}
+	}
+	return bytes.Count(got, []byte{marker})
 }
 
 // collectHTTP2StreamBytesWithin is collectHTTP2StreamBytes with a caller-set

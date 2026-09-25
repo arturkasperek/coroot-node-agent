@@ -27,6 +27,12 @@
 #define METHOD_STATEMENT_CLOSE      4
 #define METHOD_HTTP2_CLIENT_FRAMES  5
 #define METHOD_HTTP2_SERVER_FRAMES  6
+/* HTTP/1's own HEADERS/DATA split, mirroring METHOD_HTTP2_*_FRAMES but for
+   a text-delimited (\r\n\r\n), not length-prefixed, protocol — see http1.c. */
+#define METHOD_HTTP_CLIENT_HEADERS  7
+#define METHOD_HTTP_CLIENT_DATA     8
+#define METHOD_HTTP_SERVER_HEADERS  9
+#define METHOD_HTTP_SERVER_DATA     10
 
 #define IOVEC_BUF_SIZE MAX_PAYLOAD_SIZE * 2  // must be double of MAX_PAYLOAD_SIZE
 #define MAX_IOVEC_SIZE 32
@@ -317,6 +323,7 @@ void send_event(struct l7_send_args *a) {
 })
 
 #include "http2.c"
+#include "http1.c"
 
 static __always_inline
 __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_size) {
@@ -436,6 +443,11 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
         is_tls = 1;
     }
 
+    __u8 from_heap = 0;
+    if (iovlen && !plain_buf) {
+        from_heap = 1;
+    }
+
     /* Ciphertext on a TLS socket stays out. Plaintext, including an uprobe
        buffer, takes the tail pipeline. */
     __u8 topup = is_tls || !conn->is_tls;
@@ -446,11 +458,10 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
     } else if (topup && http2_tail_emit(ctx, cid, conn, payload, size, !conn->is_inbound, 0, tail_progs)) {
         return 0;
     }
-
-    __u8 from_heap = 0;
-    if (iovlen && !plain_buf) {
-        from_heap = 1;
+    if (topup && http1_tail_emit(ctx, cid, conn, from_heap ? 0 : payload, size, !conn->is_inbound, from_heap, tail_progs)) {
+        return 0;
     }
+
     if (conn->is_inbound) {
         return handle_response(ctx, cid, conn, is_tls, payload, size, total_size, from_heap, tail_progs);
     }
@@ -504,7 +515,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
     } else if (conn->is_tls) {
         return 0;
     }
-    if (conn->protocol == PROTOCOL_HTTP2) {
+    if (conn->protocol == PROTOCOL_HTTP2 || conn->protocol == PROTOCOL_HTTP) {
         return 0;
     }
 
@@ -528,8 +539,8 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
     req->payload_size = size;
 
     if (is_http_request(payload)) {
-        req->protocol = PROTOCOL_HTTP;
         conn->protocol = PROTOCOL_HTTP;
+        return http1_tail_emit(ctx, cid, conn, from_heap ? 0 : payload, size, 1, from_heap, tail_progs);
     } else if (is_postgres_query(payload, size, &req->request_type)) {
         if (req->request_type == POSTGRES_FRAME_CLOSE) {
             if (conn->is_inbound) {
@@ -716,19 +727,23 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, 
         __sync_fetch_and_add(&conn->bytes_received, total_size);
     }
 
+    __u8 from_heap = 0;
+    if (args->iovlen) {
+        from_heap = 1;
+    }
+
     __u8 topup = is_tls || !conn->is_tls;
-    if (topup && args->iovlen) {
+    if (topup && from_heap) {
         if (http2_tail_emit(ctx, cid, conn, 0, ret, conn->is_inbound, 1, tail_progs)) {
             return 0;
         }
     } else if (topup && http2_tail_emit(ctx, cid, conn, payload, ret, conn->is_inbound, 0, tail_progs)) {
         return 0;
     }
-
-    __u8 from_heap = 0;
-    if (args->iovlen) {
-        from_heap = 1;
+    if (topup && http1_tail_emit(ctx, cid, conn, from_heap ? 0 : payload, ret, conn->is_inbound, from_heap, tail_progs)) {
+        return 0;
     }
+
     if (conn->is_inbound) {
         return handle_request(ctx, cid, conn, is_tls, payload, ret, total_size, from_heap, tail_progs);
     }
@@ -744,7 +759,7 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
     } else if (conn->is_tls) {
         return 0;
     }
-    if (conn->protocol == PROTOCOL_HTTP2) {
+    if (conn->protocol == PROTOCOL_HTTP2 || conn->protocol == PROTOCOL_HTTP) {
         return 0;
     }
 
@@ -802,18 +817,21 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
         } else if (conn->protocol == PROTOCOL_UNKNOWN && is_http2(payload, ret)) {
             conn->protocol = PROTOCOL_HTTP2;
             return http2_emit_fresh(ctx, cid, conn, payload, ret, 0, from_heap, tail_progs);
+        } else if (conn->protocol == PROTOCOL_UNKNOWN && is_http_response(payload, &e->status)) {
+            /* Only reached if this response is the very first buffer this
+               agent ever saw on the connection (attached mid-stream, or the
+               request was missed) — normally the request side already set
+               conn->protocol == PROTOCOL_HTTP and the early bail above
+               routes every later buffer straight to http1_tail_emit. */
+            conn->protocol = PROTOCOL_HTTP;
+            return http1_tail_emit(ctx, cid, conn, from_heap ? 0 : payload, ret, 0, from_heap, tail_progs);
         } else {
             return 0;
         }
     }
 
     e->protocol = req->protocol;
-    if (e->protocol == PROTOCOL_HTTP) {
-        response = is_http_response(payload, &e->status);
-        if (response) {
-            conn->protocol = PROTOCOL_HTTP;
-        }
-    } else if (e->protocol == PROTOCOL_POSTGRES) {
+    if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
         if (req->request_type == POSTGRES_FRAME_PARSE) {
             e->method = METHOD_STATEMENT_PREPARE;

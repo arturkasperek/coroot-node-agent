@@ -58,7 +58,13 @@ type Process struct {
 
 	gpuUsageSamples []gpu.ProcessUsageSample
 
+	inboundHttp1Parsers map[uint64]*inboundHttp1State
 	inboundHttp2Parsers map[uint64]*inboundHttp2State
+}
+
+type inboundHttp1State struct {
+	parser        *l7.Http1Parser
+	connTimestamp uint64
 }
 
 type inboundHttp2State struct {
