@@ -434,10 +434,10 @@ func loadCollection(spec *ebpf.CollectionSpec) (*ebpf.Collection, error) {
 }
 
 func installHTTP2TailProgs(c *ebpf.Collection) error {
-	if err := putHTTP2TailProgs(c, "http2_tail_progs", "http2_resume", "http2_walk", "http2_cut", "http2_iov"); err != nil {
+	if err := putHTTP2TailProgs(c, "http2_tail_progs", "http2_resume", "http2_iov"); err != nil {
 		return err
 	}
-	if err := putHTTP2TailProgs(c, "http2_tail_progs_kprobe", "http2_resume_kp", "http2_walk_kp", "http2_cut_kp", "http2_iov_kp"); err != nil {
+	if err := putHTTP2TailProgs(c, "http2_tail_progs_kprobe", "http2_resume_kp", "http2_iov_kp"); err != nil {
 		return err
 	}
 	return putHTTP2ReadTailProgs(c, "http2_tail_progs", "http2_readv", "http2_read_exit")
@@ -450,34 +450,26 @@ func putHTTP2ReadTailProgs(c *ebpf.Collection, mapName, readvName, exitName stri
 	if m == nil || readv == nil || readExit == nil {
 		return fmt.Errorf("http2 read tail programs missing: %s", mapName)
 	}
-	if err := m.Put(uint32(4), readv); err != nil {
+	if err := m.Put(uint32(2), readv); err != nil {
 		return fmt.Errorf("readv %s: %w", mapName, err)
 	}
-	if err := m.Put(uint32(5), readExit); err != nil {
+	if err := m.Put(uint32(3), readExit); err != nil {
 		return fmt.Errorf("read exit %s: %w", mapName, err)
 	}
 	return nil
 }
 
-func putHTTP2TailProgs(c *ebpf.Collection, mapName, resumeName, walkName, cutName, iovName string) error {
+func putHTTP2TailProgs(c *ebpf.Collection, mapName, resumeName, iovName string) error {
 	m := c.Maps[mapName]
 	resume := c.Programs[resumeName]
-	walk := c.Programs[walkName]
-	cut := c.Programs[cutName]
 	iov := c.Programs[iovName]
-	if m == nil || resume == nil || walk == nil || cut == nil || iov == nil {
+	if m == nil || resume == nil || iov == nil {
 		return fmt.Errorf("http2 tail programs missing: %s", mapName)
 	}
 	if err := m.Put(uint32(0), resume); err != nil {
 		return fmt.Errorf("resume %s: %w", mapName, err)
 	}
-	if err := m.Put(uint32(1), walk); err != nil {
-		return fmt.Errorf("walk %s: %w", mapName, err)
-	}
-	if err := m.Put(uint32(2), cut); err != nil {
-		return fmt.Errorf("cut %s: %w", mapName, err)
-	}
-	if err := m.Put(uint32(3), iov); err != nil {
+	if err := m.Put(uint32(1), iov); err != nil {
 		return fmt.Errorf("iov %s: %w", mapName, err)
 	}
 	return nil
@@ -595,7 +587,7 @@ func (t *Tracer) attachPrograms() error {
 	for _, programSpec := range t.collectionSpec.Programs {
 		program := t.collection.Programs[programSpec.Name]
 		switch programSpec.Name {
-		case "http2_resume", "http2_walk", "http2_cut", "http2_iov", "http2_readv", "http2_read_exit", "http2_resume_kp", "http2_walk_kp", "http2_cut_kp", "http2_iov_kp":
+		case "http2_resume", "http2_iov", "http2_readv", "http2_read_exit", "http2_resume_kp", "http2_iov_kp":
 			continue
 		}
 		if t.disableL7Tracing {

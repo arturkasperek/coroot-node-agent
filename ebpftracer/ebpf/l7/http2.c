@@ -45,7 +45,7 @@ int is_http2_preface(char *buf, __u64 size) {
 static __always_inline
 int is_http2_settings(char *buf, __u64 size) {
     unsigned char hdr[HTTP2_FRAME_HEADER_SIZE];
-    __u32 length;
+    __u32 length; 
     __u32 stream_id;
     if (size < HTTP2_FRAME_HEADER_SIZE) {
         return 0;
@@ -268,10 +268,20 @@ static __always_inline __u32 http2_bound_body(__u32 n) {
    budgets (see HTTP2_STREAM_CAPTURE_MAX below), so which one is stashed
    decides which budget the resume rechecks. */
 #define HTTP2_SKIP_HEADER 2
-/* Walk stopped on a cut HEADERS, CONTINUATION or DATA frame. pos is the
-   frame start. Not stored on the connection — http2_cut handles it. */
+/* The iovec walk stopped on a HEADERS, CONTINUATION or DATA frame cut short
+   of its declared length by this buffer's end. Transient: stashed on
+   struct http2_trim_args for http2_iov_impl to turn into a cut-resume
+   record (t.cut_hdr/cut_body/cut_length) before the loop returns — never
+   persisted via http2_skip_save. */
 #define HTTP2_SKIP_CUT 3
 #define HTTP2_SKIP_DATA 4
+/* A frame this walker never captures (SETTINGS, WINDOW_UPDATE, PING, ... —
+   see http2_copyable) — or a copyable frame whose stream already hit
+   HTTP2_STREAM_CAPTURE_MAX — was cut short of its declared length by this
+   buffer's end. There is no header/body to reconstruct and no stream budget
+   to track, just `skip` more raw bytes to walk past once they show up in a
+   later buffer. */
+#define HTTP2_SKIP_RAW 1
 
 /* Cumulative body bytes captured per (connection, direction, HTTP2 stream,
    HEADERS/CONTINUATION vs. DATA) — across as many frames and emitted events
@@ -587,7 +597,13 @@ int http2_classify_frame(struct http2_trim_args *a, const unsigned char hdr[HTTP
     if (take < length) {
         a->skip = length - take;
         a->skip_stream = stream_id;
-        a->skip_data = type == HTTP2_FRAME_DATA;
+        /* Overwritten below for a copyable frame that gets a proper cut-resume
+           record (HTTP2_SKIP_CUT) or a header/data topup (HTTP2_SKIP_HEADER /
+           HTTP2_SKIP_DATA); this is the value that sticks for everything else
+           (non-copyable frames, and copyable frames whose stream is already
+           at its capture cap) — a plain byte count with nothing to
+           reconstruct. */
+        a->skip_data = HTTP2_SKIP_RAW;
     } else {
         a->skip = 0;
         a->skip_data = 0;
@@ -658,104 +674,14 @@ int http2_classify_frame(struct http2_trim_args *a, const unsigned char hdr[HTTP
     return 0;
 }
 
-/* Frame walk for the tail-call path. A HEADERS, CONTINUATION or DATA frame
-   cut before 1KB is captured stops the loop (HTTP2_SKIP_CUT) so http2_cut
-   can promise the length without growing this callback. */
-static long http2_topup_cb(__u32 i, void *ctx) {
-    struct http2_trim_args *a = ctx;
-    unsigned char hdr[HTTP2_FRAME_HEADER_SIZE];
-    __u32 pos;
-    __u32 remain;
-    __u32 start;
-    __u32 take;
-    __u32 copied;
-    __u32 body_off;
-    __u32 stream_id;
-    int rc;
-    (void)i;
-    if (!a || !a->src || !a->dst) {
-        return 1;
-    }
-    pos = a->pos;
-    HTTP2_SRC_BOUND(pos);
-    start = pos;
-    if (pos >= a->src_size || pos >= HTTP2_SRC_MAX) {
-        return 1;
-    }
-    remain = 0;
-    if (pos < a->src_size) {
-        remain = a->src_size - pos;
-    }
-    if (remain < HTTP2_FRAME_HEADER_SIZE) {
-        return 1;
-    }
-    if (bpf_probe_read(hdr, sizeof(hdr), a->src + pos)) {
-        return 1;
-    }
-    pos += HTTP2_FRAME_HEADER_SIZE;
-    HTTP2_SRC_BOUND(pos);
-    remain = 0;
-    if (pos < a->src_size && pos < HTTP2_SRC_MAX) {
-        remain = a->src_size - pos;
-        if (remain > HTTP2_SRC_MAX) {
-            remain = HTTP2_SRC_MAX;
-        }
-    }
-    rc = http2_classify_frame(a, hdr, remain, &take, &copied, &body_off, &stream_id);
-    if (rc == 2) {
-        a->pos = start;
-        a->skip_data = HTTP2_SKIP_CUT;
-        return 1;
-    }
-    if (rc) {
-        return 1;
-    }
-    if (copied && copy_to_payload(a->dst, body_off, copied, a->src + pos)) {
-        return 1;
-    }
-    a->pos = pos + take;
-    return 0;
-}
-
-static __attribute__((noinline))
-int http2_topup_trim(struct http2_trim_args *a) {
-    __u32 n;
-    if (!a || !a->src || !a->dst) {
-        return 0;
-    }
-    if (a->src_size > HTTP2_SRC_MAX) {
-        a->src_size = HTTP2_SRC_MAX;
-    }
-    if (a->skip) {
-        n = a->skip;
-        if (n > a->src_size) {
-            n = a->src_size;
-        }
-        HTTP2_SRC_BOUND(n);
-        a->pos = n;
-        a->skip -= n;
-        if (!a->skip) {
-            a->skip_data = 0;
-        }
-    }
-    if (a->pos == 0 && is_http2_preface(a->src, a->src_size)) {
-        a->pos = HTTP2_PREFACE_SIZE;
-    }
-    bpf_loop(HTTP2_TRIM_MAX_FRAMES, http2_topup_cb, a, 0);
-    http2_flush(a);
-    return a->out_len;
-}
-
 /* writev/readv/sendmsg. The bytes stay in the process. This table is the
    list of pointers. The frame walk switches to the next pointer inside one
    bpf_loop. */
 
 #define HTTP2_TAIL_RESUME 0
-#define HTTP2_TAIL_WALK 1
-#define HTTP2_TAIL_CUT 2
-#define HTTP2_TAIL_IOV 3
-#define HTTP2_TAIL_READV 4
-#define HTTP2_TAIL_READ_EXIT 5
+#define HTTP2_TAIL_IOV 1
+#define HTTP2_TAIL_READV 2
+#define HTTP2_TAIL_READ_EXIT 3
 
 /* One writev/readv/sendmsg. 1024 is IOV_MAX. 16 bytes per entry fits in a per-CPU map. */
 #define HTTP2_MAX_VECS 1024
@@ -786,34 +712,32 @@ struct http2_iovec_table {
 };
 
 /* http2_tail_state and http2_iovecs are BPF_MAP_TYPE_PERCPU_ARRAY with a
-   single slot: scratch space to carry a buffer pointer/size/position across
-   the bpf_tail_call chain that walks one syscall's HTTP2 bytes (RESUME ->
-   [IOV] -> WALK -> [CUT]), since a tail call replaces the running program
-   with no stack/register state surviving the jump. One slot per CPU, not
-   per connection, is normally fine: the whole chain runs synchronously
-   within the one task whose syscall triggered it, with no scheduling point
-   in between for another task's syscall to intervene on the same core.
-   "Normally" is doing real work in that sentence, though — under load this
-   scratch slot has been observed to read back a completely different
-   connection's leftover state (a skip count 10x too large to have come from
-   the connection actually being walked), consistent with the kernel
-   occasionally preempting mid-chain and running another HTTP2-carrying
-   syscall's own chain (from an unrelated connection, possibly on a
-   different core migrating in) in between. owner pins down which task's
-   chain most recently claimed this slot; every stage after the one that
-   sets it re-checks bpf_get_current_pid_tgid() against it and bails out
-   cleanly (dropping just this one capture round) on a mismatch, rather than
-   reading/writing a stream that was never this task's to touch. */
+   single slot: scratch space to carry the source (an iovec table — real for
+   writev/readv/sendmsg, synthetic single-entry for plain write/read/TLS, see
+   http2_tail_emit) across the bpf_tail_call chain that walks one syscall's
+   HTTP2 bytes (RESUME -> IOV), since a tail call replaces the running
+   program with no stack/register state surviving the jump. One slot per
+   CPU, not per connection, is normally fine: the whole chain runs
+   synchronously within the one task whose syscall triggered it, with no
+   scheduling point in between for another task's syscall to intervene on
+   the same core. "Normally" is doing real work in that sentence, though —
+   under load this scratch slot has been observed to read back a completely
+   different connection's leftover state (a skip count 10x too large to have
+   come from the connection actually being walked), consistent with the
+   kernel occasionally preempting mid-chain and running another
+   HTTP2-carrying syscall's own chain (from an unrelated connection,
+   possibly on a different core migrating in) in between. owner pins down
+   which task's chain most recently claimed this slot; every stage after the
+   one that sets it re-checks bpf_get_current_pid_tgid() against it and
+   bails out cleanly (dropping just this one capture round) on a mismatch,
+   rather than reading/writing a stream that was never this task's to
+   touch. */
 struct http2_tail_state {
     __u64 owner;
     struct connection_id cid;
-    char *buf;
     __u64 size;
-    __u32 pos;
     __u8 method;
     __u8 is_req;
-    __u8 from_heap;
-    __u8 from_iov;
 };
 
 /* True once, at the top of every SEC() program that resumes a chain another
@@ -840,17 +764,17 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 6);
+    __uint(max_entries, 4);
     __type(key, __u32);
     __type(value, __u32);
 } http2_tail_progs SEC(".maps");
 
 /* Same programs, loaded as kprobe so an uprobe can tail-call them.
-   A PROG_ARRAY holds one program type. Slots 4 and 5 stay empty:
+   A PROG_ARRAY holds one program type. Slots 2 and 3 stay empty:
    readv dispatch is tracepoint-only. */
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 6);
+    __uint(max_entries, 4);
     __type(key, __u32);
     __type(value, __u32);
 } http2_tail_progs_kprobe SEC(".maps");
@@ -1024,7 +948,11 @@ int http2_iov_pull(__u8 *out) {
         }
     }
     addr = t->v[idx].base + off;
-    if (bpf_probe_read_user(out, 1, (void *)addr)) {
+    /* Generic (not _user): a vector's base can be a real userspace iovec
+       base (writev/readv), or the kernel-side iovec_buf_heap scratch
+       buffer standing in for one (see http2_tail_emit's synthetic
+       single-vector table for the plain write/read/TLS path). */
+    if (bpf_probe_read(out, 1, (void *)addr)) {
         return -1;
     }
     t->off = off + 1;
@@ -1067,7 +995,8 @@ int http2_iov_pull_header(unsigned char hdr[HTTP2_FRAME_HEADER_SIZE]) {
     HTTP2_SRC_BOUND(off);
     if (off < len && len - off >= HTTP2_FRAME_HEADER_SIZE) {
         addr = t->v[idx].base + off;
-        if (bpf_probe_read_user(hdr, HTTP2_FRAME_HEADER_SIZE, (void *)addr)) {
+        /* Generic, same reasoning as http2_iov_pull. */
+        if (bpf_probe_read(hdr, HTTP2_FRAME_HEADER_SIZE, (void *)addr)) {
             return -1;
         }
         t->off = off + HTTP2_FRAME_HEADER_SIZE;
@@ -1344,7 +1273,7 @@ int http2_iov_impl(void *ctx) {
     (void)ctx;
 
     s = bpf_map_lookup_elem(&http2_tail_state, &zero);
-    if (!s || http2_owner_mismatch(s->owner) || !s->size || !s->from_iov) {
+    if (!s || http2_owner_mismatch(s->owner) || !s->size) {
         return 0;
     }
     cid = s->cid;
@@ -1429,13 +1358,44 @@ int http2_iov_impl(void *ctx) {
             packed = 0;
             data = 0;
         }
+    } else if (data == HTTP2_SKIP_RAW && skip) {
+        /* Tail of a frame this walker never captures (or a capped stream's
+           frame), cut short by the previous buffer's end. No header/body to
+           reconstruct, no budget to track — just walk past however many of
+           the `skip` remaining bytes this buffer has. */
+        left = 0;
+        if (iovs->consumed < iovs->total) {
+            left = iovs->total - iovs->consumed;
+        }
+        if (left > skip) {
+            left = skip;
+        }
+        if (left) {
+            rest = http2_iov_skip(left);
+            if (left >= rest) {
+                skip -= left - rest;
+            }
+            if (rest) {
+                iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+                if (iovs && iovs->idx < iovs->n) {
+                    iovs->skip_left = rest;
+                }
+            }
+        }
+        if (skip) {
+            conn = bpf_map_lookup_elem(&active_connections, &cid);
+            http2_skip_save(conn, is_req, skip, 0, HTTP2_SKIP_RAW);
+            return 0;
+        }
+        packed = 0;
+        data = 0;
     }
     conn = bpf_map_lookup_elem(&active_connections, &cid);
     http2_skip_save(conn, is_req, skip, packed, data);
     iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
     if (iovs && iovs->n && iovs->v[0].len >= HTTP2_PREFACE_SIZE && iovs->idx == 0 && iovs->off == 0) {
         char p[6];
-        if (!bpf_probe_read_user(p, sizeof(p), (void *)iovs->v[0].base) &&
+        if (!bpf_probe_read(p, sizeof(p), (void *)iovs->v[0].base) &&
             p[0] == 'P' && p[1] == 'R' && p[2] == 'I' && p[3] == ' ' && p[4] == '*') {
             http2_iov_skip(HTTP2_PREFACE_SIZE);
         }
@@ -1514,31 +1474,19 @@ int http2_iov_kp(void *ctx) {
     return http2_iov_impl(ctx);
 }
 
-/* User buffer, or the per-CPU iovec scratch when from_heap is set.
-   The map pointer is not stored across the tail call. */
-static __always_inline
-char *http2_tail_buf(struct http2_tail_state *s) {
-    __u32 zero = 0;
-    if (!s) {
-        return 0;
-    }
-    if (s->from_heap) {
-        return bpf_map_lookup_elem(&iovec_buf_heap, &zero);
-    }
-    return s->buf;
-}
-
 /* Inline: bpf_tail_call must see the caller's ctx, and tail_progs must be a
    constant map of the same program type. Every plaintext HTTP/2 buffer
-   enters http2_resume; that program only finishes a cut frame, then
-   tail-calls http2_walk for the bytes that follow. */
+   enters http2_resume, which tail-calls straight into the iovec walker. */
 static __always_inline
 int http2_tail_emit(void *ctx, struct connection_id cid, struct connection *conn,
                     char *buf, __u64 size, __u8 is_req, __u8 from_heap, void *tail_progs) {
     __u32 zero = 0;
     struct http2_tail_state *s;
     struct http2_iovec_table *iovs;
-    if (!conn || conn->protocol != PROTOCOL_HTTP2) {
+    if (!conn) {
+        return 0;
+    }
+    if (conn->protocol != PROTOCOL_HTTP2) {
         return 0;
     }
     iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
@@ -1557,13 +1505,9 @@ int http2_tail_emit(void *ctx, struct connection_id cid, struct connection *conn
     }
     s->owner = bpf_get_current_pid_tgid();
     s->cid = cid;
-    s->pos = 0;
     s->is_req = is_req;
     s->method = is_req ? METHOD_HTTP2_CLIENT_FRAMES : METHOD_HTTP2_SERVER_FRAMES;
     if (iovs && iovs->ready && iovs->total) {
-        s->from_iov = 1;
-        s->from_heap = 0;
-        s->buf = 0;
         s->size = iovs->total;
         if (s->size > HTTP2_SRC_MAX) {
             s->size = HTTP2_SRC_MAX;
@@ -1574,14 +1518,41 @@ int http2_tail_emit(void *ctx, struct connection_id cid, struct connection *conn
         iovs->skip_left = 0;
         iovs->ready = 0;
     } else {
-        s->from_iov = 0;
-        s->size = size;
-        s->from_heap = from_heap;
+        /* No real (writev/readv/sendmsg) vector list: adapt the single
+           contiguous buffer (a real userspace pointer for plain
+           write/read/TLS-decrypted data, or the kernel-side
+           iovec_buf_heap scratch standing in for one when from_heap) into
+           a synthetic one-entry vector table, so every source funnels
+           through the one walker (http2_iov_impl) instead of keeping a
+           second, source-specific one just for this case. */
+        char *src = buf;
         if (from_heap) {
-            s->buf = 0;
-        } else {
-            s->buf = buf;
+            src = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
+            if (!src) {
+                return 0;
+            }
         }
+        iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+        if (!iovs) {
+            return 0;
+        }
+        iovs->owner = s->owner;
+        iovs->n = 1;
+        iovs->idx = 0;
+        iovs->off = 0;
+        iovs->v[0].base = (__u64)src;
+        iovs->v[0].len = size;
+        if (iovs->v[0].len > HTTP2_SRC_MAX) {
+            iovs->v[0].len = HTTP2_SRC_MAX;
+        }
+        iovs->total = iovs->v[0].len;
+        iovs->consumed = 0;
+        iovs->skip_left = 0;
+        iovs->cut_body = 0;
+        iovs->cut_length = 0;
+        iovs->ready = 0;
+
+        s->size = iovs->total;
     }
     bpf_tail_call(ctx, tail_progs, HTTP2_TAIL_RESUME);
     return 1;
@@ -1671,119 +1642,21 @@ int http2_read_exit(struct trace_event_raw_sys_exit__stub *ctx) {
     return rc;
 }
 
-/* Not attached. Plaintext HTTP/2 tail-calls here so the frame walk, including
-   a cut HEADERS, CONTINUATION or DATA top-up, has its own verifier budget.
-   tail_progs is the caller's prog array (tracepoint or kprobe). */
+/* Not attached. Every source (writev/readv/sendmsg's real vector list, or
+   http2_tail_emit's synthetic single-entry one for plain write/read/TLS)
+   tail-calls here on its way to the iovec walker, so that walk gets its own
+   verifier budget. tail_progs is the caller's prog array (tracepoint or
+   kprobe). */
 static __always_inline
 int http2_resume_impl(void *ctx, void *tail_progs) {
     __u32 zero = 0;
     struct http2_tail_state *s;
-    struct connection *conn;
-    char *dst;
-    char *buf;
-    struct connection_id cid = {};
-    struct http2_trim_args t = {};
-    __u64 size;
-    __u64 conn_ts;
-    __u32 skip, packed, have, need, pos, left, stream_id, budget;
-    __u8 is_req, method, data, is_header;
 
     s = bpf_map_lookup_elem(&http2_tail_state, &zero);
     if (!s || http2_owner_mismatch(s->owner) || !s->size) {
         return 0;
     }
-    if (s->from_iov) {
-        bpf_tail_call(ctx, tail_progs, HTTP2_TAIL_IOV);
-        return 0;
-    }
-    buf = http2_tail_buf(s);
-    if (!buf) {
-        return 0;
-    }
-    cid = s->cid;
-    size = s->size;
-    is_req = s->is_req;
-    method = s->method;
-
-    conn = bpf_map_lookup_elem(&active_connections, &cid);
-    if (!conn) {
-        return 0;
-    }
-    conn_ts = conn->timestamp;
-    http2_skip_load(conn, is_req, &skip, &packed, &data);
-    pos = 0;
-    if (size > HTTP2_SRC_MAX) {
-        size = HTTP2_SRC_MAX;
-    }
-    dst = bpf_map_lookup_elem(&http2_emit_heap, &zero);
-    if (!dst) {
-        return 0;
-    }
-    if ((data == HTTP2_SKIP_HEADER || data == HTTP2_SKIP_DATA) && skip) {
-        stream_id = packed;
-        is_header = data == HTTP2_SKIP_HEADER;
-        budget = http2_stream_remaining(conn_ts, stream_id, HTTP2_STREAM_DIR(is_req, is_header));
-        if (!budget) {
-            /* Nothing left to ever capture for this stream; fall through to
-               a plain numeric skip via the generic a->skip drain below. */
-            data = 0;
-            packed = 0;
-        } else {
-            need = http2_skip_topup_want(skip, size, budget);
-            have = 0;
-            if (need) {
-                if (copy_to_payload(dst, 0, need, buf)) {
-                    return 0;
-                }
-                t.cid = cid;
-                t.conn_ts = conn_ts;
-                t.dst = dst;
-                t.is_req = is_req;
-                t.method = method;
-                t.out_len = need;
-                http2_stream_add(conn_ts, stream_id, HTTP2_STREAM_DIR(is_req, is_header), need);
-                have = need;
-                http2_flush(&t);
-                skip -= have;
-            }
-            pos = have;
-            if (skip && pos < size) {
-                left = size - pos;
-                if (left > skip) {
-                    left = skip;
-                }
-                HTTP2_SRC_BOUND(left);
-                pos += left;
-                skip -= left;
-            }
-            http2_skip_topup_next(conn_ts, stream_id, is_req, is_header, skip, &packed, &data);
-            if (pos >= size || data == HTTP2_SKIP_HEADER || data == HTTP2_SKIP_DATA) {
-                conn = bpf_map_lookup_elem(&active_connections, &cid);
-                if (!conn) {
-                    return 0;
-                }
-                http2_skip_save(conn, is_req, skip, packed, data);
-                return 0;
-            }
-            skip = 0;
-            packed = 0;
-            data = 0;
-        }
-    }
-    conn = bpf_map_lookup_elem(&active_connections, &cid);
-    if (!conn) {
-        return 0;
-    }
-    http2_skip_save(conn, is_req, skip, packed, data);
-    s = bpf_map_lookup_elem(&http2_tail_state, &zero);
-    if (!s) {
-        return 0;
-    }
-    s->pos = pos;
-    s->size = size;
-    if (pos < size) {
-        bpf_tail_call(ctx, tail_progs, HTTP2_TAIL_WALK);
-    }
+    bpf_tail_call(ctx, tail_progs, HTTP2_TAIL_IOV);
     return 0;
 }
 
@@ -1797,201 +1670,3 @@ int http2_resume_kp(void *ctx) {
     return http2_resume_impl(ctx, &http2_tail_progs_kprobe);
 }
 
-static __always_inline
-int http2_walk_impl(void *ctx, void *tail_progs) {
-    __u32 zero = 0;
-    struct http2_tail_state *s;
-    struct connection *conn;
-    char *dst;
-    struct connection_id cid = {};
-    struct http2_trim_args t = {};
-    __u8 is_req;
-    s = bpf_map_lookup_elem(&http2_tail_state, &zero);
-    if (!s || http2_owner_mismatch(s->owner)) {
-        return 0;
-    }
-    cid = s->cid;
-    is_req = s->is_req;
-    t.cid = cid;
-    t.src = http2_tail_buf(s);
-    if (!t.src) {
-        return 0;
-    }
-    t.src_size = s->size;
-    t.pos = s->pos;
-    t.method = s->method;
-    t.is_req = is_req;
-    conn = bpf_map_lookup_elem(&active_connections, &cid);
-    if (!conn) {
-        return 0;
-    }
-    t.conn_ts = conn->timestamp;
-    http2_skip_load(conn, is_req, &t.skip, &t.skip_stream, &t.skip_data);
-    dst = bpf_map_lookup_elem(&http2_emit_heap, &zero);
-    if (!dst) {
-        return 0;
-    }
-    t.dst = dst;
-    http2_topup_trim(&t);
-    if (t.skip_data == HTTP2_SKIP_CUT) {
-        s = bpf_map_lookup_elem(&http2_tail_state, &zero);
-        if (!s) {
-            return 0;
-        }
-        s->pos = t.pos;
-        bpf_tail_call(ctx, tail_progs, HTTP2_TAIL_CUT);
-        return 0;
-    }
-    conn = bpf_map_lookup_elem(&active_connections, &cid);
-    if (!conn) {
-        return 0;
-    }
-    http2_skip_save(conn, is_req, t.skip, t.skip_stream, t.skip_data);
-    return 0;
-}
-
-SEC("tracepoint/http2/walk")
-int http2_walk(void *ctx) {
-    return http2_walk_impl(ctx, &http2_tail_progs);
-}
-
-SEC("uprobe/http2_walk")
-int http2_walk_kp(void *ctx) {
-    return http2_walk_impl(ctx, &http2_tail_progs_kprobe);
-}
-
-/* One cut HEADERS, CONTINUATION or DATA frame. Captures up to one ring
-   slot's worth (bounded further by the stream's remaining budget) and
-   leaves whatever's still missing — of this ring slot's promise or of the
-   frame itself — for http2_resume on a later call. */
-static __always_inline
-int http2_cut_impl(void *ctx) {
-    __u32 zero = 0;
-    struct http2_tail_state *s;
-    struct connection *conn;
-    char *buf;
-    char *dst;
-    struct connection_id cid = {};
-    struct http2_trim_args t = {};
-    unsigned char hdr[HTTP2_FRAME_HEADER_SIZE];
-    unsigned char nh[HTTP2_FRAME_HEADER_SIZE];
-    __u64 size;
-    __u32 pos;
-    __u32 off;
-    __u32 length;
-    __u32 remain;
-    __u32 take;
-    __u32 want;
-    __u32 n;
-    __u32 stream_id;
-    __u32 budget;
-    __u64 conn_ts;
-    __u8 is_req;
-    __u8 type;
-    __u8 is_header;
-    (void)ctx;
-    s = bpf_map_lookup_elem(&http2_tail_state, &zero);
-    if (!s || http2_owner_mismatch(s->owner)) {
-        return 0;
-    }
-    buf = http2_tail_buf(s);
-    if (!buf) {
-        return 0;
-    }
-    cid = s->cid;
-    is_req = s->is_req;
-    size = s->size;
-    if (size > HTTP2_SRC_MAX) {
-        size = HTTP2_SRC_MAX;
-    }
-    pos = s->pos;
-    HTTP2_SRC_BOUND(pos);
-    if (pos >= size || size - pos < HTTP2_FRAME_HEADER_SIZE) {
-        return 0;
-    }
-    if (bpf_probe_read(hdr, sizeof(hdr), buf + pos)) {
-        return 0;
-    }
-    off = pos + HTTP2_FRAME_HEADER_SIZE;
-    HTTP2_SRC_BOUND(off);
-    length = ((__u32)hdr[0] << 16) | ((__u32)hdr[1] << 8) | hdr[2];
-    type = hdr[3];
-    if (type != HTTP2_FRAME_HEADERS && type != HTTP2_FRAME_CONTINUATION && type != HTTP2_FRAME_DATA) {
-        return 0;
-    }
-    stream_id = ((__u32)hdr[5] << 24) | ((__u32)hdr[6] << 16) | ((__u32)hdr[7] << 8) | hdr[8];
-    is_header = type == HTTP2_FRAME_HEADERS || type == HTTP2_FRAME_CONTINUATION;
-    remain = 0;
-    if (off < size) {
-        remain = size - off;
-    }
-    take = length;
-    if (take > remain) {
-        take = remain;
-    }
-    HTTP2_SRC_BOUND(take);
-
-    conn = bpf_map_lookup_elem(&active_connections, &cid);
-    if (!conn) {
-        return 0;
-    }
-    conn_ts = conn->timestamp;
-    budget = http2_stream_remaining(conn_ts, stream_id, HTTP2_STREAM_DIR(is_req, is_header));
-    if (!budget) {
-        http2_skip_save(conn, is_req, 0, 0, 0);
-        return 0;
-    }
-    want = length;
-    if (want > budget) {
-        want = budget;
-    }
-    n = take;
-    if (n > want) {
-        n = want;
-    }
-    n = http2_bound_body(n);
-    http2_encode_frame_header(nh, want, hdr);
-    dst = bpf_map_lookup_elem(&http2_emit_heap, &zero);
-    if (!dst) {
-        return 0;
-    }
-    if (copy_to_payload(dst, 0, HTTP2_FRAME_HEADER_SIZE, nh)) {
-        return 0;
-    }
-    if (n && copy_to_payload(dst, HTTP2_FRAME_HEADER_SIZE, n, buf + off)) {
-        return 0;
-    }
-    http2_stream_add(conn_ts, stream_id, HTTP2_STREAM_DIR(is_req, is_header), n);
-    t.cid = cid;
-    t.conn_ts = conn_ts;
-    t.dst = dst;
-    t.is_req = is_req;
-    t.method = s->method;
-    t.out_len = HTTP2_FRAME_HEADER_SIZE + n;
-    t.first_stream = stream_id;
-    http2_flush(&t);
-    conn = bpf_map_lookup_elem(&active_connections, &cid);
-    if (!conn) {
-        return 0;
-    }
-    if (take >= length) {
-        http2_skip_save(conn, is_req, 0, 0, 0);
-        return 0;
-    }
-    if (http2_stream_remaining(conn_ts, stream_id, HTTP2_STREAM_DIR(is_req, is_header))) {
-        http2_skip_save(conn, is_req, length - take, stream_id, is_header ? HTTP2_SKIP_HEADER : HTTP2_SKIP_DATA);
-    } else {
-        http2_skip_save(conn, is_req, 0, 0, 0);
-    }
-    return 0;
-}
-
-SEC("tracepoint/http2/cut")
-int http2_cut(void *ctx) {
-    return http2_cut_impl(ctx);
-}
-
-SEC("uprobe/http2_cut")
-int http2_cut_kp(void *ctx) {
-    return http2_cut_impl(ctx);
-}

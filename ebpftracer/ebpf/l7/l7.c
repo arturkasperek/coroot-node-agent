@@ -387,7 +387,19 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
         struct connection new_conn = {};
         new_conn.timestamp = bpf_ktime_get_ns();
         new_conn.is_inbound = 0;
-        bpf_map_update_elem(&active_connections, &cid, &new_conn, BPF_NOEXIST);
+        /* BPF_ANY, not BPF_NOEXIST: this cid's slot can hold a stale entry
+           from an earlier, unrelated connection that reused the same
+           (pid, fd) — BPF_NOEXIST would silently keep it (and its leftover
+           h2_skip_req/resp state) instead of inserting new_conn, and
+           nothing here checks bpf_map_update_elem's return to notice. The
+           lookup right after would then hand back that stale connection —
+           observed live as a brand new connection's very first read
+           reporting a pending HTTP2 DATA skip of hundreds of bytes it
+           never received. Always overwriting is correct here: reaching
+           this fallback already means the normal tcp/state.c connect/accept
+           tracking has no entry for this cid, so nothing legitimate is
+           being clobbered. */
+        bpf_map_update_elem(&active_connections, &cid, &new_conn, BPF_ANY);
         conn = bpf_map_lookup_elem(&active_connections, &cid);
         if (!conn) {
             return 0;
@@ -676,7 +688,10 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, 
         struct connection new_conn = {};
         new_conn.timestamp = bpf_ktime_get_ns();
         new_conn.is_inbound = 1;
-        bpf_map_update_elem(&active_connections, &cid, &new_conn, BPF_NOEXIST);
+        /* BPF_ANY: see the matching fallback in trace_enter_write for why
+           BPF_NOEXIST here can hand back a stale, unrelated connection's
+           leftover HTTP2 skip state on a (pid, fd) reuse. */
+        bpf_map_update_elem(&active_connections, &cid, &new_conn, BPF_ANY);
         conn = bpf_map_lookup_elem(&active_connections, &cid);
         if (!conn) {
             return 0;
