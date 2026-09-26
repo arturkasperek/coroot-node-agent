@@ -61,3 +61,14 @@ docker-test:
 		-v /sys/kernel/btf:/sys/kernel/btf:ro \
 		-e VM=1 \
 		$(DOCKER_TEST_IMAGE) $(DOCKER_TEST_ARGS)
+
+# Full end-to-end suite: builds a "swiss army knife" image (go, node,
+# python, php, java), runs one example HTTP service per language as its
+# own sibling container (so coroot-node-agent's cgroup-based container
+# discovery tracks each separately), fires HTTP/1.1 + h2c load at all of
+# them from a real coroot-node-agent instance, and verifies every request
+# shows up as an OTLP trace span in a mock collector backend. See
+# e2e/run.sh for the full orchestration.
+.PHONY: docker-test-e2e
+docker-test-e2e:
+	bash e2e/run.sh
