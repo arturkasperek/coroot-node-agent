@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -70,6 +71,20 @@ type Registry struct {
 	pythonStatsUpdateCh  chan *PythonStatsUpdate
 
 	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
+
+	// Diagnostic counters partitioning where an outbound HTTP/1 L7 event
+	// can be lost, to tell apart (1) the kernel/ring-buffer never
+	// delivering the event at all (compare http1EventsSeen against
+	// EbpfLostSamples/known request volume), (2) Go-side connection
+	// correlation failing (no connectionsByPidFd entry, or a
+	// conn.Timestamp mismatch against the event's — see onL7Request) from
+	// (3) the Http1Parser itself losing sync despite a correctly routed
+	// event (http1EventsSeen - the two dropped counters, vs
+	// http1RequestsParsed).
+	http1EventsSeen           atomic.Uint64
+	http1DroppedNoConnection  atomic.Uint64
+	http1DroppedTsMismatch    atomic.Uint64
+	http1RequestsParsed       atomic.Uint64
 }
 
 func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, profilingUpdateCh chan *ProfilingUpdate, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample) (*Registry, error) {
@@ -148,6 +163,10 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.EbpfLostSamples
 	ch <- metrics.L7PayloadsTruncated
 	ch <- metrics.GoTlsUprobeAttachFailures
+	ch <- metrics.Http1EventsSeen
+	ch <- metrics.Http1DroppedNoConnection
+	ch <- metrics.Http1DroppedTsMismatch
+	ch <- metrics.Http1RequestsParsed
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
@@ -163,6 +182,10 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 		ch <- metrics.Counter(metrics.L7PayloadsTruncated, float64(r.tracer.TruncatedPayloads()))
 		ch <- metrics.Counter(metrics.GoTlsUprobeAttachFailures, float64(r.tracer.GoTlsAttachFailures()))
 	}
+	ch <- metrics.Counter(metrics.Http1EventsSeen, float64(r.http1EventsSeen.Load()))
+	ch <- metrics.Counter(metrics.Http1DroppedNoConnection, float64(r.http1DroppedNoConnection.Load()))
+	ch <- metrics.Counter(metrics.Http1DroppedTsMismatch, float64(r.http1DroppedTsMismatch.Load()))
+	ch <- metrics.Counter(metrics.Http1RequestsParsed, float64(r.http1RequestsParsed.Load()))
 }
 
 func (r *Registry) Close() {

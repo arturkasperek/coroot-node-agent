@@ -90,8 +90,22 @@ type PidFd struct {
 	Fd  uint64
 }
 
+// PidFdTs identifies one specific connection instance rather than just
+// "whichever connection currently owns this fd" — see connectionsByPidFdTs.
+type PidFdTs struct {
+	Pid       uint32
+	Fd        uint64
+	Timestamp uint64
+}
+
 type pendingHttp2State struct {
 	parser    *l7.Http2Parser
+	timestamp uint64
+	updatedAt time.Time
+}
+
+type pendingHttp1State struct {
+	parser    *l7.Http1Parser
 	timestamp uint64
 	updatedAt time.Time
 }
@@ -127,7 +141,20 @@ type Container struct {
 	lastConnectionAttempts   map[common.HostPort]time.Time
 	activeConnections        map[ConnectionKey]*ActiveConnection
 	connectionsByPidFd       map[PidFd]*ActiveConnection
-	pendingHttp2Parsers      map[PidFd]*pendingHttp2State
+	// Every live connection also indexed by its own (pid, fd, timestamp)
+	// triple, not just the latest one per (pid, fd) — see onL7Request's
+	// fallback lookup for why a late event needs to find its exact,
+	// possibly-superseded connection rather than whatever now owns the fd.
+	connectionsByPidFdTs map[PidFdTs]*ActiveConnection
+	pendingHttp2Parsers  map[PidFd]*pendingHttp2State
+	// Keyed by the exact (pid, fd, timestamp) of the connection this
+	// buffered parser belongs to (unlike pendingHttp2Parsers, which is
+	// only ever fed for a single not-yet-registered connection at a
+	// time) — HTTP/1's fd churn (see onL7Request) means several distinct,
+	// not-yet-registered connections can share the same (pid, fd)
+	// simultaneously, and each needs its own slot so a newer one's
+	// pending events don't clobber an older one's.
+	pendingHttp1Parsers map[PidFdTs]*pendingHttp1State
 
 	l7Stats        L7Stats
 	l7InboundStats L7InboundStats
@@ -188,7 +215,9 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		lastConnectionAttempts:   map[common.HostPort]time.Time{},
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
+		connectionsByPidFdTs:     map[PidFdTs]*ActiveConnection{},
 		pendingHttp2Parsers:      map[PidFd]*pendingHttp2State{},
+		pendingHttp1Parsers:      map[PidFdTs]*pendingHttp1State{},
 		l7Stats:                  L7Stats{},
 		l7InboundStats:           L7InboundStats{},
 		dnsStats:                 &L7Metrics{},
@@ -672,11 +701,21 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			prev.Closed = time.Now()
 		}
 		c.connectionsByPidFd[k] = connection
+		if timestamp != 0 {
+			c.connectionsByPidFdTs[PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}] = connection
+		}
 		if pending, ok := c.pendingHttp2Parsers[k]; ok {
 			if pending.timestamp == 0 || pending.timestamp == timestamp {
 				connection.http2Parser = pending.parser
 			}
 			delete(c.pendingHttp2Parsers, k)
+		}
+		if timestamp != 0 {
+			kts := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
+			if pending, ok := c.pendingHttp1Parsers[kts]; ok {
+				connection.http1Parser = pending.parser
+				delete(c.pendingHttp1Parsers, kts)
+			}
 		}
 	}
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
@@ -691,6 +730,31 @@ func (c *Container) feedPendingHttp2(pid uint32, fd uint64, timestamp uint64, r 
 	}
 	if st.timestamp == 0 {
 		st.timestamp = timestamp
+	}
+	st.updatedAt = time.Now()
+	_ = st.parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+}
+
+// feedPendingHttp1 mirrors feedPendingHttp2: an HTTP/1 L7 event can arrive
+// for a (pid, fd) before onConnectionOpen has registered that connection —
+// the tcp-connect-events and l7-events ring buffers are read by two
+// independent goroutines with no ordering guarantee between them (see
+// runTcpConnectEventsReader/runL7EventsReader in ebpftracer/tracer.go), so
+// this race is routine, not exceptional. Rather than dropping the event
+// (as onL7Request otherwise would for l7.ProtocolHTTP when conn == nil),
+// keep parsing into a pending Http1Parser so header/body framing state
+// isn't lost; onConnectionOpen attaches it to the real connection once
+// registered, and normal dispatch continues from there. Same limitation as
+// HTTP2's version: a request/response pair that completes entirely before
+// the connection registers is parsed here and its result discarded (no
+// registered connection to attribute a trace to yet) — this only recovers
+// the *ongoing* framing state for whatever comes after.
+func (c *Container) feedPendingHttp1(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) {
+	k := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
+	st := c.pendingHttp1Parsers[k]
+	if st == nil {
+		st = &pendingHttp1State{parser: l7.NewHttp1Parser(), timestamp: timestamp}
+		c.pendingHttp1Parsers[k] = st
 	}
 	st.updatedAt = time.Now()
 	_ = st.parser.Parse(r.Method, r.Payload, uint64(r.Duration))
@@ -823,13 +887,48 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
-	if conn == nil {
+	if conn == nil || (timestamp != 0 && conn.Timestamp != timestamp) {
+		// (pid, fd) is reused across connections far faster than the
+		// two independent ring-buffer readers (tcp-connect-events and
+		// l7-events, see runTcpConnectEventsReader/runL7EventsReader in
+		// ebpftracer/tracer.go) can be guaranteed to stay in order: a
+		// late event for an older connection on this fd can arrive after
+		// a newer connection has already reused the same fd and
+		// overwritten connectionsByPidFd's entry. Before treating this
+		// as unknown, check whether the *exact* connection this event
+		// belongs to (identified by its own timestamp, not just the
+		// latest one on this fd) is still around.
+		if timestamp != 0 {
+			if alt := c.connectionsByPidFdTs[PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}]; alt != nil {
+				conn = alt
+			}
+		}
+	}
+	if conn == nil || (timestamp != 0 && conn.Timestamp != timestamp) {
+		// Still unresolved even after the connectionsByPidFdTs fallback
+		// above: either this (pid, fd) has never been registered at all,
+		// or it has but for a *different* connection than this event's
+		// own timestamp (the fallback lookup itself came up empty,
+		// meaning that connection's own connect-open event hasn't been
+		// processed yet either — same cross-ring-buffer race, just late
+		// enough that neither map has caught up). Both cases get one
+		// more chance via feedPendingHttp1, keyed by the event's own
+		// (pid, fd, timestamp) so concurrently-pending connections on a
+		// fast-recycled fd don't clobber each other's buffered state;
+		// onConnectionOpen attaches it once that connection's own
+		// connect-open event finally arrives (see there).
+		wasNil := conn == nil
 		if r.Protocol == l7.ProtocolHTTP2 {
 			c.feedPendingHttp2(pid, fd, timestamp, r)
 		}
-		return nil
-	}
-	if timestamp != 0 && conn.Timestamp != timestamp {
+		if r.Protocol == l7.ProtocolHTTP {
+			if wasNil {
+				c.registry.http1DroppedNoConnection.Add(1)
+			} else {
+				c.registry.http1DroppedTsMismatch.Add(1)
+			}
+			c.feedPendingHttp1(pid, fd, timestamp, r)
+		}
 		return nil
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey)
@@ -847,10 +946,12 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
+		c.registry.http1EventsSeen.Add(1)
 		if conn.http1Parser == nil {
 			conn.http1Parser = l7.NewHttp1Parser()
 		}
 		for _, req := range conn.http1Parser.Parse(r.Method, r.Payload, uint64(r.Duration)) {
+			c.registry.http1RequestsParsed.Add(1)
 			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
 				stats.observe(req.Status.Http(), "", req.Duration)
 				trace.HttpRequest(req.Method, req.Path, req.Status, req.Duration)
@@ -1385,6 +1486,9 @@ func (c *Container) gc(now time.Time) {
 			if conn == c.connectionsByPidFd[pidFd] {
 				delete(c.connectionsByPidFd, pidFd)
 			}
+			if conn.Timestamp != 0 {
+				delete(c.connectionsByPidFdTs, PidFdTs{Pid: conn.Pid, Fd: conn.Fd, Timestamp: conn.Timestamp})
+			}
 			continue
 		} else {
 			establishedDst[conn.DestinationKey.Destination()] = struct{}{}
@@ -1394,11 +1498,19 @@ func (c *Container) gc(now time.Time) {
 			if conn == c.connectionsByPidFd[pidFd] {
 				delete(c.connectionsByPidFd, pidFd)
 			}
+			if conn.Timestamp != 0 {
+				delete(c.connectionsByPidFdTs, PidFdTs{Pid: conn.Pid, Fd: conn.Fd, Timestamp: conn.Timestamp})
+			}
 		}
 	}
 	for k, st := range c.pendingHttp2Parsers {
 		if now.Sub(st.updatedAt) > gcInterval {
 			delete(c.pendingHttp2Parsers, k)
+		}
+	}
+	for k, st := range c.pendingHttp1Parsers {
+		if now.Sub(st.updatedAt) > gcInterval {
+			delete(c.pendingHttp1Parsers, k)
 		}
 	}
 	for dst, at := range c.lastConnectionAttempts {

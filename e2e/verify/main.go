@@ -75,19 +75,30 @@ func main() {
 	backend := flag.String("backend", "http://127.0.0.1:4318", "mock backend base URL")
 	manifestPath := flag.String("manifest", "/tmp/manifest.json", "manifest written by loadgen")
 	minRatio := flag.Float64("min-ratio", 0.95, "minimum fraction of sent requests that must show up as recorded spans, per h2c target")
-	// coroot-node-agent's HTTP/1 tracer resumes cross-syscall parsing state
-	// keyed by (pid, fd) with no retry: on a genuinely busy host (this suite
-	// has been run against a live k8s cluster sharing the box), a single
-	// dropped connect/L7-dispatch event under real contention silently
-	// loses that connection's capture. loadgen disables HTTP/1.1 keep-alive
-	// so each request gets its own connection (a fresh shot at protocol
-	// detection) rather than one request's drop taking down every later
-	// request on a reused connection, which brought observed ratios from
-	// ~0.04-0.18 up to ~0.60-0.83 on this host — real, but still well under
-	// h2c's ~1.00 (a single multiplexed connection isn't exposed to this at
-	// all). 0.4 sits comfortably under the observed floor without accepting
-	// near-total loss as "passing".
-	minRatioH1 := flag.Float64("min-ratio-h1", 0.4, "minimum fraction of sent requests that must show up as recorded spans, per h1 target (see comment: lower than h2c because of real host-noise-driven capture loss in the HTTP/1 tracer)")
+	// coroot-node-agent's HTTP/1 tracer correlates L7 payload events to a
+	// tracked connection by (pid, fd, timestamp). On a genuinely busy host
+	// (this suite has been run against a live k8s cluster sharing the
+	// box), (pid, fd) gets reused across connections faster than the two
+	// independent ring-buffer readers (tcp-connect-events and l7-events —
+	// see runTcpConnectEventsReader/runL7EventsReader in
+	// ebpftracer/tracer.go) are guaranteed to stay in order, so a late
+	// event for an older connection can arrive after a newer one has
+	// already reused its fd. containers/container.go's onL7Request and
+	// onConnectionOpen now keep a secondary index (connectionsByPidFdTs)
+	// so a late event can still find its exact, superseded connection
+	// instead of being compared against — and rejected by — the new one,
+	// plus a pendingHttp1Parsers buffer (mirroring HTTP2's
+	// pendingHttp2Parsers) for events that arrive before their connection
+	// is registered at all, and pendingHttp1Parsers is itself keyed by
+	// the full (pid, fd, timestamp) rather than just (pid, fd) so several
+	// concurrently-pending connections on a fast-recycled fd don't
+	// clobber each other's buffered parsing state. Together these
+	// brought measured ratios from ~0.60-0.83 up to ~0.91-1.00 on this
+	// host — close to h2c's ~1.00, though still a bit under it (a single
+	// multiplexed connection never reuses its fd, so it isn't exposed to
+	// this race at all) and still host-noise-sensitive, so the bar stays
+	// a bit under the observed floor rather than at h2c's.
+	minRatioH1 := flag.Float64("min-ratio-h1", 0.85, "minimum fraction of sent requests that must show up as recorded spans, per h1 target (see comment: lower than h2c because of real host-noise-driven capture loss in the HTTP/1 tracer)")
 	waitFor := flag.Duration("wait", 20*time.Second, "how long to wait/poll for spans to arrive before giving up")
 	flag.Parse()
 
