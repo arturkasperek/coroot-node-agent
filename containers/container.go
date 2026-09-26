@@ -108,7 +108,27 @@ type pendingHttp1State struct {
 	parser    *l7.Http1Parser
 	timestamp uint64
 	updatedAt time.Time
+	// Requests the parser completed while still waiting for their own
+	// connection to register — see feedPendingHttp1/emitPendingHttp1Requests.
+	completed []pendingHttp1CompletedRequest
 }
+
+type pendingHttp1CompletedRequest struct {
+	req l7.Http1Request
+	at  time.Time
+}
+
+// pendingHttp1RequestMaxAge bounds how long a request/response pair
+// completed by feedPendingHttp1 (before its connection was registered) can
+// wait for onConnectionOpen to recover it. Trace.createSpan (see
+// tracing/tracing.go) stamps a span's absolute start/end from time.Now()
+// at emission, not from any kernel timestamp — the request's Duration is
+// still correct either way (it comes from kernel timestamps), but the
+// longer we hold a completed request before emitting it, the further its
+// reported position in the trace timeline drifts from when it actually
+// happened. Past this age it's better to drop it than emit a visibly
+// stale span.
+const pendingHttp1RequestMaxAge = 2 * time.Second
 
 type ConnectionStats struct {
 	Count           uint64
@@ -714,6 +734,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			kts := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
 			if pending, ok := c.pendingHttp1Parsers[kts]; ok {
 				connection.http1Parser = pending.parser
+				c.emitPendingHttp1Requests(connection, pending.completed)
 				delete(c.pendingHttp1Parsers, kts)
 			}
 		}
@@ -744,11 +765,12 @@ func (c *Container) feedPendingHttp2(pid uint32, fd uint64, timestamp uint64, r 
 // (as onL7Request otherwise would for l7.ProtocolHTTP when conn == nil),
 // keep parsing into a pending Http1Parser so header/body framing state
 // isn't lost; onConnectionOpen attaches it to the real connection once
-// registered, and normal dispatch continues from there. Same limitation as
-// HTTP2's version: a request/response pair that completes entirely before
-// the connection registers is parsed here and its result discarded (no
-// registered connection to attribute a trace to yet) — this only recovers
-// the *ongoing* framing state for whatever comes after.
+// registered, and normal dispatch continues from there. Unlike HTTP2's
+// version, a request/response pair that completes entirely before the
+// connection registers is *not* discarded here — it's queued in
+// st.completed (bounded by pendingHttp1RequestMaxAge) and emitted
+// retroactively by emitPendingHttp1Requests once onConnectionOpen finds
+// this state.
 func (c *Container) feedPendingHttp1(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) {
 	k := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
 	st := c.pendingHttp1Parsers[k]
@@ -757,7 +779,46 @@ func (c *Container) feedPendingHttp1(pid uint32, fd uint64, timestamp uint64, r 
 		c.pendingHttp1Parsers[k] = st
 	}
 	st.updatedAt = time.Now()
-	_ = st.parser.Parse(r.Method, r.Payload, uint64(r.Duration))
+	for _, req := range st.parser.Parse(r.Method, r.Payload, uint64(r.Duration)) {
+		st.completed = append(st.completed, pendingHttp1CompletedRequest{req: req, at: st.updatedAt})
+	}
+}
+
+// emitPendingHttp1Requests replays request/response pairs that completed
+// while their connection was still unregistered (see feedPendingHttp1),
+// now that onConnectionOpen has found the real connection for them.
+// Mirrors the l7.ProtocolHTTP case in onL7Request's switch, but that
+// path's stats/trace are computed once per live event and reused across
+// protocols, whereas this one is only reached rarely (once per recovered
+// connection), so it computes its own rather than restructuring the live
+// path to share them.
+func (c *Container) emitPendingHttp1Requests(conn *ActiveConnection, completed []pendingHttp1CompletedRequest) {
+	if len(completed) == 0 {
+		return
+	}
+	now := time.Now()
+	stats := c.l7Stats.get(l7.ProtocolHTTP, conn.DestinationKey)
+	ebpfTracesDisabled := false
+	for _, p := range c.processes {
+		if p.Flags.EbpfTracesDisabled {
+			ebpfTracesDisabled = true
+			break
+		}
+	}
+	var trace *tracing.Trace
+	if !ebpfTracesDisabled {
+		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+	}
+	for _, cr := range completed {
+		if now.Sub(cr.at) > pendingHttp1RequestMaxAge {
+			continue
+		}
+		c.registry.http1RequestsParsed.Add(1)
+		if !common.HttpFilter.ShouldBeSkipped(cr.req.Path) {
+			stats.observe(cr.req.Status.Http(), "", cr.req.Duration)
+			trace.HttpRequest(cr.req.Method, cr.req.Path, cr.req.Status, cr.req.Duration)
+		}
+	}
 }
 
 func (c *Container) onConnectionClose(e ebpftracer.Event) {

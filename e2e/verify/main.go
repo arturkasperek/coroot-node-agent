@@ -92,13 +92,21 @@ func main() {
 	// is registered at all, and pendingHttp1Parsers is itself keyed by
 	// the full (pid, fd, timestamp) rather than just (pid, fd) so several
 	// concurrently-pending connections on a fast-recycled fd don't
-	// clobber each other's buffered parsing state. Together these
-	// brought measured ratios from ~0.60-0.83 up to ~0.91-1.00 on this
-	// host — close to h2c's ~1.00, though still a bit under it (a single
-	// multiplexed connection never reuses its fd, so it isn't exposed to
-	// this race at all) and still host-noise-sensitive, so the bar stays
-	// a bit under the observed floor rather than at h2c's.
-	minRatioH1 := flag.Float64("min-ratio-h1", 0.85, "minimum fraction of sent requests that must show up as recorded spans, per h1 target (see comment: lower than h2c because of real host-noise-driven capture loss in the HTTP/1 tracer)")
+	// clobber each other's buffered parsing state. A request/response
+	// pair that completes entirely before its connection registers is no
+	// longer discarded either: it's queued (pendingHttp1CompletedRequest)
+	// and emitted retroactively once the connection is found, bounded by
+	// pendingHttp1RequestMaxAge (2s) since Trace.createSpan stamps a
+	// span's absolute time from time.Now() at emission, not a kernel
+	// timestamp — recovering an arbitrarily stale request would mean an
+	// arbitrarily skewed span. Together these brought measured ratios
+	// from ~0.60-0.83 up to a consistent 1.00 on this host, matching
+	// h2c's own ~1.00 (its single multiplexed connection never reuses
+	// its fd, so none of this ever applied to it). Kept a hair under
+	// h2c's bar rather than raising it to the exact same value — both
+	// are still host-noise-sensitive, and 1.00 leaves zero slack for any
+	// one request genuinely lost to real ring-buffer pressure.
+	minRatioH1 := flag.Float64("min-ratio-h1", 0.95, "minimum fraction of sent requests that must show up as recorded spans, per h1 target (see comment: lower than h2c because of real host-noise-driven capture loss in the HTTP/1 tracer)")
 	waitFor := flag.Duration("wait", 20*time.Second, "how long to wait/poll for spans to arrive before giving up")
 	flag.Parse()
 
