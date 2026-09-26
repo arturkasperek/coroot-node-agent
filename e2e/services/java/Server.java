@@ -41,6 +41,10 @@ public class Server {
             }
         });
 
+        server.createContext("/healthz", (HttpExchange ex) -> {
+            ex.sendResponseHeaders(200, -1);
+        });
+
         server.setExecutor(null);
         server.start();
         System.out.println("java-service: http/1.1 on :" + port);

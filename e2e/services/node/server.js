@@ -28,6 +28,11 @@ function route(req, res) {
     res.end('boom');
     return;
   }
+  if (url.startsWith('/healthz')) {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
   res.writeHead(404);
   res.end();
 }

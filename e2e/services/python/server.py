@@ -15,6 +15,11 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path.startswith("/healthz"):
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/users"):
             body = json.dumps([{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]).encode()
             self.send_response(200)

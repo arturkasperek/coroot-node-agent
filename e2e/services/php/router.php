@@ -26,4 +26,9 @@ if (str_starts_with($path, '/error')) {
     return;
 }
 
+if (str_starts_with($path, '/healthz')) {
+    http_response_code(200);
+    return;
+}
+
 http_response_code(404);

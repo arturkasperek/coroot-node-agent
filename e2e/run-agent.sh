@@ -62,7 +62,14 @@ ready=0
 while [ "${SECONDS}" -lt "${deadline}" ]; do
   for spec in "${target_specs[@]}"; do
     base_url="${spec##*|}"
-    curl -s -m 2 -o /dev/null "${base_url}/users" || true
+    # /healthz, not /users: this probe traffic gets captured too, and if a
+    # probe's span lands just after the /api/reset below (the eBPF-ringbuf
+    # -> OTLP export pipeline is async, so the last probe or two can still
+    # be in flight when reset fires), it must not be able to land in one of
+    # verify's counted (method, path, status) buckets and inflate the real
+    # measured ratio — see e2e/verify/main.go's matching, which is coarse
+    # (ip:port + method + path + status, no per-request id).
+    curl -s -m 2 -o /dev/null "${base_url}/healthz" || true
   done
   spans_seen="$(curl -s -m 5 "http://${MOCKBACKEND_ADDR}/api/spans" || true)"
   missing=0
