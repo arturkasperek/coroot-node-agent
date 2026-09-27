@@ -14,6 +14,9 @@ case "$role" in
   node-service)
     exec node /e2e/services/node/server.js "$@"
     ;;
+  node-keepalive-service)
+    exec node /e2e/services/node-keepalive/server.js "$@"
+    ;;
   python-service)
     exec python3 /e2e/services/python/server.py "$@"
     ;;
@@ -28,7 +31,7 @@ case "$role" in
     exec run-agent.sh "$@"
     ;;
   *)
-    echo "unknown role: $role (expected go-service|node-service|python-service|php-service|java-service|agent-orchestrator)" >&2
+    echo "unknown role: $role (expected go-service|node-service|node-keepalive-service|python-service|php-service|java-service|agent-orchestrator)" >&2
     exit 2
     ;;
 esac

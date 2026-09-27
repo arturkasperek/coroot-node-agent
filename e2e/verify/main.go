@@ -173,7 +173,7 @@ func main() {
 			ratio = float64(gotTotal) / float64(wantTotal)
 		}
 		threshold := *minRatio
-		if entry.Proto == "h1" {
+		if entry.Proto == "h1" || entry.Proto == "h1-keepalive" {
 			threshold = *minRatioH1
 		}
 		status := "OK"

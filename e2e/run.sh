@@ -52,6 +52,7 @@ start_service svc-node node-service 8081 8082
 start_service svc-python python-service 8081
 start_service svc-php php-service 8081
 start_service svc-java java-service 8081
+start_service svc-node-ka node-keepalive-service 8081
 
 TARGETS="go-h1|h1|http://svc-go:8081"
 TARGETS="${TARGETS},go-h2c|h2c|http://svc-go:8082"
@@ -60,6 +61,13 @@ TARGETS="${TARGETS},node-h2c|h2c|http://svc-node:8082"
 TARGETS="${TARGETS},python-h1|h1|http://svc-python:8081"
 TARGETS="${TARGETS},php-h1|h1|http://svc-php:8081"
 TARGETS="${TARGETS},java-h1|h1|http://svc-java:8081"
+# Dedicated keep-alive scenario: one persistent HTTP/1.1 connection shared
+# across many requests to several different routes (see
+# e2e/services/node-keepalive), whose response bodies deliberately span a
+# wide size range. loadgen drives this target with a keep-alive-enabled
+# client (proto h1-keepalive) instead of the fresh-connection-per-request
+# client used for every other h1 target — see e2e/loadgen's newClient.
+TARGETS="${TARGETS},node-keepalive|h1-keepalive|http://svc-node-ka:8081"
 
 echo "[run.sh] running agent + load + verify"
 docker rm -f coroot-e2e-agent >/dev/null 2>&1 || true

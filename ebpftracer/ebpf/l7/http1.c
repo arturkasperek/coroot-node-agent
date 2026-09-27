@@ -642,7 +642,19 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
             sv.data_captured = 0;
         } else {
             sv.phase = HTTP1_PHASE_DATA;
-            sv.body_remaining = sc.have_content_length ? sc.content_length : HTTP1_LEN_UNKNOWN;
+            /* No Content-Length and not chunked: for a REQUEST this always
+               means a zero-length body (RFC 7230 3.3.2 — a request without
+               either header has no body, full stop; GET/HEAD/DELETE never
+               carry one). Getting this wrong is not just "one unknown
+               body's bytes are misread" — on a reused (keep-alive)
+               connection it is fatal: HTTP1_LEN_UNKNOWN never reaches 0
+               (see http1_capture_data), so the phase never returns to
+               HEADERS and every later request on the same connection is
+               parsed as more of this "body" forever. A RESPONSE genuinely
+               can be close-delimited instead of framed (rare, legacy), so
+               HTTP1_LEN_UNKNOWN stays correct there — see the file
+               comment and http1_capture_data's own doc comment. */
+            sv.body_remaining = sc.have_content_length ? sc.content_length : (s->is_req ? 0 : HTTP1_LEN_UNKNOWN);
             sv.content_length = 0;
             sv.chunked = 0;
             sv.data_captured = 0;
