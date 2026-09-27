@@ -81,10 +81,21 @@ type Registry struct {
 	// (3) the Http1Parser itself losing sync despite a correctly routed
 	// event (http1EventsSeen - the two dropped counters, vs
 	// http1RequestsParsed).
-	http1EventsSeen           atomic.Uint64
-	http1DroppedNoConnection  atomic.Uint64
-	http1DroppedTsMismatch    atomic.Uint64
-	http1RequestsParsed       atomic.Uint64
+	http1EventsSeen          atomic.Uint64
+	http1DroppedNoConnection atomic.Uint64
+	http1DroppedTsMismatch   atomic.Uint64
+	http1RequestsParsed      atomic.Uint64
+
+	// Same partitioning as the http1* counters above, for HTTP/2 —
+	// h2c connections are normally long-lived (no fd churn), so this race
+	// should be rare there, but it uses the exact same
+	// connectionsByPidFd/connectionsByPidFdTs lookup and the exact same
+	// feedPendingHttp2 buffering as HTTP/1 (see onL7Request), so it's not
+	// immune to it either.
+	http2EventsSeen          atomic.Uint64
+	http2DroppedNoConnection atomic.Uint64
+	http2DroppedTsMismatch   atomic.Uint64
+	http2RequestsParsed      atomic.Uint64
 }
 
 func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, profilingUpdateCh chan *ProfilingUpdate, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample) (*Registry, error) {
@@ -167,6 +178,10 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.Http1DroppedNoConnection
 	ch <- metrics.Http1DroppedTsMismatch
 	ch <- metrics.Http1RequestsParsed
+	ch <- metrics.Http2EventsSeen
+	ch <- metrics.Http2DroppedNoConnection
+	ch <- metrics.Http2DroppedTsMismatch
+	ch <- metrics.Http2RequestsParsed
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
@@ -186,6 +201,10 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	ch <- metrics.Counter(metrics.Http1DroppedNoConnection, float64(r.http1DroppedNoConnection.Load()))
 	ch <- metrics.Counter(metrics.Http1DroppedTsMismatch, float64(r.http1DroppedTsMismatch.Load()))
 	ch <- metrics.Counter(metrics.Http1RequestsParsed, float64(r.http1RequestsParsed.Load()))
+	ch <- metrics.Counter(metrics.Http2EventsSeen, float64(r.http2EventsSeen.Load()))
+	ch <- metrics.Counter(metrics.Http2DroppedNoConnection, float64(r.http2DroppedNoConnection.Load()))
+	ch <- metrics.Counter(metrics.Http2DroppedTsMismatch, float64(r.http2DroppedTsMismatch.Load()))
+	ch <- metrics.Counter(metrics.Http2RequestsParsed, float64(r.http2RequestsParsed.Load()))
 }
 
 func (r *Registry) Close() {

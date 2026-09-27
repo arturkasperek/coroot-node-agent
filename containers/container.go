@@ -1037,6 +1037,13 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		if r.Protocol == l7.ProtocolHTTP2 {
 			c.feedPendingHttp2(pid, fd, timestamp, r)
 		}
+		if r.Protocol == l7.ProtocolHTTP2 {
+			if wasNil {
+				c.registry.http2DroppedNoConnection.Add(1)
+			} else {
+				c.registry.http2DroppedTsMismatch.Add(1)
+			}
+		}
 		if r.Protocol == l7.ProtocolHTTP {
 			if wasNil {
 				c.registry.http1DroppedNoConnection.Add(1)
@@ -1074,11 +1081,13 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			}
 		}
 	case l7.ProtocolHTTP2:
+		c.registry.http2EventsSeen.Add(1)
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()
 		}
 		requests := conn.http2Parser.Parse(r.Method, r.Payload, uint64(r.Duration))
 		for _, req := range requests {
+			c.registry.http2RequestsParsed.Add(1)
 			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
 				status := req.Status.Http()
 				if req.GrpcStatus >= 0 {

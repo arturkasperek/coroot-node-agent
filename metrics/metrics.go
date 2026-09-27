@@ -71,6 +71,11 @@ var (
 	Http1DroppedTsMismatch   = metric("node_l7_http1_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/1 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")
 	Http1RequestsParsed      = metric("node_l7_http1_requests_parsed_total", "Total number of complete HTTP/1 request/response pairs the parser reconstructed from correlated events")
 
+	Http2EventsSeen          = metric("node_l7_http2_events_total", "Total number of outbound HTTP/2 L7 events the kernel delivered to userspace, whether or not they could be correlated to a tracked connection")
+	Http2DroppedNoConnection = metric("node_l7_http2_dropped_no_connection_total", "Total number of outbound HTTP/2 L7 events that arrived before their (pid, fd)'s connection was registered")
+	Http2DroppedTsMismatch   = metric("node_l7_http2_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/2 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")
+	Http2RequestsParsed      = metric("node_l7_http2_requests_parsed_total", "Total number of complete HTTP/2 request/response pairs the parser reconstructed from correlated events")
+
 	PythonThreadLockWaitTime   = metric("container_python_thread_lock_wait_time_seconds", "Time spent waiting acquiring GIL in seconds")
 	NodejsEventLoopBlockedTime = metric("container_nodejs_event_loop_blocked_time_seconds_total", "Total time the Node.js event loop spent blocked")
 
