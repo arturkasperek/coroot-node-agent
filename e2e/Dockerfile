@@ -42,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /out/ /usr/local/bin/
 COPY --from=build /repo/e2e/services /e2e/services
+COPY --from=build /repo/e2e/certs /e2e/certs
 COPY e2e/entrypoint.sh e2e/run-agent.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/run-agent.sh && \
     javac -encoding UTF-8 -d /usr/local/bin/java-classes /e2e/services/java/Server.java

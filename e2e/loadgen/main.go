@@ -26,7 +26,7 @@ import (
 
 type target struct {
 	name    string
-	proto   string // "h1", "h2c", or "h1-keepalive"
+	proto   string // "h1", "h2c", "h1-keepalive", or "h1-tls"
 	baseURL string
 }
 
@@ -69,6 +69,22 @@ func newClient(proto string) *http.Client {
 					var d net.Dialer
 					return d.DialContext(ctx, network, addr)
 				},
+			},
+			Timeout: 10 * time.Second,
+		}
+	}
+	if proto == "h1-tls" {
+		// Fresh TLS connection per request, same reasoning as the plain
+		// h1 client below (never reused — keeps this exercising
+		// TLS-uprobe attach + protocol detection repeatedly rather than
+		// once per test). Self-signed cert (e2e/certs), so skip
+		// verification — this harness only cares whether the eBPF
+		// SSL_write/SSL_read uprobes see the decrypted plaintext, not
+		// about certificate trust.
+		return &http.Client{
+			Transport: &http.Transport{
+				DisableKeepAlives: true,
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 			},
 			Timeout: 10 * time.Second,
 		}
@@ -234,7 +250,7 @@ func driveTarget(t target, n, concurrency int) manifestEntry {
 func main() {
 	n := flag.Int("n", 500, "requests per target")
 	concurrency := flag.Int("concurrency", 20, "concurrent requests per target")
-	targetsSpec := flag.String("targets", "", "comma-separated name|proto|baseurl targets, proto is h1, h2c, or h1-keepalive")
+	targetsSpec := flag.String("targets", "", "comma-separated name|proto|baseurl targets, proto is h1, h2c, h1-keepalive, or h1-tls")
 	manifestPath := flag.String("manifest", "/tmp/manifest.json", "where to write the sent-requests manifest")
 	flag.Parse()
 

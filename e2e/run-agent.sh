@@ -24,12 +24,18 @@ mockbackend -addr "${MOCKBACKEND_ADDR}" &
 MOCKBACKEND_PID=$!
 
 echo "[run-agent] starting coroot-node-agent"
+# --instrumentation-delay=0s: production defaults to 30s (avoid
+# instrumenting short-lived processes) — this whole warmup+load+verify
+# cycle can finish well inside that window, so the h1-tls targets'
+# SSL_write/SSL_read uprobes (see attachTlsUprobes in containers/
+# container.go) would never get attached in time otherwise.
 coroot-node-agent \
   --collector-endpoint="http://${MOCKBACKEND_ADDR}" \
   --disable-gpu-monitoring \
   --disable-log-parsing \
   --scrape-interval=5s \
   --min-container-age=0s \
+  --instrumentation-delay=0s \
   2>&1 | sed 's/^/[agent] /' &
 AGENT_PID=$!
 
@@ -69,7 +75,7 @@ while [ "${SECONDS}" -lt "${deadline}" ]; do
     # verify's counted (method, path, status) buckets and inflate the real
     # measured ratio — see e2e/verify/main.go's matching, which is coarse
     # (ip:port + method + path + status, no per-request id).
-    curl -s -m 2 -o /dev/null "${base_url}/healthz" || true
+    curl -sk -m 2 -o /dev/null "${base_url}/healthz" || true
   done
   spans_seen="$(curl -s -m 5 "http://${MOCKBACKEND_ADDR}/api/spans" || true)"
   missing=0

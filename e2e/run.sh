@@ -48,8 +48,8 @@ start_service() {
 
 echo "[run.sh] starting example services"
 start_service svc-go go-service -addr1 :8081 -addr2 :8082
-start_service svc-node node-service 8081 8082
-start_service svc-python python-service 8081
+start_service svc-node node-service 8081 8082 8443
+start_service svc-python python-service 8081 8443
 start_service svc-php php-service 8081
 start_service svc-java java-service 8081
 start_service svc-node-ka node-keepalive-service 8081
@@ -61,6 +61,12 @@ TARGETS="${TARGETS},node-h2c|h2c|http://svc-node:8082"
 TARGETS="${TARGETS},python-h1|h1|http://svc-python:8081"
 TARGETS="${TARGETS},php-h1|h1|http://svc-php:8081"
 TARGETS="${TARGETS},java-h1|h1|http://svc-java:8081"
+# TLS scenarios: Node embeds its own OpenSSL, Python's ssl module wraps
+# libssl — both exercise ebpftracer/ebpf/l7/openssl.c's SSL_write/SSL_read
+# uprobes (self-signed cert in e2e/certs, loadgen's h1-tls client skips
+# verification — see e2e/loadgen's newClient).
+TARGETS="${TARGETS},node-tls|h1-tls|https://svc-node:8443"
+TARGETS="${TARGETS},python-tls|h1-tls|https://svc-python:8443"
 # Dedicated keep-alive scenario: one persistent HTTP/1.1 connection shared
 # across many requests to several different routes (see
 # e2e/services/node-keepalive), whose response bodies deliberately span a
