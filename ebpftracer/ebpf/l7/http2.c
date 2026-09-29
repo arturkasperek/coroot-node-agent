@@ -781,6 +781,36 @@ int http2_owner_mismatch(__u64 owner) {
     return owner != bpf_get_current_pid_tgid();
 }
 
+/* Diagnostic counter for http1_walk_impl's http2_owner_mismatch() bail
+   (see there): http1_tail_state is a single max_entries=1 percpu scratch
+   slot shared by every task scheduled on that CPU. A mismatch means some
+   other, unrelated trigger (a different task's syscall or uprobe hit
+   landing on this same CPU) claimed the slot before this chain's own
+   continuation ran, silently abandoning whatever this chain was in the
+   middle of — see e2e's node-tls/python-tls capture-ratio investigation.
+   Only this one call site is instrumented (not http2.c's four other
+   http2_owner_mismatch() sites): http1_walk_impl has just two inline
+   expansion points (http1_walk, http1_walk_kp), while http2_iov_adopt and
+   friends are __always_inline and reached from every read/write hook —
+   instrumenting those blew the 1M-instruction verifier budget even with
+   noinline counter functions (the call-site overhead itself duplicates at
+   every expansion point; only the callee body is shared). */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} l7_race_http1_walk SEC(".maps");
+
+static __attribute__((noinline))
+void l7_race_inc_http1_walk(void) {
+    __u32 zero = 0;
+    __u64 *n = bpf_map_lookup_elem(&l7_race_http1_walk, &zero);
+    if (n) {
+        __sync_fetch_and_add(n, 1);
+    }
+}
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -1350,7 +1380,10 @@ int http2_iov_impl(void *ctx) {
     (void)ctx;
 
     s = bpf_map_lookup_elem(&http2_tail_state, &zero);
-    if (!s || http2_owner_mismatch(s->owner) || !s->size) {
+    if (!s) {
+        return 0;
+    }
+    if (http2_owner_mismatch(s->owner) || !s->size) {
         return 0;
     }
     cid = s->cid;

@@ -76,6 +76,14 @@ var (
 	Http2DroppedTsMismatch   = metric("node_l7_http2_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/2 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")
 	Http2RequestsParsed      = metric("node_l7_http2_requests_parsed_total", "Total number of complete HTTP/2 request/response pairs the parser reconstructed from correlated events")
 
+	// See ebpftracer.Tracer.L7RaceHttp1Walk for why only this one
+	// http2_owner_mismatch() call site is instrumented (verifier budget).
+	L7RaceHttp1Walk = metric("node_l7_race_http1_walk_total", "Total number of times http1_walk_impl found its percpu scratch slot (http1_tail_state) claimed by an unrelated task on the same CPU and abandoned its chain")
+
+	// See ebpftracer.Tracer.L7SslReadNoSyscall.
+	L7SslReadNoSyscall        = metric("node_l7_ssl_read_no_syscall_total", "Total number of times OpenSSL's SSL_read() returned buffered plaintext without its own inner read syscall, forcing an fd guess from the last-seen fd on that thread")
+	L7SslReadNoSyscallMissing = metric("node_l7_ssl_read_no_syscall_missing_total", "Total number of times that fd guess found nothing and the read was dropped")
+
 	PythonThreadLockWaitTime   = metric("container_python_thread_lock_wait_time_seconds", "Time spent waiting acquiring GIL in seconds")
 	NodejsEventLoopBlockedTime = metric("container_nodejs_event_loop_blocked_time_seconds_total", "Total time the Node.js event loop spent blocked")
 

@@ -182,6 +182,9 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.Http2DroppedNoConnection
 	ch <- metrics.Http2DroppedTsMismatch
 	ch <- metrics.Http2RequestsParsed
+	ch <- metrics.L7RaceHttp1Walk
+	ch <- metrics.L7SslReadNoSyscall
+	ch <- metrics.L7SslReadNoSyscallMissing
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
@@ -205,6 +208,11 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	ch <- metrics.Counter(metrics.Http2DroppedNoConnection, float64(r.http2DroppedNoConnection.Load()))
 	ch <- metrics.Counter(metrics.Http2DroppedTsMismatch, float64(r.http2DroppedTsMismatch.Load()))
 	ch <- metrics.Counter(metrics.Http2RequestsParsed, float64(r.http2RequestsParsed.Load()))
+	if r.tracer != nil {
+		ch <- metrics.Counter(metrics.L7RaceHttp1Walk, float64(r.tracer.L7RaceHttp1Walk()))
+		ch <- metrics.Counter(metrics.L7SslReadNoSyscall, float64(r.tracer.L7SslReadNoSyscall()))
+		ch <- metrics.Counter(metrics.L7SslReadNoSyscallMissing, float64(r.tracer.L7SslReadNoSyscallMissing()))
+	}
 }
 
 func (r *Registry) Close() {

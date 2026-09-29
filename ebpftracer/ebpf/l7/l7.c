@@ -1022,9 +1022,31 @@ int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     return trace_enter_plain_pack(ctx, ctx->fd, 1, ctx->buf, ctx->size, 0);
 }
 
+/* ssl_last_fd used to be populated only from inside ssl_check_read_enter's
+   own match (i.e. only when an SSL_read_enter uprobe had already primed
+   ssl_pending before this exact syscall fired) — which only ever happens
+   for a TLS stack that calls read()/recvfrom() synchronously *from inside*
+   SSL_read() itself. Runtimes with an async, memory-BIO-based TLS stack
+   (Node.js's TLSWrap: libuv reads ciphertext off the socket into a BIO on
+   its own schedule, and SSL_read() merely decrypts already-buffered bytes,
+   never touching the socket itself) never hit that match, so
+   openssl.c's SSL_read_exit fallback always found ssl_last_fd empty —
+   100% of the time in testing (node_l7_ssl_read_no_syscall_total ==
+   node_l7_ssl_read_no_syscall_missing_total). Recording every thread's most
+   recently seen read fd here, unconditionally, means that by the time such
+   a decoupled SSL_read() call happens, ssl_last_fd already holds the fd of
+   whatever this thread most recently read from the network — which, for
+   the common case of one pending decrypt following its own feeding read,
+   is the right connection. */
+static __always_inline
+void l7_track_last_read_fd(__u64 tid, __u64 fd) {
+    bpf_map_update_elem(&ssl_last_fd, &tid, &fd, BPF_ANY);
+}
+
 SEC("tracepoint/syscalls/sys_enter_read")
 int sys_enter_read(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
+    l7_track_last_read_fd(id, ctx->fd);
     if (ssl_check_read_enter(id, ctx->fd) >= 0) {
         return 0;
     }
@@ -1035,6 +1057,7 @@ int sys_enter_read(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_readv")
 int sys_enter_readv(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
+    l7_track_last_read_fd(id, ctx->fd);
     if (ssl_check_read_enter(id, ctx->fd) >= 0) {
         return 0;
     }
@@ -1045,6 +1068,7 @@ int sys_enter_readv(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_recvmsg")
 int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
+    l7_track_last_read_fd(id, ctx->fd);
     if (ssl_check_read_enter(id, ctx->fd) >= 0) {
         return 0;
     }
@@ -1059,6 +1083,7 @@ int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_recvfrom")
 int sys_enter_recvfrom(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 id = bpf_get_current_pid_tgid();
+    l7_track_last_read_fd(id, ctx->fd);
     if (ssl_check_read_enter(id, ctx->fd) >= 0) {
         return 0;
     }

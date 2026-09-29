@@ -553,7 +553,11 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
     __u8 method;
 
     s = bpf_map_lookup_elem(&http1_tail_state, &zero);
-    if (!s || http2_owner_mismatch(s->owner)) {
+    if (!s) {
+        return 0;
+    }
+    if (http2_owner_mismatch(s->owner)) {
+        l7_race_inc_http1_walk();
         return 0;
     }
     key.conn_ts = s->conn_ts;

@@ -30,6 +30,7 @@ echo "[run-agent] starting coroot-node-agent"
 # SSL_write/SSL_read uprobes (see attachTlsUprobes in containers/
 # container.go) would never get attached in time otherwise.
 coroot-node-agent \
+  --listen=0.0.0.0:10300 \
   --collector-endpoint="http://${MOCKBACKEND_ADDR}" \
   --disable-gpu-monitoring \
   --disable-log-parsing \
@@ -53,7 +54,8 @@ declare -A target_ipports=()
 IFS=',' read -ra target_specs <<< "${TARGETS}"
 for spec in "${target_specs[@]}"; do
   base_url="${spec##*|}"
-  hostport="${base_url#http://}"
+  hostport="${base_url#https://}"
+  hostport="${hostport#http://}"
   host="${hostport%%:*}"
   port="${hostport##*:}"
   ip="$(getent hosts "${host}" | awk '{print $1}' | head -1)"
@@ -98,6 +100,9 @@ else
 fi
 curl -s -m 5 -X POST "http://${MOCKBACKEND_ADDR}/api/reset" -o /dev/null || true
 
+echo "[run-agent] l7 race diagnostic (before load):"
+curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_l7_race_http1_walk_total\|node_ebpf_lost_samples_total\|node_l7_http1_events_total\|node_l7_http1_dropped_\|node_l7_http1_requests_parsed_total\|node_l7_ssl_read_no_syscall" | grep -v '^#' || true
+
 echo "[run-agent] generating load: ${N_REQUESTS} requests/target, targets=${TARGETS}"
 if ! loadgen -n "${N_REQUESTS}" -concurrency "${CONCURRENCY}" -targets "${TARGETS}" -manifest "${MANIFEST}"; then
   echo "[run-agent] loadgen failed" >&2
@@ -106,6 +111,9 @@ fi
 
 echo "[run-agent] waiting ${FLUSH_SECONDS}s for the OTLP batch exporter to flush"
 sleep "${FLUSH_SECONDS}"
+
+echo "[run-agent] l7 race diagnostic (after load):"
+curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_l7_race_http1_walk_total\|node_ebpf_lost_samples_total\|node_l7_http1_events_total\|node_l7_http1_dropped_\|node_l7_http1_requests_parsed_total\|node_l7_ssl_read_no_syscall" | grep -v '^#' || true
 
 echo "[run-agent] verifying"
 verify -backend "http://${MOCKBACKEND_ADDR}" -manifest "${MANIFEST}" -wait 20s

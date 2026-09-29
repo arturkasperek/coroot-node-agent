@@ -274,8 +274,62 @@ func (t *Tracer) TruncatedPayloads() uint64 {
 	return t.truncatedPayloads.Load()
 }
 
+// L7RaceHttp1Walk reads the l7_race_http1_walk diagnostic percpu counter
+// (see ebpftracer/ebpf/l7/http2.c's l7_race_inc_http1_walk / http1.c's
+// http1_walk_impl): counts how often http1_tail_state — a shared per-CPU
+// scratch slot (BPF_MAP_TYPE_PERCPU_ARRAY, max_entries=1) — was found
+// already claimed by an unrelated task's syscall or uprobe hit landing on
+// the same CPU, silently abandoning whatever this chain was in the middle
+// of. Only this one http2_owner_mismatch() call site is instrumented; see
+// the comment above l7_race_http1_walk's map declaration for why the
+// other four aren't (verifier budget).
+func (t *Tracer) L7RaceHttp1Walk() uint64 {
+	return t.ringbufDrops("l7_race_http1_walk")
+}
+
 func (t *Tracer) GoTlsAttachFailures() uint64 {
 	return t.goTlsAttachFailures.Load()
+}
+
+// percpuCounter reads one element of a BPF_MAP_TYPE_PERCPU_ARRAY, summing
+// across CPUs. Like ringbufDrops but for maps with more than one element.
+func (t *Tracer) percpuCounter(mapName string, key uint32) uint64 {
+	if t.collection == nil {
+		return 0
+	}
+	m := t.collection.Maps[mapName]
+	if m == nil {
+		return 0
+	}
+	var values []uint64
+	if err := m.Lookup(key, &values); err != nil {
+		return 0
+	}
+	var n uint64
+	for _, v := range values {
+		n += v
+	}
+	return n
+}
+
+// L7SslReadNoSyscall reads the l7_ssl_read_no_syscall[0] diagnostic percpu
+// counter (see ebpftracer/ebpf/l7/openssl.c's SSL_read_exit): counts how
+// often OpenSSL's SSL_read() returned already-buffered plaintext without
+// its own inner read()/recvfrom() syscall, forcing the tracer to guess
+// which fd the data belongs to from ssl_last_fd (the last fd *any*
+// SSL_read on this thread actually saw a syscall for) — a guess that's
+// wrong whenever a single-threaded event-loop server interleaves reads
+// from multiple TLS connections on the same OS thread. See e2e's h1-tls
+// capture-ratio investigation.
+func (t *Tracer) L7SslReadNoSyscall() uint64 {
+	return t.percpuCounter("l7_ssl_read_no_syscall", 0)
+}
+
+// L7SslReadNoSyscallMissing reads l7_ssl_read_no_syscall[1]: the subset of
+// L7SslReadNoSyscall's cases where even the ssl_last_fd fallback found
+// nothing, so the read was dropped outright.
+func (t *Tracer) L7SslReadNoSyscallMissing() uint64 {
+	return t.percpuCounter("l7_ssl_read_no_syscall", 1)
 }
 
 func parseL7Event(raw []byte) (*Event, bool, error) {
