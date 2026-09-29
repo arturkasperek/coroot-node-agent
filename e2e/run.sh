@@ -21,17 +21,27 @@ containers=()
 cleanup() {
   if [ "${KEEP}" = "1" ]; then
     echo "[run.sh] KEEP=1: leaving containers/network up for inspection:"
-    printf '  %s\n' "${containers[@]}"
+    printf '  %s\n' ${containers[@]+"${containers[@]}"}
     echo "  network: ${NET}"
     return
   fi
   echo "[run.sh] cleaning up"
-  for c in "${containers[@]}"; do
+  for c in ${containers[@]+"${containers[@]}"}; do
     docker rm -f "$c" >/dev/null 2>&1 || true
   done
   docker network rm "${NET}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+# Two runs can't share a host: the container names below are global to the
+# docker daemon, and a second run's `docker rm -f` would tear the first
+# one's services out from under it mid-measurement. Fail fast and say so,
+# rather than producing a wrong number that reads like a capture failure.
+if docker ps --format '{{.Names}}' | grep -qx coroot-e2e-agent; then
+  echo "[run.sh] another e2e run is in progress (container coroot-e2e-agent is running)." >&2
+  echo "[run.sh] wait for it to finish, or: docker rm -f coroot-e2e-agent" >&2
+  exit 1
+fi
 
 echo "[run.sh] building ${IMAGE}"
 docker build -f e2e/Dockerfile -t "${IMAGE}" . || exit 1

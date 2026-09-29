@@ -557,7 +557,6 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         return 0;
     }
     if (http2_owner_mismatch(s->owner)) {
-        l7_race_inc_http1_walk();
         return 0;
     }
     key.conn_ts = s->conn_ts;

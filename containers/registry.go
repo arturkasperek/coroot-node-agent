@@ -29,6 +29,26 @@ import (
 const (
 	MinTrafficStatsUpdateInterval = 5 * time.Second
 	IgnoredContainersCacheTTL     = 15 * time.Second
+
+	// Above this many events queued, handleEvents stops doing TLS-uprobe
+	// attachment inline and defers it to pendingTlsAttach instead. Attaching
+	// means parsing a process's ELF (openssl, Go crypto/tls, rustls) and
+	// probing for a JVM — hundreds of microseconds to milliseconds of file
+	// I/O, once per *new* process that opens a connection. handleEvents is a
+	// single goroutine, so on a host that churns through processes (CI, ssh
+	// sessions, short-lived tooling) that cost lands directly on L7 event
+	// throughput. Measured before this: a run that entered its load window
+	// 7599 events deep in backlog processed exactly zero events during the
+	// whole window and recorded 0.00 on all ten targets, with the kernel
+	// ring buffers clean (node_ebpf_lost_samples_total = 0) — nothing was
+	// lost, the consumer simply never caught up. Deferring costs nothing in
+	// practice: the attach is per-executable and retried on a ticker, so it
+	// still lands, just not at the expense of the events already waiting.
+	eventQueueBusyThreshold = 500
+
+	// Cap on how many deferred attaches one ticker tick will do, so
+	// draining a large backlog of them cannot itself stall the loop.
+	maxTlsAttachPerTick = 20
 )
 
 var (
@@ -85,6 +105,16 @@ type Registry struct {
 	http1DroppedNoConnection atomic.Uint64
 	http1DroppedTsMismatch   atomic.Uint64
 	http1RequestsParsed      atomic.Uint64
+	// L7 events dropped because their pid's container could not be
+	// resolved even after trying to register it (process already gone, or a
+	// cgroup that is deliberately ignored). See the EventTypeL7Request case.
+	l7DroppedUnknownContainer atomic.Uint64
+	// Cumulative nanoseconds handleEvents spent inside attachTlsUprobes
+	// (ELF parsing, symbol resolution, uprobe syscalls), inline on the single
+	// event-dispatch goroutine. Read next to node_l7_event_queue_depth: if the
+	// queue is deep and this is growing, attach work is what is starving
+	// event processing.
+	tlsAttachNanos atomic.Uint64
 
 	// Same partitioning as the http1* counters above, for HTTP/2 —
 	// h2c connections are normally long-lived (no fd churn), so this race
@@ -178,13 +208,13 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.Http1DroppedNoConnection
 	ch <- metrics.Http1DroppedTsMismatch
 	ch <- metrics.Http1RequestsParsed
+	ch <- metrics.L7DroppedUnknownContainer
+	ch <- metrics.L7EventQueueDepth
+	ch <- metrics.L7TlsAttachSeconds
 	ch <- metrics.Http2EventsSeen
 	ch <- metrics.Http2DroppedNoConnection
 	ch <- metrics.Http2DroppedTsMismatch
 	ch <- metrics.Http2RequestsParsed
-	ch <- metrics.L7RaceHttp1Walk
-	ch <- metrics.L7SslReadNoSyscall
-	ch <- metrics.L7SslReadNoSyscallMissing
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
@@ -204,15 +234,13 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	ch <- metrics.Counter(metrics.Http1DroppedNoConnection, float64(r.http1DroppedNoConnection.Load()))
 	ch <- metrics.Counter(metrics.Http1DroppedTsMismatch, float64(r.http1DroppedTsMismatch.Load()))
 	ch <- metrics.Counter(metrics.Http1RequestsParsed, float64(r.http1RequestsParsed.Load()))
+	ch <- metrics.Counter(metrics.L7DroppedUnknownContainer, float64(r.l7DroppedUnknownContainer.Load()))
+	ch <- metrics.Gauge(metrics.L7EventQueueDepth, float64(len(r.events)))
+	ch <- metrics.Counter(metrics.L7TlsAttachSeconds, float64(r.tlsAttachNanos.Load())/1e9)
 	ch <- metrics.Counter(metrics.Http2EventsSeen, float64(r.http2EventsSeen.Load()))
 	ch <- metrics.Counter(metrics.Http2DroppedNoConnection, float64(r.http2DroppedNoConnection.Load()))
 	ch <- metrics.Counter(metrics.Http2DroppedTsMismatch, float64(r.http2DroppedTsMismatch.Load()))
 	ch <- metrics.Counter(metrics.Http2RequestsParsed, float64(r.http2RequestsParsed.Load()))
-	if r.tracer != nil {
-		ch <- metrics.Counter(metrics.L7RaceHttp1Walk, float64(r.tracer.L7RaceHttp1Walk()))
-		ch <- metrics.Counter(metrics.L7SslReadNoSyscall, float64(r.tracer.L7SslReadNoSyscall()))
-		ch <- metrics.Counter(metrics.L7SslReadNoSyscallMissing, float64(r.tracer.L7SslReadNoSyscallMissing()))
-	}
 }
 
 func (r *Registry) Close() {
@@ -228,7 +256,15 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	for {
 		select {
 		case <-tlsAttachTicker.C:
+			if len(r.events) > eventQueueBusyThreshold {
+				break // events first; these are retried every tick anyway
+			}
+			done := 0
 			for pid, c := range r.pendingTlsAttach {
+				if done >= maxTlsAttachPerTick {
+					break
+				}
+				done++
 				if c.attachTlsUprobes(r.tracer, pid, true) {
 					delete(r.pendingTlsAttach, pid)
 				}
@@ -370,8 +406,17 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			case ebpftracer.EventTypeConnectionOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
-					if !c.attachTlsUprobes(r.tracer, e.Pid, true) {
+					if len(r.events) > eventQueueBusyThreshold {
+						// Behind on events — defer rather than pay the
+						// attach cost inline. See eventQueueBusyThreshold.
 						r.pendingTlsAttach[e.Pid] = c
+					} else {
+						tlsAttachStart := time.Now()
+						attached := c.attachTlsUprobes(r.tracer, e.Pid, true)
+						r.tlsAttachNanos.Add(uint64(time.Since(tlsAttachStart)))
+						if !attached {
+							r.pendingTlsAttach[e.Pid] = c
+						}
 					}
 				}
 			case ebpftracer.EventTypeConnectionError:
@@ -392,7 +437,21 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if e.L7Request == nil {
 					continue
 				}
-				if c := r.containersByPid[e.Pid]; c != nil {
+				// getOrCreateContainer, not a bare containersByPid lookup.
+				// tcp-connect-events and l7-events are read by independent
+				// goroutines with no ordering guarantee (see
+				// runTcpConnectEventsReader/runL7EventsReader), so an L7 event
+				// routinely arrives before the ConnectionOpen that would have
+				// registered its pid — every other event type here already
+				// registers on the spot, and dropping these silently lost
+				// whichever slice of traffic preceded the registration.
+				c := r.containersByPid[e.Pid]
+				if c == nil {
+					if c = r.getOrCreateContainer(e.Pid); c == nil {
+						r.l7DroppedUnknownContainer.Add(1)
+					}
+				}
+				if c != nil {
 					ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request)
 					r.ip2fqdnLock.Lock()
 					for ip, domain := range ip2fqdn {
@@ -419,7 +478,15 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	cg, err := proc.ReadCgroup(pid)
 	if err != nil {
-		if !common.IsNotExist(err) {
+		if common.IsNotExist(err) {
+			// The process is already gone. Cache that like every other
+			// negative result below: handleEvents is a single goroutine, and
+			// without this every further event of a dead pid repeats a failing
+			// open of /proc/<pid>/cgroup, starving the real events queued
+			// behind them on hosts with process churn.
+			t := time.Now()
+			r.containersByPidIgnored[pid] = &t
+		} else {
 			klog.Warningln("failed to read proc cgroup:", err)
 		}
 		return nil

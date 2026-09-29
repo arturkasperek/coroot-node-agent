@@ -1023,21 +1023,19 @@ int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 }
 
 /* ssl_last_fd used to be populated only from inside ssl_check_read_enter's
-   own match (i.e. only when an SSL_read_enter uprobe had already primed
-   ssl_pending before this exact syscall fired) — which only ever happens
-   for a TLS stack that calls read()/recvfrom() synchronously *from inside*
+   own match, i.e. only when an SSL_read_enter uprobe had already primed
+   ssl_pending before this exact syscall fired. That only ever happens for a
+   TLS stack that calls read()/recvfrom() synchronously from inside
    SSL_read() itself. Runtimes with an async, memory-BIO-based TLS stack
    (Node.js's TLSWrap: libuv reads ciphertext off the socket into a BIO on
    its own schedule, and SSL_read() merely decrypts already-buffered bytes,
-   never touching the socket itself) never hit that match, so
-   openssl.c's SSL_read_exit fallback always found ssl_last_fd empty —
-   100% of the time in testing (node_l7_ssl_read_no_syscall_total ==
-   node_l7_ssl_read_no_syscall_missing_total). Recording every thread's most
-   recently seen read fd here, unconditionally, means that by the time such
-   a decoupled SSL_read() call happens, ssl_last_fd already holds the fd of
-   whatever this thread most recently read from the network — which, for
-   the common case of one pending decrypt following its own feeding read,
-   is the right connection. */
+   never touching the socket) never hit that match, so openssl.c's
+   SSL_read_exit fallback found ssl_last_fd empty every single time and
+   dropped the read. Recording every thread's most recently seen read fd
+   here, unconditionally, means that by the time such a decoupled SSL_read()
+   runs, ssl_last_fd already holds the fd of whatever this thread last read
+   from the network — which, for the common case of one pending decrypt
+   following its own feeding read, is the right connection. */
 static __always_inline
 void l7_track_last_read_fd(__u64 tid, __u64 fd) {
     bpf_map_update_elem(&ssl_last_fd, &tid, &fd, BPF_ANY);

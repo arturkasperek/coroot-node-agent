@@ -252,6 +252,16 @@ func main() {
 	concurrency := flag.Int("concurrency", 20, "concurrent requests per target")
 	targetsSpec := flag.String("targets", "", "comma-separated name|proto|baseurl targets, proto is h1, h2c, h1-keepalive, or h1-tls")
 	manifestPath := flag.String("manifest", "/tmp/manifest.json", "where to write the sent-requests manifest")
+	// Keep the process alive after the requests are done. Used by
+	// run-agent.sh's TLS-uprobe priming: coroot-node-agent attaches Go TLS
+	// uprobes per *executable*, but only once it has seen a live process
+	// running it (via that process's EventTypeConnectionOpen, see
+	// containers/registry.go). A priming run that exits in milliseconds is
+	// already gone by the time the agent's event loop reaches its
+	// connect event, so /proc/<pid> is unreadable, no container resolves,
+	// and no uprobe is ever attached — the attach then lands mid-way
+	// through the real measured load instead, losing whatever ran first.
+	hold := flag.Duration("hold", 0, "stay alive this long after finishing (keeps the process visible to an eBPF agent)")
 	flag.Parse()
 
 	targets, err := parseTargets(*targetsSpec)
@@ -285,4 +295,7 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("manifest written to %s", *manifestPath)
+	if *hold > 0 {
+		time.Sleep(*hold)
+	}
 }

@@ -71,18 +71,23 @@ var (
 	Http1DroppedTsMismatch   = metric("node_l7_http1_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/1 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")
 	Http1RequestsParsed      = metric("node_l7_http1_requests_parsed_total", "Total number of complete HTTP/1 request/response pairs the parser reconstructed from correlated events")
 
+	// Depth of the registry's event channel at scrape time. handleEvents is
+	// a single goroutine, so a non-trivial reading here means it is behind
+	// and events are being delayed (not dropped — the ring buffers stay
+	// clean, node_ebpf_lost_samples_total stays 0) past the point where
+	// anything downstream still correlates them.
+	L7EventQueueDepth = metric("node_l7_event_queue_depth", "Number of eBPF events waiting to be processed by the registry's single event-dispatch goroutine")
+
+	// See containers.Registry's tlsAttachNanos.
+	L7TlsAttachSeconds = metric("node_l7_tls_attach_seconds_total", "Cumulative time the registry's event-dispatch goroutine spent attaching TLS uprobes (ELF parsing, symbol resolution, uprobe syscalls) instead of processing events")
+
+	// See containers.Registry's l7DroppedUnknownContainer.
+	L7DroppedUnknownContainer = metric("node_l7_dropped_unknown_container_total", "Total number of L7 events that arrived for a PID whose container was not registered yet (now registered on the spot instead of being dropped)")
+
 	Http2EventsSeen          = metric("node_l7_http2_events_total", "Total number of outbound HTTP/2 L7 events the kernel delivered to userspace, whether or not they could be correlated to a tracked connection")
 	Http2DroppedNoConnection = metric("node_l7_http2_dropped_no_connection_total", "Total number of outbound HTTP/2 L7 events that arrived before their (pid, fd)'s connection was registered")
 	Http2DroppedTsMismatch   = metric("node_l7_http2_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/2 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")
 	Http2RequestsParsed      = metric("node_l7_http2_requests_parsed_total", "Total number of complete HTTP/2 request/response pairs the parser reconstructed from correlated events")
-
-	// See ebpftracer.Tracer.L7RaceHttp1Walk for why only this one
-	// http2_owner_mismatch() call site is instrumented (verifier budget).
-	L7RaceHttp1Walk = metric("node_l7_race_http1_walk_total", "Total number of times http1_walk_impl found its percpu scratch slot (http1_tail_state) claimed by an unrelated task on the same CPU and abandoned its chain")
-
-	// See ebpftracer.Tracer.L7SslReadNoSyscall.
-	L7SslReadNoSyscall        = metric("node_l7_ssl_read_no_syscall_total", "Total number of times OpenSSL's SSL_read() returned buffered plaintext without its own inner read syscall, forcing an fd guess from the last-seen fd on that thread")
-	L7SslReadNoSyscallMissing = metric("node_l7_ssl_read_no_syscall_missing_total", "Total number of times that fd guess found nothing and the read was dropped")
 
 	PythonThreadLockWaitTime   = metric("container_python_thread_lock_wait_time_seconds", "Time spent waiting acquiring GIL in seconds")
 	NodejsEventLoopBlockedTime = metric("container_nodejs_event_loop_blocked_time_seconds_total", "Total time the Node.js event loop spent blocked")

@@ -74,59 +74,14 @@ func hostPort(baseURL string) (string, error) {
 func main() {
 	backend := flag.String("backend", "http://127.0.0.1:4318", "mock backend base URL")
 	manifestPath := flag.String("manifest", "/tmp/manifest.json", "manifest written by loadgen")
-	minRatio := flag.Float64("min-ratio", 0.95, "minimum fraction of sent requests that must show up as recorded spans, per h2c target")
-	// coroot-node-agent's HTTP/1 tracer correlates L7 payload events to a
-	// tracked connection by (pid, fd, timestamp). On a genuinely busy host
-	// (this suite has been run against a live k8s cluster sharing the
-	// box), (pid, fd) gets reused across connections faster than the two
-	// independent ring-buffer readers (tcp-connect-events and l7-events —
-	// see runTcpConnectEventsReader/runL7EventsReader in
-	// ebpftracer/tracer.go) are guaranteed to stay in order, so a late
-	// event for an older connection can arrive after a newer one has
-	// already reused its fd. containers/container.go's onL7Request and
-	// onConnectionOpen now keep a secondary index (connectionsByPidFdTs)
-	// so a late event can still find its exact, superseded connection
-	// instead of being compared against — and rejected by — the new one,
-	// plus a pendingHttp1Parsers buffer (mirroring HTTP2's
-	// pendingHttp2Parsers) for events that arrive before their connection
-	// is registered at all, and pendingHttp1Parsers is itself keyed by
-	// the full (pid, fd, timestamp) rather than just (pid, fd) so several
-	// concurrently-pending connections on a fast-recycled fd don't
-	// clobber each other's buffered parsing state. A request/response
-	// pair that completes entirely before its connection registers is no
-	// longer discarded either: it's queued (pendingHttp1CompletedRequest)
-	// and emitted retroactively once the connection is found, bounded by
-	// pendingHttp1RequestMaxAge (2s) since Trace.createSpan stamps a
-	// span's absolute time from time.Now() at emission, not a kernel
-	// timestamp — recovering an arbitrarily stale request would mean an
-	// arbitrarily skewed span. Together these brought measured ratios
-	// from ~0.60-0.83 up to a consistent 1.00 on this host, matching
-	// h2c's own ~1.00 (its single multiplexed connection never reuses
-	// its fd, so none of this ever applied to it). Kept a hair under
-	// h2c's bar rather than raising it to the exact same value — both
-	// are still host-noise-sensitive, and 1.00 leaves zero slack for any
-	// one request genuinely lost to real ring-buffer pressure.
-	minRatioH1 := flag.Float64("min-ratio-h1", 0.95, "minimum fraction of sent requests that must show up as recorded spans, per h1 target (see comment: lower than h2c because of real host-noise-driven capture loss in the HTTP/1 tracer)")
-	// h1-tls sits measurably lower and, unlike plain h1/h1-keepalive
-	// (which reliably reach ~1.00 with the fixes above), noticeably
-	// noisier: repeated runs on this host ranged ~0.71-1.00. Investigated
-	// two concrete hypotheses and ruled both out with hard evidence: (1)
-	// the shared percpu tail-call scratch (http1_tail_state) getting
-	// clobbered by an unrelated task on the same CPU — instrumented with
-	// node_l7_race_http1_walk_total (see ebpftracer/ebpf/l7/http1.c),
-	// which stayed at 0 across every run, pass or fail; (2) pending
-	// request/response pairs timing out of the 2s buffer window before
-	// their connection registered — widening it to 5s across 5 runs
-	// produced ~0.71-0.99, no better (arguably noisier) than 2s's
-	// ~0.80-1.00, so reverted. Leading unconfirmed theory: a TLS
-	// handshake is several more raw read/write syscalls than plain
-	// HTTP's ~2, each one an independent chance to hit the same
-	// still-not-fully-eliminated connection-registration race the h1
-	// fixes mitigate but don't remove — more syscalls per logical
-	// request compounds a small per-syscall miss rate. Given the
-	// measured floor, the bar sits with real margin below it rather than
-	// pretending this is as solid as plain h1.
-	minRatioH1TLS := flag.Float64("min-ratio-h1-tls", 0.6, "minimum fraction of sent requests that must show up as recorded spans, per h1-tls target (see comment: measurably noisier than plain h1, unresolved despite investigation)")
+	// Every request sent must show up as a recorded span: 1.0, for every
+	// protocol. Measured on a quiet host and under k3s load alike, a healthy
+	// agent records all of them — so anything below is a real capture problem,
+	// not noise. The per-route breakdown printed for any shortfall says where
+	// it is, and node_l7_event_queue_depth, node_l7_tls_attach_seconds_total
+	// and node_l7_dropped_unknown_container_total (dumped by run-agent.sh) say
+	// whether the agent's event loop was starved.
+	minRatio := flag.Float64("min-ratio", 1.0, "minimum fraction of sent requests that must show up as recorded spans, for every target")
 	waitFor := flag.Duration("wait", 20*time.Second, "how long to wait/poll for spans to arrive before giving up")
 	flag.Parse()
 
@@ -186,19 +141,20 @@ func main() {
 		for _, oc := range entry.Outcomes {
 			key := oc.Method + "|" + oc.Path + "|" + strconv.Itoa(oc.Status)
 			wantTotal += oc.Count
-			gotTotal += matched[key]
+			// Capped at what was sent: with a bar of exactly 1.0, extra
+			// spans in one (method, path, status) bucket must not be able
+			// to make up for missing ones in another.
+			got := matched[key]
+			if got > oc.Count {
+				got = oc.Count
+			}
+			gotTotal += got
 		}
 		ratio := 0.0
 		if wantTotal > 0 {
 			ratio = float64(gotTotal) / float64(wantTotal)
 		}
 		threshold := *minRatio
-		switch entry.Proto {
-		case "h1", "h1-keepalive":
-			threshold = *minRatioH1
-		case "h1-tls":
-			threshold = *minRatioH1TLS
-		}
 		status := "OK"
 		if wantTotal == 0 || ratio < threshold {
 			status = "FAIL"
@@ -206,7 +162,11 @@ func main() {
 		}
 		fmt.Printf("%-6s target=%-14s proto=%-4s sent=%-5d recorded=%-5d ratio=%.2f\n",
 			status, entry.Target, entry.Proto, wantTotal, gotTotal, ratio)
-		if status == "FAIL" {
+		// Print the per-route breakdown for any shortfall: which routes lose
+		// requests is the single most diagnostic fact about a partial
+		// capture (loss concentrated on the one route with a request body
+		// points somewhere completely different than loss spread evenly).
+		if status == "FAIL" || gotTotal < wantTotal {
 			for _, oc := range entry.Outcomes {
 				key := oc.Method + "|" + oc.Path + "|" + strconv.Itoa(oc.Status)
 				fmt.Printf("         %-6s %-6s -> %d sent, %d recorded\n", oc.Method, oc.Path, oc.Count, matched[key])
