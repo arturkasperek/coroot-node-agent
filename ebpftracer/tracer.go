@@ -302,6 +302,9 @@ func (t *Tracer) UserMemoryReads() (failed map[string]uint64, rescued uint64) {
 	failed["tls_buf_zero_at_exit"] = sum(4)
 	failed["tls_buf_zero_recovered"] = sum(5)
 	failed["tls_buf_zero_persisted"] = sum(7)
+	failed["http2_owner_mismatch"] = sum(8)
+	failed["http2_scratch_or_conn_missing"] = sum(9)
+	failed["http2_tail_call_failed"] = sum(10)
 	return failed, sum(3)
 }
 

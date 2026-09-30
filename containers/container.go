@@ -682,10 +682,14 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		return
 	}
 	p := c.processes[pid]
-	if p == nil {
+	// The open of a process that exited before handleEvents got to it (its
+	// events were queued behind the exit): there is no Process to consult, so
+	// only connections that need no netns check are registered.
+	exited := p == nil && c.registry.exitedBeforeHandled(pid, c)
+	if p == nil && !exited {
 		return
 	}
-	if dst.IP().IsLoopback() && !p.isHostNs() {
+	if dst.IP().IsLoopback() && (exited || !p.isHostNs()) {
 		return
 	}
 	if actualDst.Port() == 0 {
@@ -695,7 +699,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			actualDst = dst
 		}
 	}
-	if actualDst.IP().IsLoopback() && !p.isHostNs() {
+	if actualDst.IP().IsLoopback() && (exited || !p.isHostNs()) {
 		return
 	}
 	if common.ConnectionFilter.ShouldBeSkipped(dst.IP(), actualDst.IP()) {

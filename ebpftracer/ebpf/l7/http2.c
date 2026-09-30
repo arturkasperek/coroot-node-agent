@@ -1365,19 +1365,23 @@ int http2_iov_impl(void *ctx) {
 
     s = scratch_lookup(&http2_tail_state);
     if (!s) {
+        count_src_fail(9);
         return 0;
     }
     if (http2_owner_mismatch(s->owner) || !s->size) {
+        count_src_fail(8);
         return 0;
     }
     cid = s->cid;
     is_req = s->is_req;
     iovs = scratch_lookup(&http2_iovecs);
     if (!iovs || http2_owner_mismatch(iovs->owner) || !iovs->n) {
+        count_src_fail(8);
         return 0;
     }
     conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (!conn) {
+        count_src_fail(9);
         return 0;
     }
     conn_ts = conn->timestamp;
@@ -1669,6 +1673,7 @@ int http2_tail_emit(void *ctx, struct connection_id cid, struct connection *conn
         s->size = HTTP2_SRC_MAX;
     }
     bpf_tail_call(ctx, tail_progs, HTTP2_TAIL_RESUME);
+    count_src_fail(10);
     return 1;
 }
 
@@ -1768,9 +1773,11 @@ int http2_resume_impl(void *ctx, void *tail_progs) {
 
     s = scratch_lookup(&http2_tail_state);
     if (!s || http2_owner_mismatch(s->owner) || !s->size) {
+        count_src_fail(8);
         return 0;
     }
     bpf_tail_call(ctx, tail_progs, HTTP2_TAIL_IOV);
+    count_src_fail(10);
     return 0;
 }
 

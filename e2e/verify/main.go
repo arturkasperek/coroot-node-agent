@@ -151,6 +151,20 @@ func main() {
 			}
 		}
 
+		// Spans for this destination that fit none of the sent buckets (a
+		// request the agent saw but mis-parsed, e.g. an unknown path). They
+		// never count toward the ratio; they are printed so a shortfall can be
+		// told apart from a request the agent never saw at all.
+		wanted := map[string]bool{}
+		for _, oc := range entry.Outcomes {
+			wanted[oc.Method+"|"+oc.Path+"|"+strconv.Itoa(oc.Status)] = true
+		}
+		for key, n := range matched {
+			if !wanted[key] {
+				log.Printf("[%s] unexpected spans: %s x%d", entry.Target, key, n)
+			}
+		}
+
 		var wantTotal, gotTotal int64
 		for _, oc := range entry.Outcomes {
 			key := oc.Method + "|" + oc.Path + "|" + strconv.Itoa(oc.Status)

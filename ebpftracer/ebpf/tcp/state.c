@@ -38,7 +38,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, __u32);
     __type(value, __u64);
-    __uint(max_entries, 8);
+    __uint(max_entries, 16);
 } src_read_fail SEC(".maps");
 
 static __always_inline

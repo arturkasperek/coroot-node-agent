@@ -30,6 +30,7 @@ import (
 const (
 	MinTrafficStatsUpdateInterval = 5 * time.Second
 	IgnoredContainersCacheTTL     = 15 * time.Second
+	RecentlyExitedTTL             = 60 * time.Second
 
 	// Above this many events queued, handleEvents stops doing TLS-uprobe
 	// attachment inline and defers it to pendingTlsAttach instead. Attaching
@@ -110,6 +111,18 @@ type Registry struct {
 	// resolved even after trying to register it (process already gone, or a
 	// cgroup that is deliberately ignored). See the EventTypeL7Request case.
 	l7DroppedUnknownContainer atomic.Uint64
+	// Processes whose exit event was already handled, kept for
+	// RecentlyExitedTTL so L7/connection events of theirs that are still
+	// queued behind it (they come from separate ring buffers) can still be
+	// attributed — see lateEventContainer.
+	recentlyExited map[uint32]recentlyExitedProc
+
+	// Set by the goroutine that feeds handleEvents: the cgroup of every pid
+	// seen in an event, read as soon as the event left the tracer rather than
+	// when handleEvents gets to it. See forwardEvents.
+	tracerEvents chan ebpftracer.Event
+	earlyCgLock  sync.Mutex
+	earlyCg      map[uint32]earlyCgroup
 	// Cumulative nanoseconds handleEvents spent inside attachTlsUprobes
 	// (ELF parsing, symbol resolution, uprobe syscalls), inline on the single
 	// event-dispatch goroutine. Read next to node_l7_event_queue_depth: if the
@@ -191,9 +204,12 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 	if err = reg.Register(r); err != nil {
 		return nil, err
 	}
+	r.tracerEvents = make(chan ebpftracer.Event, 10000)
+	r.earlyCg = map[uint32]earlyCgroup{}
 	go r.handleEvents(r.events)
-	if err = r.tracer.Run(r.events); err != nil {
-		close(r.events)
+	go r.forwardEvents(r.tracerEvents)
+	if err = r.tracer.Run(r.tracerEvents); err != nil {
+		close(r.tracerEvents)
 		return nil, err
 	}
 
@@ -264,7 +280,67 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 
 func (r *Registry) Close() {
 	r.tracer.Close()
-	close(r.events)
+	close(r.tracerEvents)
+}
+
+type earlyCgroup struct {
+	cg *cgroup.Cgroup
+	at time.Time
+}
+
+// forwardEvents sits between the tracer's ring-buffer readers and
+// handleEvents. handleEvents is a single goroutine that can stall for seconds
+// (TLS uprobe attach, container discovery), and by the time it reaches the
+// first event of a short-lived process the process is gone and
+// /proc/<pid>/cgroup can't be read, so every event of that process would be
+// dropped. Reading the cgroup here, right after the event left the kernel,
+// keeps that answer available to getOrCreateContainer.
+func (r *Registry) forwardEvents(in <-chan ebpftracer.Event) {
+	defer close(r.events)
+	for e := range in {
+		switch e.Type {
+		case ebpftracer.EventTypeProcessStart:
+			r.noteCgroup(e.Pid, true)
+		case ebpftracer.EventTypeL7Request, ebpftracer.EventTypeConnectionOpen, ebpftracer.EventTypeConnectionError,
+			ebpftracer.EventTypeListenOpen, ebpftracer.EventTypeFileOpen:
+			r.noteCgroup(e.Pid, false)
+		}
+		r.events <- e
+	}
+}
+
+func (r *Registry) noteCgroup(pid uint32, refresh bool) {
+	now := time.Now()
+	r.earlyCgLock.Lock()
+	x, ok := r.earlyCg[pid]
+	r.earlyCgLock.Unlock()
+	if ok && !refresh && now.Sub(x.at) < RecentlyExitedTTL {
+		return
+	}
+	cg, err := proc.ReadCgroup(pid)
+	if err != nil {
+		return
+	}
+	r.earlyCgLock.Lock()
+	if len(r.earlyCg) >= 4096 {
+		for p, y := range r.earlyCg {
+			if now.Sub(y.at) > RecentlyExitedTTL {
+				delete(r.earlyCg, p)
+			}
+		}
+	}
+	r.earlyCg[pid] = earlyCgroup{cg: cg, at: now}
+	r.earlyCgLock.Unlock()
+}
+
+func (r *Registry) earlyContainer(pid uint32) *Container {
+	r.earlyCgLock.Lock()
+	x, ok := r.earlyCg[pid]
+	r.earlyCgLock.Unlock()
+	if !ok || time.Since(x.at) > RecentlyExitedTTL {
+		return nil
+	}
+	return r.containersByCgroupId[x.cg.Id]
 }
 
 func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
@@ -380,6 +456,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 			switch e.Type {
 			case ebpftracer.EventTypeProcessStart:
+				delete(r.recentlyExited, e.Pid)
 				c, seen := r.containersByPid[e.Pid]
 				switch { // possible pids wraparound + missed `process-exit` event
 				case c == nil && seen: // ignored
@@ -400,6 +477,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			case ebpftracer.EventTypeProcessExit:
 				if c := r.containersByPid[e.Pid]; c != nil {
 					c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill)
+					r.rememberExited(e.Pid, c)
 				}
 				delete(r.containersByPid, e.Pid)
 				delete(r.pendingTlsAttach, e.Pid)
@@ -423,7 +501,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 
 			case ebpftracer.EventTypeConnectionOpen:
-				if c := r.getOrCreateContainer(e.Pid); c != nil {
+				if c := r.containerOrLate(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
 					if len(r.events) > eventQueueBusyThreshold {
 						// Behind on events — defer rather than pay the
@@ -439,11 +517,15 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					}
 				}
 			case ebpftracer.EventTypeConnectionError:
-				if c := r.getOrCreateContainer(e.Pid); c != nil {
+				if c := r.containerOrLate(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
 				}
 			case ebpftracer.EventTypeConnectionClose:
-				if c := r.containersByPid[e.Pid]; c != nil {
+				c := r.containersByPid[e.Pid]
+				if c == nil {
+					c = r.lateEventContainer(e.Pid)
+				}
+				if c != nil {
 					c.onConnectionClose(e)
 				}
 			case ebpftracer.EventTypeTCPRetransmit:
@@ -466,6 +548,9 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				// whichever slice of traffic preceded the registration.
 				c := r.containersByPid[e.Pid]
 				if c == nil {
+					c = r.lateEventContainer(e.Pid)
+				}
+				if c == nil {
 					if c = r.getOrCreateContainer(e.Pid); c == nil {
 						r.l7DroppedUnknownContainer.Add(1)
 					}
@@ -483,6 +568,66 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	}
 }
 
+type recentlyExitedProc struct {
+	c  *Container
+	at time.Time
+}
+
+func (r *Registry) rememberExited(pid uint32, c *Container) {
+	if r.recentlyExited == nil {
+		r.recentlyExited = map[uint32]recentlyExitedProc{}
+	}
+	now := time.Now()
+	if len(r.recentlyExited) >= 1024 {
+		for p, x := range r.recentlyExited {
+			if now.Sub(x.at) > RecentlyExitedTTL {
+				delete(r.recentlyExited, p)
+			}
+		}
+	}
+	r.recentlyExited[pid] = recentlyExitedProc{c: c, at: now}
+}
+
+// lateEventContainer resolves the container of a process whose exit event has
+// already been handled. The L7 events of a short-lived process can sit in
+// their ring buffer behind its exit event; the process is gone by then, so
+// /proc/<pid>/cgroup can't be read and, without this, getOrCreateContainer
+// would drop every one of them (and negative-cache the pid).
+func (r *Registry) lateEventContainer(pid uint32) *Container {
+	x, ok := r.recentlyExited[pid]
+	if !ok {
+		return nil
+	}
+	if time.Since(x.at) > RecentlyExitedTTL {
+		delete(r.recentlyExited, pid)
+		return nil
+	}
+	return x.c
+}
+
+// exitedBeforeHandled: pid belongs to c and is gone, i.e. its events were
+// still queued when the process ended.
+func (r *Registry) exitedBeforeHandled(pid uint32, c *Container) bool {
+	if r.lateEventContainer(pid) == c {
+		return true
+	}
+	if r.earlyContainer(pid) != c {
+		return false
+	}
+	_, err := proc.ReadCgroup(pid)
+	return err != nil && common.IsNotExist(err)
+}
+
+func (r *Registry) containerOrLate(pid uint32) *Container {
+	if c := r.containersByPid[pid]; c != nil {
+		return c
+	}
+	if c := r.lateEventContainer(pid); c != nil {
+		return c
+	}
+	return r.getOrCreateContainer(pid)
+}
+
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	if c := r.containersByPid[pid]; c != nil {
 		return c
@@ -496,6 +641,14 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		}
 	}
 	cg, err := proc.ReadCgroup(pid)
+	if err != nil && common.IsNotExist(err) {
+		// Gone before handleEvents got to it; forwardEvents may have read
+		// its cgroup while it was alive. Only an already-known container is
+		// used: nothing is registered for a pid that no longer exists.
+		if c := r.earlyContainer(pid); c != nil {
+			return c
+		}
+	}
 	if err != nil {
 		if common.IsNotExist(err) {
 			// The process is already gone. Cache that like every other

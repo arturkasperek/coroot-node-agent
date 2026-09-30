@@ -85,6 +85,19 @@ TARGETS="${TARGETS},python-tls|h1-tls|https://svc-python:8443"
 # client used for every other h1 target — see e2e/loadgen's newClient.
 TARGETS="${TARGETS},node-keepalive|h1-keepalive|http://svc-node-ka:8081"
 
+# ONLY=name1,name2 restricts the measured load to those targets (services all
+# still start).
+if [ -n "${ONLY:-}" ]; then
+  filtered=""
+  IFS=',' read -ra _all <<< "${TARGETS}"
+  for t in "${_all[@]}"; do
+    for o in ${ONLY//,/ }; do
+      [ "${t%%|*}" = "$o" ] && filtered="${filtered:+${filtered},}${t}"
+    done
+  done
+  TARGETS="${filtered}"
+fi
+
 echo "[run.sh] running agent + load + verify"
 docker rm -f coroot-e2e-agent >/dev/null 2>&1 || true
 containers+=("coroot-e2e-agent")
@@ -104,6 +117,8 @@ docker run --name coroot-e2e-agent \
   -v /sys/kernel/btf:/sys/kernel/btf:ro \
   -e TARGETS="${TARGETS}" \
   -e N_REQUESTS="${N_REQUESTS}" \
+  -e CONCURRENCY="${CONCURRENCY:-20}" \
+  -e STRESS="${STRESS:-0}" \
   "${IMAGE}" agent-orchestrator
 RC=$?
 

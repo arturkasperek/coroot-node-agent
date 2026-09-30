@@ -191,7 +191,30 @@ sleep 5
 curl -s -m 5 -X POST "http://${MOCKBACKEND_ADDR}/api/reset" -o /dev/null || true
 
 echo "[run-agent] agent health counters (before load):"
-curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
+curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_http2_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
+
+# STRESS=1: background pressure while the measured load runs — CPU burners on
+# every core, memory churn plus forced compaction (page migration is what makes
+# nofault user-memory reads fail transiently), to probe loaded-host behavior.
+STRESS_PIDS=()
+# STRESS=cpu or STRESS=mem runs just one of the two.
+if [ "${STRESS:-0}" != "0" ]; then
+  echo "[run-agent] STRESS=${STRESS}: cpu burners + memory churn + forced compaction (cpu/mem select one)"
+fi
+if [ "${STRESS:-0}" = "1" ] || [ "${STRESS:-0}" = "cpu" ]; then
+  for _ in $(seq "$(nproc)"); do
+    ( while :; do :; done ) &
+    STRESS_PIDS+=($!)
+  done
+fi
+if [ "${STRESS:-0}" = "1" ] || [ "${STRESS:-0}" = "mem" ]; then
+  ( while :; do
+      python3 -c 'b=[bytearray(64<<20) for _ in range(16)]
+import time; time.sleep(0.5)' 2>/dev/null
+      echo 1 > /proc/sys/vm/compact_memory 2>/dev/null
+    done ) &
+  STRESS_PIDS+=($!)
+fi
 
 echo "[run-agent] generating load: ${N_REQUESTS} requests/target, targets=${TARGETS}"
 if ! loadgen -n "${N_REQUESTS}" -concurrency "${CONCURRENCY}" -targets "${TARGETS}" -manifest "${MANIFEST}"; then
@@ -199,11 +222,13 @@ if ! loadgen -n "${N_REQUESTS}" -concurrency "${CONCURRENCY}" -targets "${TARGET
   exit 1
 fi
 
+if [ "${#STRESS_PIDS[@]}" -gt 0 ]; then kill "${STRESS_PIDS[@]}" 2>/dev/null || true; fi
+
 echo "[run-agent] waiting ${FLUSH_SECONDS}s for the OTLP batch exporter to flush"
 sleep "${FLUSH_SECONDS}"
 
 echo "[run-agent] agent health counters (after load):"
-curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
+curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_http2_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
 
 # Dump the agent's own warnings/errors (deduplicated, pids/ids masked so
 # repeats collapse) — the single most useful thing to have when a run
