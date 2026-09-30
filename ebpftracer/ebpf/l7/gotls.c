@@ -21,14 +21,17 @@ struct go_interface {
 static inline __attribute__((__always_inline__))
 int go_crypto_tls_get_fd_from_conn(struct pt_regs *ctx, __u32 *fd) {
     struct go_interface conn;
-    if (bpf_probe_read(&conn, sizeof(conn), (void*)GO_PARAM1(ctx))) {
+    if (probe_read_retry(&conn, sizeof(conn), (void*)GO_PARAM1(ctx))) {
+        count_src_fail(2);
         return 1;
     };
     void* fd_ptr;
-    if (bpf_probe_read(&fd_ptr, sizeof(fd_ptr), conn.ptr)) {
+    if (probe_read_retry(&fd_ptr, sizeof(fd_ptr), conn.ptr)) {
+        count_src_fail(2);
         return 1;
     }
-    if (bpf_probe_read(fd, sizeof(*fd), fd_ptr + 0x10)) {
+    if (probe_read_retry(fd, sizeof(*fd), fd_ptr + 0x10)) {
+        count_src_fail(2);
         return 1;
     }
     return 0;

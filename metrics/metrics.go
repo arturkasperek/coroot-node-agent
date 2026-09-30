@@ -66,6 +66,14 @@ var (
 	L7PayloadsTruncated       = metric("node_l7_payloads_truncated_total", "Total number of L7 events whose payload was truncated to 1024 bytes")
 	GoTlsUprobeAttachFailures = metric("node_go_tls_uprobe_attach_failures_total", "Total number of Go binaries where crypto/tls uprobes could not be attached (typically stripped binaries)")
 
+	TracesSpansCreated      = metric("node_traces_spans_created_total", "Spans handed to the OpenTelemetry SDK")
+	TracesSpansExported     = metric("node_traces_spans_exported_total", "Spans the OTLP exporter successfully sent")
+	TracesSpansExportFailed = metric("node_traces_spans_export_failed_total", "Spans the OTLP exporter failed to send. Created minus (exported + failed), once drained, is spans the SDK's batch queue dropped")
+
+	EbpfProgramRecursionMisses = metric("node_ebpf_program_recursion_misses_total", "Times the kernel skipped a BPF program because that program was already running on the same CPU (the skipped run is silently lost)", "program")
+	EbpfUserMemoryReadFailures = metric("node_ebpf_user_memory_read_failures_total", "Reads of a traced application's memory that failed even after retrying (the capture of that request or response is cut short or the connection is not recognised)", "stage")
+	EbpfUserMemoryReadsRescued = metric("node_ebpf_user_memory_reads_rescued_total", "Reads of a traced application's memory that failed once (a page momentarily unavailable, e.g. under migration) and succeeded on retry")
+
 	Http1EventsSeen          = metric("node_l7_http1_events_total", "Total number of outbound HTTP/1 L7 events the kernel delivered to userspace, whether or not they could be correlated to a tracked connection")
 	Http1DroppedNoConnection = metric("node_l7_http1_dropped_no_connection_total", "Total number of outbound HTTP/1 L7 events that arrived before their (pid, fd)'s connection was registered (buffered into a pending parser, see feedPendingHttp1 — not necessarily lost, but a request completing entirely before registration still is)")
 	Http1DroppedTsMismatch   = metric("node_l7_http1_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/1 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")

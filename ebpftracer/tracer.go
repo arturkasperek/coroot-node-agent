@@ -251,6 +251,57 @@ func (t *Tracer) LostSamples() uint64 {
 	return t.lostSamples.Load() + t.ringbufDrops("l7_events_dropped") + t.ringbufDrops("tcp_connect_events_dropped")
 }
 
+// ProgramRecursionMisses returns, per program, how many times the kernel
+// skipped running it because that same program was already active on the
+// CPU (its recursion guard). A skipped tracepoint/kprobe run simply never
+// happens: no event, no error, and none of node_ebpf_lost_samples_total's
+// ring-buffer counters move — so this is the only place such a loss is
+// visible. Only programs with a nonzero count are returned.
+func (t *Tracer) ProgramRecursionMisses() map[string]uint64 {
+	out := map[string]uint64{}
+	if t.collection == nil {
+		return out
+	}
+	for name, prog := range t.collection.Programs {
+		st, err := prog.Stats()
+		if err != nil || st.RecursionMisses == 0 {
+			continue
+		}
+		out[name] = st.RecursionMisses
+	}
+	return out
+}
+
+// UserMemoryReads reports the eBPF side's reads of traced applications'
+// memory (see probe_read_retry in ebpf/tcp/state.c): how many failed even
+// after retries, by stage, and how many failed once but succeeded on retry.
+func (t *Tracer) UserMemoryReads() (failed map[string]uint64, rescued uint64) {
+	failed = map[string]uint64{}
+	if t.collection == nil {
+		return failed, 0
+	}
+	m := t.collection.Maps["src_read_fail"]
+	if m == nil {
+		return failed, 0
+	}
+	sum := func(k uint32) uint64 {
+		var vs []uint64
+		if err := m.Lookup(k, &vs); err != nil {
+			return 0
+		}
+		var n uint64
+		for _, v := range vs {
+			n += v
+		}
+		return n
+	}
+	failed["header_byte"] = sum(0)
+	failed["payload_copy"] = sum(1)
+	failed["tls_fd"] = sum(2)
+	failed["protocol_sniff"] = sum(6)
+	return failed, sum(3)
+}
+
 func (t *Tracer) ringbufDrops(mapName string) uint64 {
 	if t.collection == nil {
 		return 0
@@ -353,6 +404,9 @@ type Connection struct {
 	H2SkipReqData    uint8
 	H2SkipRespData   uint8
 	_                [2]uint8
+	// struct sock * recorded at SYN_SENT; only read by the eBPF side
+	// (emit_connection_open_lazy)
+	Skaddr uint64
 }
 
 type perfMap struct {

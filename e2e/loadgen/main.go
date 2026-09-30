@@ -15,7 +15,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,9 +37,23 @@ type outcome struct {
 	Path   string `json:"path"`
 	Status int    `json:"status"`
 	Count  int64  `json:"count"`
+	// IDs are the request indices (see runOne's "n" query parameter) that
+	// made up Count, so verify can name exactly which requests went missing
+	// instead of only how many. Empty for targets whose server can't take a
+	// query string (h1-keepalive matches the full URL).
+	IDs []int `json:"ids,omitempty"`
+	// SrcPorts[i] is the local TCP port request IDs[i] went out on. With it a
+	// missing request can be joined to the agent's log of connection-open
+	// events, which says whether the agent ever learned the connection
+	// existed (see run-agent.sh's portcheck).
+	SrcPorts []int `json:"src_ports,omitempty"`
 }
 
 type manifestEntry struct {
+	// Run tags every request of this loadgen invocation ("r" query
+	// parameter), so verify only counts spans this run produced and never
+	// warmup or probe traffic that reuses the same routes and indices.
+	Run      string    `json:"run,omitempty"`
 	Target   string    `json:"target"`
 	BaseURL  string    `json:"base_url"`
 	Proto    string    `json:"proto"`
@@ -159,13 +175,20 @@ func routesFor(proto string) []routeStep {
 
 // runOne fires one request per step's rotation and returns (method, path,
 // status) actually observed.
-func runOne(client *http.Client, base string, step routeStep, i int) (string, string, int, error) {
+func runOne(client *http.Client, base string, step routeStep, i int, query string, srcPort *int) (string, string, int, error) {
+	// trace records the local port the request's connection was dialed from.
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		if a, ok := info.Conn.LocalAddr().(*net.TCPAddr); ok {
+			*srcPort = a.Port
+		}
+	}}
 	if step.echoBody {
 		body := bytes.Repeat([]byte{byte('a' + i%26)}, 200+i%800)
-		req, err := http.NewRequest(step.method, base+step.path, bytes.NewReader(body))
+		req, err := http.NewRequest(step.method, base+step.path+query, bytes.NewReader(body))
 		if err != nil {
 			return "", "", 0, err
 		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 		resp, err := client.Do(req)
 		if err != nil {
 			return "", "", 0, err
@@ -177,10 +200,11 @@ func runOne(client *http.Client, base string, step routeStep, i int) (string, st
 		}
 		return step.method, step.path, resp.StatusCode, nil
 	}
-	req, err := http.NewRequest(step.method, base+step.path, nil)
+	req, err := http.NewRequest(step.method, base+step.path+query, nil)
 	if err != nil {
 		return "", "", 0, err
 	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", 0, err
@@ -194,6 +218,8 @@ func driveTarget(t target, n, concurrency int) manifestEntry {
 	client := newClient(t.proto)
 	routes := routesFor(t.proto)
 	counts := map[[3]any]*int64{}
+	ids := map[[3]any][]int{}
+	ports := map[int]int{} // request id -> local source port
 	var countsMu sync.Mutex
 	var failed int64
 
@@ -213,7 +239,15 @@ func driveTarget(t target, n, concurrency int) manifestEntry {
 			defer wg.Done()
 			defer func() { <-sem }()
 			step := routes[i%len(routes)]
-			method, path, status, err := runOne(client, t.baseURL, step, i)
+			// n = which request, r = which loadgen run: lets verify name the
+			// exact requests that never became spans. Not for h1-keepalive,
+			// whose server looks the *whole* URL up in a table.
+			query := ""
+			if t.proto != "h1-keepalive" {
+				query = fmt.Sprintf("?n=%d&r=%s", i, runID)
+			}
+			srcPort := 0
+			method, path, status, err := runOne(client, t.baseURL, step, i, query, &srcPort)
 			if err != nil {
 				atomic.AddInt64(&failed, 1)
 				log.Printf("[%s] request %d failed: %v", t.name, i, err)
@@ -228,6 +262,10 @@ func driveTarget(t target, n, concurrency int) manifestEntry {
 				counts[key] = c
 			}
 			*c++
+			if query != "" {
+				ids[key] = append(ids[key], i)
+				ports[i] = srcPort
+			}
 			countsMu.Unlock()
 		}()
 	}
@@ -236,7 +274,12 @@ func driveTarget(t target, n, concurrency int) manifestEntry {
 	var outcomes []outcome
 	countsMu.Lock()
 	for k, c := range counts {
-		outcomes = append(outcomes, outcome{Method: k[0].(string), Path: k[1].(string), Status: k[2].(int), Count: *c})
+		sort.Ints(ids[k])
+		var srcPorts []int
+		for _, id := range ids[k] {
+			srcPorts = append(srcPorts, ports[id])
+		}
+		outcomes = append(outcomes, outcome{Method: k[0].(string), Path: k[1].(string), Status: k[2].(int), Count: *c, IDs: ids[k], SrcPorts: srcPorts})
 	}
 	countsMu.Unlock()
 
@@ -244,8 +287,11 @@ func driveTarget(t target, n, concurrency int) manifestEntry {
 		log.Printf("[%s] %d/%d requests failed", t.name, failed, n)
 	}
 	log.Printf("[%s] done: %d requests, %d outcome buckets", t.name, n, len(outcomes))
-	return manifestEntry{Target: t.name, BaseURL: t.baseURL, Proto: t.proto, Outcomes: outcomes}
+	return manifestEntry{Run: runID, Target: t.name, BaseURL: t.baseURL, Proto: t.proto, Outcomes: outcomes}
 }
+
+// runID tags every request of this process; see manifestEntry.Run.
+var runID = fmt.Sprintf("%x", time.Now().UnixNano()&0xffffffff)
 
 func main() {
 	n := flag.Int("n", 500, "requests per target")

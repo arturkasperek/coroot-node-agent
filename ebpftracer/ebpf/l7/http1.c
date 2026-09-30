@@ -118,6 +118,32 @@ struct {
     __uint(max_entries, 4096);
 } http1_state SEC(".maps");
 
+/* Percpu scratch carrying http1_tail_emit's arguments across the
+   bpf_tail_call to http1_walk_impl — same reasoning as http2_tail_state:
+   a tail call replaces the running program, nothing survives on the
+   stack/in registers. owner guards against another task's syscall winning
+   this CPU's slot in between (see http2_owner_mismatch). round counts how
+   many times http1_walk_impl has tail-called itself for this buffer (see
+   below), bounding HTTP1_MAX_ROUNDS independent of any one call's own
+   verifier budget. */
+struct http1_tail_state {
+    __u64 owner;
+    struct connection_id cid;
+    __u64 conn_ts;
+    __u8 is_req;
+    __u8 round;
+    /* the connection's direction as seen when the chain started (see
+       http1_flush for why it is not looked up again there) */
+    __u8 is_inbound;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct http1_tail_state);
+} http1_tail_state SEC(".maps");
+
 struct http1_flush_args {
     struct connection_id cid;
     char *dst;
@@ -135,16 +161,37 @@ void http1_flush(struct http1_flush_args *a) {
     __u32 zero = 0;
     struct l7_event *e;
     struct connection *conn;
+    struct http1_tail_state *ts;
+    __u64 conn_ts;
+    __u8 inbound;
     __u32 n;
     if (!a || !a->out_len || !a->dst) {
         return;
     }
-    conn = bpf_map_lookup_elem(&active_connections, &a->cid);
-    if (!conn) {
-        a->out_len = 0;
-        return;
+    /* Stamp the event with the connection identity the chain started with
+       (http1_tail_emit's), not with whatever active_connections holds for
+       this (pid, fd) by now: every request here is a fresh connection and
+       fds are recycled within microseconds, so by the time a slow walk got
+       to emit, the fd could already belong to the NEXT connection — the
+       event then reached the agent under that connection's timestamp, and
+       was worse than lost (it was somebody else's data). If the connection
+       has already been closed, emit anyway: the agent keeps recently closed
+       connections around, and matches by (pid, fd, timestamp). */
+    ts = scratch_lookup(&http1_tail_state);
+    if (ts && ts->owner == bpf_get_current_pid_tgid() &&
+        ts->cid.pid == a->cid.pid && ts->cid.fd == a->cid.fd) {
+        conn_ts = ts->conn_ts;
+        inbound = ts->is_inbound;
+    } else {
+        conn = bpf_map_lookup_elem(&active_connections, &a->cid);
+        if (!conn) {
+            a->out_len = 0;
+            return;
+        }
+        conn_ts = conn->timestamp;
+        inbound = conn->is_inbound;
     }
-    e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+    e = scratch_lookup(&l7_event_heap);
     if (!e) {
         a->out_len = 0;
         return;
@@ -156,7 +203,7 @@ void http1_flush(struct http1_flush_args *a) {
     PAYLOAD_BOUND(n);
     e->protocol = PROTOCOL_HTTP;
     e->method = a->method;
-    e->is_inbound = conn->is_inbound;
+    e->is_inbound = inbound;
     e->status = STATUS_UNKNOWN;
     e->statement_id = 0;
     e->duration = bpf_ktime_get_ns();
@@ -164,7 +211,7 @@ void http1_flush(struct http1_flush_args *a) {
         struct bpf_dynptr d = {};
         __u32 pn = payload_copy_len(n);
         __u32 rec = sizeof(*e) + pn;
-        e->connection_timestamp = conn->timestamp;
+        e->connection_timestamp = conn_ts;
         e->fd = a->cid.fd;
         e->pid = a->cid.pid;
         e->payload_size = n;
@@ -374,7 +421,7 @@ int http1_capture_data(struct connection_id cid, __u32 *data_captured, __u64 *bo
     __u32 chunk;
     int i;
 
-    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    iovs = scratch_lookup(&http2_iovecs);
     if (!iovs) {
         return 0;
     }
@@ -500,29 +547,6 @@ int http1_chunk_crlf_step(__u8 *consumed) {
     return *consumed >= 2;
 }
 
-/* Percpu scratch carrying http1_tail_emit's arguments across the
-   bpf_tail_call to http1_walk_impl — same reasoning as http2_tail_state:
-   a tail call replaces the running program, nothing survives on the
-   stack/in registers. owner guards against another task's syscall winning
-   this CPU's slot in between (see http2_owner_mismatch). round counts how
-   many times http1_walk_impl has tail-called itself for this buffer (see
-   below), bounding HTTP1_MAX_ROUNDS independent of any one call's own
-   verifier budget. */
-struct http1_tail_state {
-    __u64 owner;
-    struct connection_id cid;
-    __u64 conn_ts;
-    __u8 is_req;
-    __u8 round;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct http1_tail_state);
-} http1_tail_state SEC(".maps");
-
 /* Not attached: tail-called only, so the bpf_loop-heavy header/chunk scan
    gets its own verifier budget separate from whichever real hook
    (sys_enter_write, sys_exit_read, a TLS uprobe, ...) triggered it — the
@@ -552,7 +576,7 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
     __u32 source_left;
     __u8 method;
 
-    s = bpf_map_lookup_elem(&http1_tail_state, &zero);
+    s = scratch_lookup(&http1_tail_state);
     if (!s) {
         return 0;
     }
@@ -567,7 +591,7 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
     } else {
         sv.body_remaining = HTTP1_LEN_UNKNOWN;
     }
-    dst = bpf_map_lookup_elem(&http2_emit_heap, &zero);
+    dst = scratch_lookup(&http2_emit_heap);
     if (!dst) {
         return 0;
     }
@@ -707,7 +731,7 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
 
     bpf_map_update_elem(&http1_state, &key, &sv, BPF_ANY);
 
-    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    iovs = scratch_lookup(&http2_iovecs);
     if (!iovs) {
         return 0;
     }
@@ -755,13 +779,14 @@ int http1_tail_emit(void *ctx, struct connection_id cid, struct connection *conn
     if (!iovs) {
         return 0;
     }
-    s = bpf_map_lookup_elem(&http1_tail_state, &zero);
+    s = scratch_lookup(&http1_tail_state);
     if (!s) {
         return 0;
     }
     s->owner = bpf_get_current_pid_tgid();
     s->cid = cid;
     s->conn_ts = conn->timestamp;
+    s->is_inbound = conn->is_inbound;
     s->is_req = is_req;
     s->round = 0;
     bpf_tail_call(ctx, tail_progs, HTTP1_TAIL_WALK);

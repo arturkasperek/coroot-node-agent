@@ -1,8 +1,9 @@
 
 static __always_inline
 int is_http_request(char *buf) {
-    char b[16];
-    if (bpf_probe_read_str(&b, sizeof(b), (void *)buf) < 16) {
+    __u64 w[2] = {};
+    char *b = (char *)w;
+    if (!sniff_first16(w, buf)) {
         return 0;
     }
     if (b[0] == 'G' && b[1] == 'E' && b[2] == 'T') {
@@ -34,8 +35,9 @@ int is_http_request(char *buf) {
 
 static __always_inline
 int is_http_response(char *buf, __s32 *status) {
-    char b[16];
-    if (bpf_probe_read_str(&b, sizeof(b), (void *)buf) < 16) {
+    __u64 w[2] = {};
+    char *b = (char *)w;
+    if (!sniff_first16(w, buf)) {
         return 0;
     }
     if (b[0] != 'H' || b[1] != 'T' || b[2] != 'T' || b[3] != 'P' || b[4] != '/') {

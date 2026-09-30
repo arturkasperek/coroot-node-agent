@@ -484,10 +484,10 @@ void http2_encode_frame_header(unsigned char nh[HTTP2_FRAME_HEADER_SIZE], __u32 
 }
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
     __type(value, char[MAX_PAYLOAD_SIZE]);
-    __uint(max_entries, 1);
 } http2_emit_heap SEC(".maps");
 
 struct http2_trim_args {
@@ -523,7 +523,7 @@ void http2_flush(struct http2_trim_args *a) {
         a->first_stream = 0;
         return;
     }
-    e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+    e = scratch_lookup(&l7_event_heap);
     if (!e) {
         a->out_len = 0;
         a->first_stream = 0;
@@ -782,16 +782,16 @@ int http2_owner_mismatch(__u64 owner) {
 }
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
     __type(value, struct http2_tail_state);
 } http2_tail_state SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
     __type(value, struct http2_iovec_table);
 } http2_iovecs SEC(".maps");
 
@@ -823,7 +823,7 @@ void http2_iov_clear(void) {
     __u32 zero = 0;
     struct http2_iovec_table *t;
 
-    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    t = scratch_lookup(&http2_iovecs);
     if (t) {
         t->ready = 0;
     }
@@ -867,7 +867,7 @@ static long http2_iov_load_cb(__u32 i, void *ctx) {
     if (u.size > HTTP2_SRC_MAX) {
         len = HTTP2_SRC_MAX;
     }
-    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    t = scratch_lookup(&http2_iovecs);
     if (!t) {
         return 1;
     }
@@ -907,7 +907,7 @@ void http2_load_iovecs(char *iovec, __u64 iovlen, __u64 cap) {
     __u32 n;
     __u32 lim;
 
-    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    t = scratch_lookup(&http2_iovecs);
     if (!t || !iovec || !iovlen) {
         return;
     }
@@ -933,10 +933,23 @@ void http2_load_iovecs(char *iovec, __u64 iovlen, __u64 cap) {
     arg.n = n;
     arg.cap = lim;
     bpf_loop(n, http2_iov_load_cb, &arg, 0);
-    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    t = scratch_lookup(&http2_iovecs);
     if (t && t->n && t->total) {
         t->ready = 1;
     }
+}
+
+/* Global (not static) on purpose: the verifier checks a global function once
+   however many call sites there are, while the retry loop inlined into
+   http2_iov_pull — which sits inside the walkers' bpf_loop callbacks — made
+   http2_iov/http1_walk exceed the verifier's complexity limit. See
+   probe_read_retry for why the read is retried at all. */
+__attribute__((noinline))
+long probe_read_byte_retry(unsigned char *out, __u64 addr) {
+    if (!out) {
+        return -1;
+    }
+    return probe_read_retry(out, 1, (void *)addr);
 }
 
 static __attribute__((noinline))
@@ -948,7 +961,7 @@ int http2_iov_pull(__u8 *out) {
     __u32 len;
     __u64 addr;
 
-    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    t = scratch_lookup(&http2_iovecs);
     if (!t || !out) {
         return -1;
     }
@@ -985,7 +998,8 @@ int http2_iov_pull(__u8 *out) {
        base (writev/readv), or the kernel-side iovec_buf_heap scratch
        buffer standing in for one (see http2_tail_emit's synthetic
        single-vector table for the plain write/read/TLS path). */
-    if (bpf_probe_read(out, 1, (void *)addr)) {
+    if (probe_read_byte_retry(out, addr)) {
+        count_src_fail(0);
         return -1;
     }
     t->off = off + 1;
@@ -1009,7 +1023,7 @@ int http2_iov_pull_header_fast(unsigned char hdr[HTTP2_FRAME_HEADER_SIZE]) {
     __u32 len;
     __u64 addr;
 
-    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    t = scratch_lookup(&http2_iovecs);
     if (!t) {
         return -1;
     }
@@ -1103,7 +1117,7 @@ __u32 http2_iov_skip(__u32 n) {
         if (!n) {
             return 0;
         }
-        t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+        t = scratch_lookup(&http2_iovecs);
         if (!t || t->idx >= t->n || t->idx >= HTTP2_MAX_VECS) {
             return n;
         }
@@ -1167,7 +1181,7 @@ int http2_iov_copy(char *dst, __u32 out, __u32 n) {
         if (!n) {
             return 0;
         }
-        t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+        t = scratch_lookup(&http2_iovecs);
         if (!t || t->idx >= t->n || t->idx >= HTTP2_MAX_VECS) {
             return -1;
         }
@@ -1239,13 +1253,13 @@ static long http2_iov_cb(__u32 i, void *ctx) {
     if (!a || !a->dst) {
         return 1;
     }
-    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    t = scratch_lookup(&http2_iovecs);
     if (!t) {
         return 1;
     }
     if (t->skip_left) {
         rest = http2_iov_skip(t->skip_left);
-        t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+        t = scratch_lookup(&http2_iovecs);
         if (!t) {
             return 1;
         }
@@ -1263,7 +1277,7 @@ static long http2_iov_cb(__u32 i, void *ctx) {
     if (http2_iov_pull_header_resumable(a->conn_ts, a->is_req, hdr)) {
         return 1;
     }
-    t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    t = scratch_lookup(&http2_iovecs);
     if (!t) {
         return 1;
     }
@@ -1278,7 +1292,7 @@ static long http2_iov_cb(__u32 i, void *ctx) {
            so — unlike the contiguous walker, which just rewinds a->pos —
            the header bytes and the captured-so-far body length must be
            stashed for http2_iov_impl to replay after the loop. */
-        t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+        t = scratch_lookup(&http2_iovecs);
         if (!t) {
             return 1;
         }
@@ -1309,7 +1323,7 @@ static long http2_iov_cb(__u32 i, void *ctx) {
     if (take > copied) {
         rest = http2_iov_skip(take - copied);
         if (rest) {
-            t = bpf_map_lookup_elem(&http2_iovecs, &zero);
+            t = scratch_lookup(&http2_iovecs);
             if (!t) {
                 return 1;
             }
@@ -1349,7 +1363,7 @@ int http2_iov_impl(void *ctx) {
     __u8 data;
     (void)ctx;
 
-    s = bpf_map_lookup_elem(&http2_tail_state, &zero);
+    s = scratch_lookup(&http2_tail_state);
     if (!s) {
         return 0;
     }
@@ -1358,7 +1372,7 @@ int http2_iov_impl(void *ctx) {
     }
     cid = s->cid;
     is_req = s->is_req;
-    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    iovs = scratch_lookup(&http2_iovecs);
     if (!iovs || http2_owner_mismatch(iovs->owner) || !iovs->n) {
         return 0;
     }
@@ -1368,7 +1382,7 @@ int http2_iov_impl(void *ctx) {
     }
     conn_ts = conn->timestamp;
     http2_skip_load(conn, is_req, &skip, &packed, &data);
-    dst = bpf_map_lookup_elem(&http2_emit_heap, &zero);
+    dst = scratch_lookup(&http2_emit_heap);
     if (!dst) {
         return 0;
     }
@@ -1401,7 +1415,7 @@ int http2_iov_impl(void *ctx) {
                 http2_flush(&t);
                 skip -= have;
             }
-            iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+            iovs = scratch_lookup(&http2_iovecs);
             if (!iovs) {
                 return 0;
             }
@@ -1418,14 +1432,14 @@ int http2_iov_impl(void *ctx) {
                     skip -= left - rest;
                 }
                 if (rest) {
-                    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+                    iovs = scratch_lookup(&http2_iovecs);
                     if (iovs && iovs->idx < iovs->n) {
                         iovs->skip_left = rest;
                     }
                 }
             }
             http2_skip_topup_next(conn_ts, stream_id, is_req, is_header, skip, &packed, &data);
-            iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+            iovs = scratch_lookup(&http2_iovecs);
             if (!iovs) {
                 return 0;
             }
@@ -1456,7 +1470,7 @@ int http2_iov_impl(void *ctx) {
                 skip -= left - rest;
             }
             if (rest) {
-                iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+                iovs = scratch_lookup(&http2_iovecs);
                 if (iovs && iovs->idx < iovs->n) {
                     iovs->skip_left = rest;
                 }
@@ -1472,7 +1486,7 @@ int http2_iov_impl(void *ctx) {
     }
     conn = bpf_map_lookup_elem(&active_connections, &cid);
     http2_skip_save(conn, is_req, skip, packed, data);
-    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    iovs = scratch_lookup(&http2_iovecs);
     if (iovs && iovs->n && iovs->v[0].len >= HTTP2_PREFACE_SIZE && iovs->idx == 0 && iovs->off == 0) {
         char p[6];
         if (!bpf_probe_read(p, sizeof(p), (void *)iovs->v[0].base) &&
@@ -1488,7 +1502,7 @@ int http2_iov_impl(void *ctx) {
     bpf_loop(HTTP2_TRIM_MAX_FRAMES, http2_iov_cb, &t, 0);
     http2_flush(&t);
     if (t.skip_data == HTTP2_SKIP_CUT) {
-        iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+        iovs = scratch_lookup(&http2_iovecs);
         if (!iovs) {
             return 0;
         }
@@ -1572,7 +1586,7 @@ struct http2_iovec_table *http2_iov_adopt(char *buf, __u64 size, __u8 from_heap)
     struct http2_iovec_table *iovs;
     char *src;
 
-    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    iovs = scratch_lookup(&http2_iovecs);
     /* A ready iovec table this task didn't itself just load (see
        http2_load_iovecs) belongs to whatever unrelated syscall last won the
        race for this CPU's scratch slot — not usable here. */
@@ -1599,12 +1613,12 @@ struct http2_iovec_table *http2_iov_adopt(char *buf, __u64 size, __u8 from_heap)
        this case. */
     src = buf;
     if (from_heap) {
-        src = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
+        src = scratch_lookup(&iovec_buf_heap);
         if (!src) {
             return 0;
         }
     }
-    iovs = bpf_map_lookup_elem(&http2_iovecs, &zero);
+    iovs = scratch_lookup(&http2_iovecs);
     if (!iovs) {
         return 0;
     }
@@ -1642,7 +1656,7 @@ int http2_tail_emit(void *ctx, struct connection_id cid, struct connection *conn
     if (!iovs) {
         return 0;
     }
-    s = bpf_map_lookup_elem(&http2_tail_state, &zero);
+    s = scratch_lookup(&http2_tail_state);
     if (!s) {
         return 0;
     }
@@ -1752,7 +1766,7 @@ int http2_resume_impl(void *ctx, void *tail_progs) {
     __u32 zero = 0;
     struct http2_tail_state *s;
 
-    s = bpf_map_lookup_elem(&http2_tail_state, &zero);
+    s = scratch_lookup(&http2_tail_state);
     if (!s || http2_owner_mismatch(s->owner) || !s->size) {
         return 0;
     }

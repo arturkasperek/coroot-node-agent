@@ -60,6 +60,7 @@ int copy_to_payload(char *dst, __u32 offset, __u32 size, const void *src) {
     }
     if (bpf_probe_read_user_dynptr(&d, offset, size, src) &&
         bpf_probe_read_kernel_dynptr(&d, offset, size, src)) {
+        count_src_fail(1);
         return -1;
     }
     return 0;
@@ -124,10 +125,10 @@ struct l7_event {
 };
 
 struct {
-     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
      __type(key, int);
      __type(value, struct l7_event);
-     __uint(max_entries, 1);
 } l7_event_heap SEC(".maps");
 
 #define L7_EVENTS_RINGBUF_SIZE (128 * 1024 * 1024)
@@ -203,17 +204,17 @@ struct {
 #endif
 
 struct {
-     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
      __type(key, int);
      __type(value, struct l7_request);
-     __uint(max_entries, 1);
 } l7_request_heap SEC(".maps");
 
 struct {
-     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
      __type(key, int);
      __type(value, char[IOVEC_BUF_SIZE]);
-     __uint(max_entries, 1);
 } iovec_buf_heap SEC(".maps");
 
 struct trace_event_raw_sys_enter_rw__stub {
@@ -265,9 +266,9 @@ struct sendmmsg_iter {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
     __type(value, struct l7_write_args);
 } l7_write_args_heap SEC(".maps");
 
@@ -392,7 +393,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
             return 0;
         }
         struct connection new_conn = {};
-        new_conn.timestamp = bpf_ktime_get_ns();
+        new_conn.timestamp = conn_timestamp(cid.pid, cid.fd);
         new_conn.is_inbound = 0;
         /* BPF_ANY, not BPF_NOEXIST: this cid's slot can hold a stale entry
            from an earlier, unrelated connection that reused the same
@@ -413,6 +414,10 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
         }
     }
 
+    if (!conn->is_inbound && !conn->open_sent && conn->skaddr) {
+        emit_connection_open_lazy(&cid, conn);
+    }
+
     char* payload = buf;
     if (iovlen && !plain_buf) {
         http2_load_iovecs(buf, iovlen, 0);
@@ -422,7 +427,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
         }
     }
     if (iovlen) {
-        payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
+        payload = scratch_lookup(&iovec_buf_heap);
         if (!payload) {
             return 0;
         }
@@ -494,7 +499,7 @@ int trace_enter_tls_kp(void *ctx, __u64 fd, char *buf, __u64 size) {
 static __always_inline
 int trace_enter_plain_pack(void *ctx, __u64 fd, __u8 socket_only, char *buf, __u64 size, __u64 iovlen) {
     __u32 zero = 0;
-    struct l7_write_args *a = bpf_map_lookup_elem(&l7_write_args_heap, &zero);
+    struct l7_write_args *a = scratch_lookup(&l7_write_args_heap);
     if (!a) {
         return 0;
     }
@@ -527,7 +532,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
         bpf_map_delete_elem(&active_l7_requests, &k);
     }
 
-    struct l7_request *req = bpf_map_lookup_elem(&l7_request_heap, &zero);
+    struct l7_request *req = scratch_lookup(&l7_request_heap);
     if (!req) {
         return 0;
     }
@@ -546,7 +551,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
             if (conn->is_inbound) {
                 return 0;
             }
-            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            struct l7_event *e = scratch_lookup(&l7_event_heap);
             if (!e) {
                 return 0;
             }
@@ -566,7 +571,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
             if (conn->is_inbound) {
                 return 0;
             }
-            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            struct l7_event *e = scratch_lookup(&l7_event_heap);
             if (!e) {
                 return 0;
             }
@@ -581,7 +586,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
         req->protocol = PROTOCOL_MONGO;
     } else if (is_rabbitmq_method_frame(payload, size)) {
         if (!conn->is_inbound && rabbitmq_method_matches(payload, RABBITMQ_METHOD_PUBLISH)) {
-            struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+            struct l7_event *e = scratch_lookup(&l7_event_heap);
             if (!e) {
                 return 0;
             }
@@ -593,7 +598,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
         }
         return 0;
     } else if (!conn->is_inbound && nats_method(payload, size) == METHOD_PRODUCE) {
-        struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+        struct l7_event *e = scratch_lookup(&l7_event_heap);
         if (!e) {
             return 0;
         }
@@ -697,7 +702,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, 
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (!conn) {
         struct connection new_conn = {};
-        new_conn.timestamp = bpf_ktime_get_ns();
+        new_conn.timestamp = conn_timestamp(cid.pid, cid.fd);
         new_conn.is_inbound = 1;
         /* BPF_ANY: see the matching fallback in trace_enter_write for why
            BPF_NOEXIST here can hand back a stale, unrelated connection's
@@ -708,11 +713,14 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, 
             return 0;
         }
     }
+    if (!conn->is_inbound && !conn->open_sent && conn->skaddr) {
+        emit_connection_open_lazy(&cid, conn);
+    }
     __u64 total_size = ret;
     int zero = 0;
     char* payload = args->buf;
     if (args->iovlen) {
-        payload = bpf_map_lookup_elem(&iovec_buf_heap, &zero);
+        payload = scratch_lookup(&iovec_buf_heap);
         if (!payload) {
             return 0;
         }
@@ -765,7 +773,7 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
 
     int zero = 0;
     struct l7_request_key k = {.pid = cid.pid, .fd = cid.fd, .is_tls = is_tls, .stream_id = -1};
-    struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
+    struct l7_event *e = scratch_lookup(&l7_event_heap);
     if (!e) {
         return 0;
     }
@@ -961,9 +969,9 @@ struct mmsghdr {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
     __type(value, struct mmsghdr);
 } sendmmsg_hdr SEC(".maps");
 
@@ -977,7 +985,7 @@ static long sendmmsg_cb(__u32 i, void *ctx) {
     if (!it || i >= it->vlen) {
         return 1;
     }
-    h = bpf_map_lookup_elem(&sendmmsg_hdr, &zero);
+    h = scratch_lookup(&sendmmsg_hdr);
     if (!h) {
         return 1;
     }

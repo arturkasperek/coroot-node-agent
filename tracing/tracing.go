@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-node-agent/api"
@@ -24,6 +25,35 @@ import (
 const (
 	MemcacheDBItemKeyName attribute.Key = "db.memcached.item"
 )
+
+// Span accounting. spansCreated counts spans handed to the SDK (End called);
+// spansExported/spansExportFailed count what the OTLP exporter actually sent
+// or failed to send. The SDK's BatchSpanProcessor silently drops a span when
+// its queue is full (it only logs that at debug level), so created minus
+// (exported + failed), once the pipeline has drained, is exactly the number
+// of spans lost between the agent's parser and the collector.
+var (
+	spansCreated      atomic.Uint64
+	spansExported     atomic.Uint64
+	spansExportFailed atomic.Uint64
+)
+
+// Stats returns the span counters described above.
+func Stats() (created, exported, failed uint64) {
+	return spansCreated.Load(), spansExported.Load(), spansExportFailed.Load()
+}
+
+type countingExporter struct{ sdktrace.SpanExporter }
+
+func (e countingExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	err := e.SpanExporter.ExportSpans(ctx, spans)
+	if err != nil {
+		spansExportFailed.Add(uint64(len(spans)))
+	} else {
+		spansExported.Add(uint64(len(spans)))
+	}
+	return err
+}
 
 var (
 	batcher             sdktrace.TracerProviderOption
@@ -68,7 +98,7 @@ func Init(machineId, hostname, version string) {
 		klog.Exitln(err)
 	}
 
-	batcher = sdktrace.WithBatcher(exporter)
+	batcher = sdktrace.WithBatcher(countingExporter{exporter})
 	commonResourceAttrs = []attribute.KeyValue{semconv.HostName(hostname), semconv.HostID(machineId)}
 	agentVersion = version
 	initialized = true
@@ -138,6 +168,7 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 		span.SetStatus(codes.Error, "")
 	}
 	span.End(trace.WithTimestamp(end))
+	spansCreated.Add(1)
 }
 
 func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration) {

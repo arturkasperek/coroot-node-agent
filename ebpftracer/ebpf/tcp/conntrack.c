@@ -37,9 +37,23 @@ struct ipPort {
     __u16 port;
 };
 
+/* Keyed by the connection's source AND the destination it was aimed at (the
+   pre-NAT one), not by the source alone: the kernel happily hands out the
+   same ephemeral source port for connections to different destinations, so
+   a source-only key let one connection's entry overwrite another's, and a
+   connection was then reported (and its requests attributed) with someone
+   else's actual destination. */
+struct connPair {
+    __u8 src_ip[16];
+    __u8 dst_ip[16];
+    __u16 src_port;
+    __u16 dst_port;
+    __u32 pad;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(key_size, sizeof(struct ipPort));
+    __uint(key_size, sizeof(struct connPair));
     __uint(value_size, sizeof(struct ipPort));
     __uint(max_entries, 10240);
 } actual_destinations SEC(".maps");
@@ -53,21 +67,26 @@ int handle_ct(struct pt_regs *ctx, struct nf_conn conn)
     if (repl.dst.protonum != IPPROTO_TCP) {
         return 0;
     }
-    struct ipPort src = {};
+    struct connPair src = {};
     struct ipPort actualDst = {};
     if (repl.src.l3num == AF_INET) {
-        src.ip[10] = 0xff;
-        src.ip[11] = 0xff;
-        __builtin_memcpy(&src.ip[12], &repl.dst.addr.ip, 4);
+        src.src_ip[10] = 0xff;
+        src.src_ip[11] = 0xff;
+        __builtin_memcpy(&src.src_ip[12], &repl.dst.addr.ip, 4);
+        src.dst_ip[10] = 0xff;
+        src.dst_ip[11] = 0xff;
+        __builtin_memcpy(&src.dst_ip[12], &orig.dst.addr.ip, 4);
 
         actualDst.ip[10] = 0xff;
         actualDst.ip[11] = 0xff;
         __builtin_memcpy(&actualDst.ip[12], &repl.src.addr.ip, 4);
     } else if (repl.src.l3num == AF_INET6) {
-        __builtin_memcpy(&src.ip, &repl.dst.addr.ip, 16);
+        __builtin_memcpy(&src.src_ip, &repl.dst.addr.ip, 16);
+        __builtin_memcpy(&src.dst_ip, &orig.dst.addr.ip, 16);
         __builtin_memcpy(&actualDst.ip, &repl.src.addr.ip, 16);
     }
-    src.port = bpf_ntohs(repl.dst.port);
+    src.src_port = bpf_ntohs(repl.dst.port);
+    src.dst_port = bpf_ntohs(orig.dst.port);
     actualDst.port = bpf_ntohs(repl.src.port);
     bpf_map_update_elem(&actual_destinations, &src, &actualDst, BPF_ANY);
     return 0;

@@ -36,6 +36,11 @@ echo "[run-agent] starting coroot-node-agent"
 # cycle can finish well inside that window, so the h1-tls targets'
 # SSL_write/SSL_read uprobes (see attachTlsUprobes in containers/
 # container.go) would never get attached in time otherwise.
+# --log-per-second/--log-burst: the agent rate-limits its own log to 10 lines
+# a second (burst 100) by default. Anything this suite greps the log for —
+# the TLS-uprobe attach confirmation, per-connection diagnostics — is
+# silently truncated to that budget, and a missing line then reads as "it
+# never happened". Effectively unlimited here so the log can be trusted.
 AGENT_LOG=/tmp/agent.log
 coroot-node-agent \
   --listen=0.0.0.0:10300 \
@@ -45,6 +50,8 @@ coroot-node-agent \
   --scrape-interval=5s \
   --min-container-age=0s \
   --instrumentation-delay=0s \
+  --log-per-second=1000000 \
+  --log-burst=10000000 \
   > "${AGENT_LOG}" 2>&1 &
 AGENT_PID=$!
 # The agent's own log goes to AGENT_LOG only (not streamed live): the TLS
@@ -184,7 +191,7 @@ sleep 5
 curl -s -m 5 -X POST "http://${MOCKBACKEND_ADDR}/api/reset" -o /dev/null || true
 
 echo "[run-agent] agent health counters (before load):"
-curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_lost_samples_total\|node_l7_http1_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
+curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
 
 echo "[run-agent] generating load: ${N_REQUESTS} requests/target, targets=${TARGETS}"
 if ! loadgen -n "${N_REQUESTS}" -concurrency "${CONCURRENCY}" -targets "${TARGETS}" -manifest "${MANIFEST}"; then
@@ -196,7 +203,7 @@ echo "[run-agent] waiting ${FLUSH_SECONDS}s for the OTLP batch exporter to flush
 sleep "${FLUSH_SECONDS}"
 
 echo "[run-agent] agent health counters (after load):"
-curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_lost_samples_total\|node_l7_http1_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
+curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
 
 # Dump the agent's own warnings/errors (deduplicated, pids/ids masked so
 # repeats collapse) — the single most useful thing to have when a run

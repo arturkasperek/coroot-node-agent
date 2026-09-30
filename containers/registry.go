@@ -20,6 +20,7 @@ import (
 	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/metrics"
 	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/coroot/coroot-node-agent/tracing"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
 	"inet.af/netaddr"
@@ -204,6 +205,12 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.EbpfLostSamples
 	ch <- metrics.L7PayloadsTruncated
 	ch <- metrics.GoTlsUprobeAttachFailures
+	ch <- metrics.EbpfProgramRecursionMisses
+	ch <- metrics.EbpfUserMemoryReadFailures
+	ch <- metrics.EbpfUserMemoryReadsRescued
+	ch <- metrics.TracesSpansCreated
+	ch <- metrics.TracesSpansExported
+	ch <- metrics.TracesSpansExportFailed
 	ch <- metrics.Http1EventsSeen
 	ch <- metrics.Http1DroppedNoConnection
 	ch <- metrics.Http1DroppedTsMismatch
@@ -218,6 +225,10 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
+	created, exported, failed := tracing.Stats()
+	ch <- metrics.Counter(metrics.TracesSpansCreated, float64(created))
+	ch <- metrics.Counter(metrics.TracesSpansExported, float64(exported))
+	ch <- metrics.Counter(metrics.TracesSpansExportFailed, float64(failed))
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	for ip, domain := range r.ip2fqdn {
@@ -229,6 +240,14 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 		ch <- metrics.Counter(metrics.EbpfLostSamples, float64(r.tracer.LostSamples()))
 		ch <- metrics.Counter(metrics.L7PayloadsTruncated, float64(r.tracer.TruncatedPayloads()))
 		ch <- metrics.Counter(metrics.GoTlsUprobeAttachFailures, float64(r.tracer.GoTlsAttachFailures()))
+		for prog, n := range r.tracer.ProgramRecursionMisses() {
+			ch <- metrics.Counter(metrics.EbpfProgramRecursionMisses, float64(n), prog)
+		}
+		failed, rescued := r.tracer.UserMemoryReads()
+		for stage, n := range failed {
+			ch <- metrics.Counter(metrics.EbpfUserMemoryReadFailures, float64(n), stage)
+		}
+		ch <- metrics.Counter(metrics.EbpfUserMemoryReadsRescued, float64(rescued))
 	}
 	ch <- metrics.Counter(metrics.Http1EventsSeen, float64(r.http1EventsSeen.Load()))
 	ch <- metrics.Counter(metrics.Http1DroppedNoConnection, float64(r.http1DroppedNoConnection.Load()))

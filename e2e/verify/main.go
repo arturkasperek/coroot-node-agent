@@ -23,9 +23,11 @@ type outcome struct {
 	Path   string `json:"path"`
 	Status int    `json:"status"`
 	Count  int64  `json:"count"`
+	IDs    []int  `json:"ids,omitempty"`
 }
 
 type manifestEntry struct {
+	Run      string    `json:"run,omitempty"`
 	Target   string    `json:"target"`
 	BaseURL  string    `json:"base_url"`
 	Proto    string    `json:"proto"`
@@ -119,6 +121,10 @@ func main() {
 
 		// counts[method|path|status] = how many spans matched this bucket
 		matched := map[string]int64{}
+		// matchedIDs[bucket][n] = request n of THIS loadgen run has a span.
+		// Spans from other traffic (warmup, probes) carry another r= or none,
+		// so they can neither be counted nor mask a missing request.
+		matchedIDs := map[string]map[int]bool{}
 		for _, sp := range spans {
 			u := sp.Attributes["http.url"]
 			if !strings.Contains(u, hp) {
@@ -135,6 +141,14 @@ func main() {
 			}
 			key := sp.Name + "|" + path + "|" + status
 			matched[key]++
+			if q, err := url.Parse(u); err == nil && entry.Run != "" && q.Query().Get("r") == entry.Run {
+				if n, err := strconv.Atoi(q.Query().Get("n")); err == nil {
+					if matchedIDs[key] == nil {
+						matchedIDs[key] = map[int]bool{}
+					}
+					matchedIDs[key][n] = true
+				}
+			}
 		}
 
 		var wantTotal, gotTotal int64
@@ -145,6 +159,14 @@ func main() {
 			// spans in one (method, path, status) bucket must not be able
 			// to make up for missing ones in another.
 			got := matched[key]
+			if len(oc.IDs) > 0 {
+				got = 0
+				for _, id := range oc.IDs {
+					if matchedIDs[key][id] {
+						got++
+					}
+				}
+			}
 			if got > oc.Count {
 				got = oc.Count
 			}
@@ -169,7 +191,17 @@ func main() {
 		if status == "FAIL" || gotTotal < wantTotal {
 			for _, oc := range entry.Outcomes {
 				key := oc.Method + "|" + oc.Path + "|" + strconv.Itoa(oc.Status)
-				fmt.Printf("         %-6s %-6s -> %d sent, %d recorded\n", oc.Method, oc.Path, oc.Count, matched[key])
+				line := fmt.Sprintf("         %-6s %-6s -> %d sent, %d recorded", oc.Method, oc.Path, oc.Count, matched[key])
+				var missing []int
+				for _, id := range oc.IDs {
+					if !matchedIDs[key][id] {
+						missing = append(missing, id)
+					}
+				}
+				if len(missing) > 0 {
+					line += fmt.Sprintf("   MISSING n=%v", missing)
+				}
+				fmt.Println(line)
 			}
 		}
 	}
