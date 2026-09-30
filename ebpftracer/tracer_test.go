@@ -509,6 +509,17 @@ func http1Headers(padLen int) []byte {
 	return append(buf, []byte("\r\n\r\n")...)
 }
 
+// http1HeadersWithBody is http1Headers for a request that is followed by
+// bodyLen bytes of body. The Content-Length is what makes those bytes a
+// body: a request without Content-Length (or chunked) has, per RFC 7230
+// 3.3.2, no body at all, and the walker then reads whatever follows as the
+// next request's headers, not as DATA.
+func http1HeadersWithBody(padLen, bodyLen int) []byte {
+	head := []byte(fmt.Sprintf("GET /test HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\nX-Pad: ", bodyLen))
+	buf := append(head, bytes.Repeat([]byte{0xab}, padLen)...)
+	return append(buf, []byte("\r\n\r\n")...)
+}
+
 // TestHttp1HeadersSplitAcrossSyscalls checks that a write() boundary cutting
 // the headers block (well before "\r\n\r\n") doesn't lose any header bytes —
 // the HTTP1 analogue of TestHttp2WriteHeaderSplitMidHeaderTopsUpOnNextWrite,
@@ -560,7 +571,7 @@ func TestHttp1HeadersDelimiterSplitAcrossSyscalls(t *testing.T) {
 
 	const padLen = 50
 	const bodyLen = 200
-	headers := http1Headers(padLen)
+	headers := http1HeadersWithBody(padLen, bodyLen)
 	split := len(headers) - 1
 	_, err = conn.Write(headers[:split])
 	require.NoError(t, err)
@@ -593,7 +604,7 @@ func TestHttp1HeadersOver4KBTruncated(t *testing.T) {
 
 	const padLen = 5000 // > Http1CaptureMax
 	const bodyLen = 100
-	headers := http1Headers(padLen)
+	headers := http1HeadersWithBody(padLen, bodyLen)
 	_, err = conn.Write(headers)
 	require.NoError(t, err)
 	_, err = conn.Write(bytes.Repeat([]byte{0xcd}, bodyLen))
@@ -601,7 +612,7 @@ func TestHttp1HeadersOver4KBTruncated(t *testing.T) {
 
 	// The cap is on total header bytes, not just the marker padding — the
 	// request-line/Host/X-Pad prefix before the padding counts against it too.
-	prefixLen := len(http1Headers(0)) - len("\r\n\r\n")
+	prefixLen := len(http1HeadersWithBody(0, bodyLen)) - len("\r\n\r\n")
 	wantMarkers := Http1CaptureMax - prefixLen
 
 	pid := uint32(os.Getpid())
@@ -625,10 +636,10 @@ func TestHttp1DataSplitAcrossSyscalls(t *testing.T) {
 	watchConn(t, conn)
 	defer conn.Close()
 
-	_, err = conn.Write(http1Headers(10))
+	const bodyLen = 500
+	_, err = conn.Write(http1HeadersWithBody(10, bodyLen))
 	require.NoError(t, err)
 
-	const bodyLen = 500
 	body := bytes.Repeat([]byte{0xcd}, bodyLen)
 	_, err = conn.Write(body[:bodyLen/2])
 	require.NoError(t, err)
@@ -654,10 +665,10 @@ func TestHttp1DataOver4KBCapped(t *testing.T) {
 	watchConn(t, conn)
 	defer conn.Close()
 
-	_, err = conn.Write(http1Headers(10))
+	const bodyLen = 5000 // > Http1CaptureMax
+	_, err = conn.Write(http1HeadersWithBody(10, bodyLen))
 	require.NoError(t, err)
 
-	const bodyLen = 5000 // > Http1CaptureMax
 	_, err = conn.Write(bytes.Repeat([]byte{0xcd}, bodyLen))
 	require.NoError(t, err)
 

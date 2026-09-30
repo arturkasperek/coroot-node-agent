@@ -299,6 +299,9 @@ func (t *Tracer) UserMemoryReads() (failed map[string]uint64, rescued uint64) {
 	failed["payload_copy"] = sum(1)
 	failed["tls_fd"] = sum(2)
 	failed["protocol_sniff"] = sum(6)
+	failed["tls_buf_zero_at_exit"] = sum(4)
+	failed["tls_buf_zero_recovered"] = sum(5)
+	failed["tls_buf_zero_persisted"] = sum(7)
 	return failed, sum(3)
 }
 

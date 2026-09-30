@@ -50,7 +50,7 @@ func TestParseL7EventHeaderSize(t *testing.T) {
 }
 
 func TestConnectionMapValueSize(t *testing.T) {
-	require.Equal(t, 48, binary.Size(Connection{}))
+	require.Equal(t, 56, binary.Size(Connection{}))
 }
 
 func TestParseL7EventVariableRecord(t *testing.T) {

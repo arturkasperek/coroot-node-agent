@@ -69,5 +69,21 @@ int go_crypto_tls_read_exit(struct pt_regs *ctx) {
     __u64 goroutine_id = GOROUTINE(ctx);
     __u64 id = pid << 32 | goroutine_id | IS_TLS_READ_ID;
     long int ret = GO_PARAM1(ctx);
+    struct read_args *ra = bpf_map_lookup_elem(&active_reads, &id);
+    if (ra && ret >= 8 && !ra->iovlen) {
+        /* Diagnostic + mitigation: is the decrypted buffer still zero right
+           after Read returned? (4 = it was, 5 = data appeared while waiting,
+           7 = it stayed zero) */
+        __u64 first = 1;
+        __u64 addr = (__u64)ra->buf;
+        if (!bpf_probe_read(&first, sizeof(first), ra->buf) && first == 0) {
+            count_src_fail(4);
+            if (tls_buf_wait_nonzero(addr)) {
+                count_src_fail(5);
+            } else {
+                count_src_fail(7);
+            }
+        }
+    }
     return trace_exit_read(ctx, id, pid, 1, ret, &http2_tail_progs_kprobe);
 }

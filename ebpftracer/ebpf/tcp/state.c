@@ -92,6 +92,22 @@ long probe_read_retry(void *dst, __u32 size, const void *src) {
     return r;
 }
 
+/* Wait (bounded) until the first 8 bytes at addr are not all zero. Used on a
+   decrypted TLS read buffer that is still zero right after the Read returned
+   n > 0. Global with a plain-number argument, so the loop is verified once.
+   Returns 1 if data appeared, 0 if it stayed zero (or unreadable). */
+__attribute__((noinline))
+long tls_buf_wait_nonzero(__u64 addr) {
+    __u64 first = 0;
+#pragma nounroll
+    for (int i = 0; i < 2048; i++) {
+        if (!bpf_probe_read(&first, sizeof(first), (const void *)addr) && first) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Argument block of sniff_read16: plain numbers only, which is the one shape
    the verifier accepts as the argument of a global function. `addr` carries
    the user pointer as a number (storing it here launders its type). */
