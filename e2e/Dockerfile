@@ -34,7 +34,7 @@ RUN mkdir -p /out/java-classes && \
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl bash \
+        ca-certificates curl bash bpftool \
         nodejs npm \
         python3 \
         php-cli \

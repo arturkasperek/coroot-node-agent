@@ -53,6 +53,40 @@ same cost is a few percent. The cost is per request, not per byte: it comes from
 the syscall hooks and the frame/HTTP walk that run on the request path (one on
 the write, one on the read).
 
+## Memory
+
+The run also prints the agent's memory twice (idle before the benchmark, and
+after it): the process (`VmRSS` split into `RssAnon` and `RssFile`) and the
+kernel memory pinned by the BPF maps and programs it loaded (`bytes_memlock`
+from `bpftool`, taken as everything that did not exist before the agent
+started). One measurement on the test host:
+
+| | size | notes |
+|---|---|---|
+| Process, anonymous memory | ~73 MB | after startup settles; the startup peak was 470-860 MB (`VmHWM`) |
+| Process, file-backed pages (`RssFile`) | ~391 MB | the binary, libraries and mapped files; clean pages, reclaimable, shared |
+| BPF maps, pinned kernel memory | **465 MB** | 61 maps |
+| BPF programs | 1.3 MB | 64 programs |
+
+So "RSS 520 MB" is mostly file-backed pages and says little. The memory the agent
+really owns is roughly 75 MB in the process plus 465 MB in the kernel, and almost
+all of the kernel part is a handful of maps that are sized for the worst case and
+allocated up front:
+
+| map | type | pinned | max_entries |
+|---|---|---|---|
+| `active_connections` | LRU hash | 137 MB | 1,000,000 |
+| `l7_events` | ring buffer | 135 MB | 128 MiB |
+| `connection_id_by_socket` | LRU hash | 89 MB | 1,000,000 |
+| `active_l7_requests` | LRU hash | 37 MB | 32,768 |
+| `stacks` | stack trace | 17 MB | 16,384 |
+| `tcp_connect_events` | ring buffer | 17 MB | 16 MiB |
+
+None of this grows with load in the benchmark (the numbers before and after were
+identical). To cut it, lower `MAX_CONNECTIONS` (`ebpf/tcp/state.c`) and the
+`l7_events` size; both trade memory for headroom on a busy node (a full ring
+buffer drops events, an over-full LRU map evicts live connections).
+
 ## Caveats
 
 - One host, one run, no pinning of CPUs; use it to compare before and after a

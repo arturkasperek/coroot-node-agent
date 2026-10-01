@@ -26,6 +26,38 @@ cpu_ticks() { # utime+stime of a pid, in clock ticks
   awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0
 }
 
+# Memory of the agent: its own process (RSS, split into anonymous, file-backed
+# and shared pages) plus the kernel memory its BPF maps and programs pin, which
+# is not part of any process's RSS.
+mem_report() { # mem_report <label>
+  local label="$1"
+  echo "[latency] memory (${label}):"
+  awk '/^(VmRSS|RssAnon|RssFile|RssShmem|VmHWM):/{printf "  %-9s %8.1f MB\n", $1, $2/1024}' "/proc/${AGENT_PID}/status"
+  # The BPF objects the agent loaded are the ones that did not exist before it
+  # started (ids recorded in ${OUT}/bpf_ids_before.json).
+  { bpftool map show -j; echo; bpftool prog show -j; echo; cat "${OUT}/bpf_ids_before.json"; } 2>/dev/null | python3 -c '
+import json, sys
+dec = json.JSONDecoder()
+text = sys.stdin.read()
+docs, i = [], 0
+while i < len(text):
+    while i < len(text) and text[i] in " \n\r\t":
+        i += 1
+    if i >= len(text):
+        break
+    obj, i = dec.raw_decode(text, i)
+    docs.append(obj)
+maps, progs, before = docs[0], docs[1], docs[2]
+mm = [m for m in maps if m["id"] not in set(before["maps"])]
+pp = [p for p in progs if p["id"] not in set(before["progs"])]
+msum = sum(m.get("bytes_memlock", 0) for m in mm)
+psum = sum(p.get("bytes_memlock", 0) for p in pp)
+print("  kernel: %d BPF maps pin %.1f MB, %d programs pin %.1f MB (bytes_memlock)" % (len(mm), msum/1e6, len(pp), psum/1e6))
+for m in sorted(mm, key=lambda m: -m.get("bytes_memlock", 0))[:8]:
+    print("    %-24s %-18s %8.2f MB  max_entries=%s" % (m.get("name", "?"), m.get("type", "?"), m.get("bytes_memlock", 0)/1e6, m.get("max_entries", "?")))
+'
+}
+
 echo "[latency] ${ROUNDS} rounds per phase, $((TOTAL_BYTES / 1024 / 1024)) MB per case in ${BODY_BYTES}-byte requests, concurrency ${LAT_CONCURRENCY}"
 
 # Phase 1: no agent. One unmeasured pass first so connection pools, JITs and
@@ -38,6 +70,11 @@ for r in $(seq "${ROUNDS}"); do
 done
 
 # Phase 2: with the agent.
+python3 -c '
+import json, subprocess
+ids = lambda what: [o["id"] for o in json.loads(subprocess.check_output(["bpftool", what, "show", "-j"]))]
+print(json.dumps({"maps": ids("map"), "progs": ids("prog")}))
+' > "${OUT}/bpf_ids_before.json" 2>/dev/null || echo '{"maps": [], "progs": []}' > "${OUT}/bpf_ids_before.json"
 echo "[latency] starting mockbackend and coroot-node-agent"
 mockbackend -addr "${MOCKBACKEND_ADDR}" &
 MOCKBACKEND_PID=$!
@@ -102,6 +139,7 @@ sleep 5
 curl -s -m 5 -X POST "http://${MOCKBACKEND_ADDR}/api/reset" -o /dev/null || true
 
 echo "[latency] phase 2: with the agent"
+mem_report "agent idle, before the benchmark"
 bench "${OUT}/discard.json" -total-bytes 524288 >/dev/null
 TICKS_PER_SEC="$(getconf CLK_TCK)"
 t0_ticks="$(cpu_ticks "${AGENT_PID}")"
@@ -112,6 +150,7 @@ for r in $(seq "${ROUNDS}"); do
 done
 t1_ticks="$(cpu_ticks "${AGENT_PID}")"
 t1_wall="${SECONDS}"
+mem_report "after the benchmark"
 
 sleep 20 # let the exporter flush before counting spans
 spans="$(curl -s -m 10 "http://${MOCKBACKEND_ADDR}/api/spans" | grep -o '"http.url"' | wc -l)"
