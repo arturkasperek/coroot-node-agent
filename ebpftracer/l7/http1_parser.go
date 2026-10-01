@@ -59,10 +59,25 @@ func NewHttp1Parser() *Http1Parser {
 	return &Http1Parser{}
 }
 
+// trimLeadingCRLF drops empty lines before the start line of a header block.
+// RFC 7230 3.5 has a recipient ignore at least one empty line before a
+// request line, and the end of a chunked body leaves one behind: the "\r\n"
+// that closes an empty trailer section.
+func trimLeadingCRLF(b []byte) []byte {
+	for len(b) >= 2 && b[0] == '\r' && b[1] == '\n' {
+		b = b[2:]
+	}
+	return b
+}
+
 func (p *Http1Parser) Parse(method Method, payload []byte, kernelTime uint64) []Http1Request {
 	switch method {
 	case MethodHttpClientHeaders:
 		if len(p.clientBuf) == 0 {
+			payload = trimLeadingCRLF(payload)
+			if len(payload) == 0 {
+				return nil
+			}
 			p.clientBufStart = kernelTime
 		}
 		p.clientBuf = append(p.clientBuf, payload...)
@@ -73,6 +88,12 @@ func (p *Http1Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 			p.clientBuf = nil
 		}
 	case MethodHttpServerHeaders:
+		if len(p.serverBuf) == 0 {
+			payload = trimLeadingCRLF(payload)
+			if len(payload) == 0 {
+				return nil
+			}
+		}
 		p.serverBuf = append(p.serverBuf, payload...)
 		if bytes.HasSuffix(p.serverBuf, http1HeaderEnd) || len(p.serverBuf) >= http1CaptureMax {
 			status, ok := parseHttp1StatusLine(p.serverBuf)

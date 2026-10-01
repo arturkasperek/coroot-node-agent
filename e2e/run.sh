@@ -93,17 +93,38 @@ if [ "${EDGE:-0}" = "1" ]; then
   TARGETS="${TARGETS},edge|h1-edge|http://svc-go:8081"
 fi
 
+# LATENCY=1: measure request latency with and without the agent instead of
+# checking trace completeness (see e2e/run-latency.sh, e2e/latency/main.go).
+# Every case POSTs the same amount of data to /echo; the protos are h1 (new
+# connection per request), h1-ka (reused connection), h1-tls, h1-tls-ka and
+# h2c.
+ROLE=agent-orchestrator
+LAT_TARGETS=""
+if [ "${LATENCY:-0}" = "1" ]; then
+  ROLE=latency-orchestrator
+  LAT_TARGETS="go-h1|h1|http://svc-go:8081,go-h1-ka|h1-ka|http://svc-go:8081,go-h2c|h2c|http://svc-go:8082"
+  LAT_TARGETS="${LAT_TARGETS},node-h1|h1|http://svc-node:8081,node-h1-ka|h1-ka|http://svc-node:8081,node-h2c|h2c|http://svc-node:8082"
+  LAT_TARGETS="${LAT_TARGETS},node-tls|h1-tls|https://svc-node:8443,node-tls-ka|h1-tls-ka|https://svc-node:8443"
+  LAT_TARGETS="${LAT_TARGETS},python-h1|h1|http://svc-python:8081,python-h1-ka|h1-ka|http://svc-python:8081"
+  LAT_TARGETS="${LAT_TARGETS},python-tls|h1-tls|https://svc-python:8443,python-tls-ka|h1-tls-ka|https://svc-python:8443"
+  LAT_TARGETS="${LAT_TARGETS},php-h1|h1|http://svc-php:8081,java-h1|h1|http://svc-java:8081,java-h1-ka|h1-ka|http://svc-java:8081"
+fi
+
 # ONLY=name1,name2 restricts the measured load to those targets (services all
-# still start).
-if [ -n "${ONLY:-}" ]; then
-  filtered=""
-  IFS=',' read -ra _all <<< "${TARGETS}"
+# still start). Applies to the latency cases too.
+filter_only() {
+  local spec="$1" filtered="" t o
+  IFS=',' read -ra _all <<< "${spec}"
   for t in "${_all[@]}"; do
     for o in ${ONLY//,/ }; do
       [ "${t%%|*}" = "$o" ] && filtered="${filtered:+${filtered},}${t}"
     done
   done
-  TARGETS="${filtered}"
+  echo "${filtered}"
+}
+if [ -n "${ONLY:-}" ]; then
+  TARGETS="$(filter_only "${TARGETS}")"
+  [ -n "${LAT_TARGETS}" ] && LAT_TARGETS="$(filter_only "${LAT_TARGETS}")"
 fi
 
 echo "[run.sh] running agent + load + verify"
@@ -127,8 +148,13 @@ docker run --name coroot-e2e-agent \
   -e N_REQUESTS="${N_REQUESTS}" \
   -e CONCURRENCY="${CONCURRENCY:-20}" \
   -e STRESS="${STRESS:-0}" \
+  -e LAT_TARGETS="${LAT_TARGETS}" \
+  -e ROUNDS="${ROUNDS:-3}" \
+  -e TOTAL_BYTES="${TOTAL_BYTES:-10485760}" \
+  -e BODY_BYTES="${BODY_BYTES:-10240}" \
+  -e LAT_CONCURRENCY="${LAT_CONCURRENCY:-1}" \
   -e STRESS_SLICE_MS="${STRESS_SLICE_MS:-1}" \
-  "${IMAGE}" agent-orchestrator
+  "${IMAGE}" "${ROLE}"
 RC=$?
 
 if [ "$RC" -eq 0 ]; then

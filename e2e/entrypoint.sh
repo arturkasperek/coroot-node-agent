@@ -30,8 +30,11 @@ case "$role" in
   agent-orchestrator)
     exec run-agent.sh "$@"
     ;;
+  latency-orchestrator)
+    exec run-latency.sh "$@"
+    ;;
   *)
-    echo "unknown role: $role (expected go-service|node-service|node-keepalive-service|python-service|php-service|java-service|agent-orchestrator)" >&2
+    echo "unknown role: $role (expected go-service|node-service|node-keepalive-service|python-service|php-service|java-service|agent-orchestrator|latency-orchestrator)" >&2
     exit 2
     ;;
 esac

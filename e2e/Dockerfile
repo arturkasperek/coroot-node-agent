@@ -28,7 +28,8 @@ RUN mkdir -p /out/java-classes && \
     go build -o /out/go-service ./e2e/services/go && \
     go build -o /out/mockbackend ./e2e/mockbackend && \
     go build -o /out/loadgen ./e2e/loadgen && \
-    go build -o /out/verify ./e2e/verify
+    go build -o /out/verify ./e2e/verify && \
+    go build -o /out/latbench ./e2e/latency
 
 FROM debian:bookworm-slim
 
@@ -43,8 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /out/ /usr/local/bin/
 COPY --from=build /repo/e2e/services /e2e/services
 COPY --from=build /repo/e2e/certs /e2e/certs
-COPY e2e/entrypoint.sh e2e/run-agent.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/run-agent.sh && \
+COPY e2e/entrypoint.sh e2e/run-agent.sh e2e/run-latency.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/run-agent.sh /usr/local/bin/run-latency.sh && \
     javac -encoding UTF-8 -d /usr/local/bin/java-classes /e2e/services/java/Server.java
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

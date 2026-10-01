@@ -6,7 +6,7 @@ measured, what is already ruled out, and where to start.
 
 | File | Problem | Size of the loss |
 |---|---|---|
-| [tls-residual-loss.md](tls-residual-loss.md) | A few TLS requests never become spans | ~1-2 per 8000 |
+| [tls-residual-loss.md](tls-residual-loss.md) | A few TLS requests never become spans | ~1-2 per 8000; 1.4% on node-tls with a new connection per request |
 | [keepalive-rare-loss-under-cpu-stress.md](keepalive-rare-loss-under-cpu-stress.md) | Keep-alive HTTP/1 loses a request at 99% CPU | 2 per 4000, once |
 | [write-retry-dedup-gaps.md](write-retry-dedup-gaps.md) | Retried writes still counted twice on some paths | not measured |
 | [http1-pipelining-depth.md](http1-pipelining-depth.md) | Deep HTTP/1 pipelining loses the tail of a buffer | by design, ~12-14 |
@@ -29,6 +29,7 @@ Useful knobs (all environment variables of `e2e/run.sh`):
   burner per core, busy and asleep in alternating slices of `STRESS_SLICE_MS`
   (default 1 ms), for about half the CPU; `STRESS=mem` memory churn plus forced compaction; `STRESS=1` both
   cpu and mem.
+- `make docker-test-latency` measures the agent's latency cost (see [../latency-benchmark.md](../latency-benchmark.md)).
 - `EDGE=1 ONLY=edge` HTTP/1 traffic at the edge of the capture (see
   `e2e/loadgen/edge.go`).
 

@@ -72,3 +72,13 @@ docker-test:
 .PHONY: docker-test-e2e
 docker-test-e2e:
 	bash e2e/run.sh
+
+# Latency of the example services with and without the agent: the same amount
+# of data (TOTAL_BYTES, default 10 MB) goes through every case (HTTP/1 with and
+# without keep-alive, with and without TLS, h2c, on go/node/python/php/java).
+# Prints p50/p99/mean off vs on and the agent's own CPU and memory. Knobs:
+# ROUNDS (3), TOTAL_BYTES, BODY_BYTES (10240), LAT_CONCURRENCY (1),
+# ONLY=go-h1,node-tls to run a few cases. See e2e/run-latency.sh.
+.PHONY: docker-test-latency
+docker-test-latency:
+	LATENCY=1 bash e2e/run.sh

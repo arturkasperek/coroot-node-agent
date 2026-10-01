@@ -4,6 +4,7 @@ package ebpftracer
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -4184,4 +4185,62 @@ func TestHttp2WriteRetriedAfterIncompleteWriteIsNotDuplicated(t *testing.T) {
 		got = append(got, e.L7Request.Payload...)
 	}
 	require.Equal(t, frames*payloadLen, bytes.Count(got, []byte{0xab}))
+}
+
+// Real Go server and client over one reused connection: a POST whose echo
+// comes back chunked (Go chunks anything the handler writes after WriteHeader
+// once it exceeds its small buffer). Every exchange must become a request,
+// not just every other one: the end of a chunked body used to reach the
+// userspace parser as a stray "\r\n" header event that spoiled the next
+// response's status line.
+func TestHttp1KeepAlivePostWithChunkedResponses(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	const requests = 5
+	body := bytes.Repeat([]byte{0xcd}, 3000)
+	client := &http.Client{Transport: &http.Transport{
+		MaxIdleConnsPerHost: 1,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err == nil {
+				watchConn(t, c)
+			}
+			return c, err
+		},
+	}}
+	for i := 0; i < requests; i++ {
+		resp, err := client.Post("http://"+ln.Addr().String()+"/echo", "application/octet-stream", bytes.NewReader(body))
+		require.NoError(t, err)
+		n, err := io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		require.NoError(t, err)
+		require.Equal(t, int64(len(body)), n)
+	}
+
+	// Feed the client's side of the connection to the real parser.
+	pid := uint32(os.Getpid())
+	parser := l7.NewHttp1Parser()
+	parsed := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for parsed < requests && time.Now().Before(deadline) {
+		e := getEvent()
+		if e == nil || e.Pid != pid || e.Type != EventTypeL7Request || e.L7Request == nil ||
+			e.L7Request.Protocol != l7.ProtocolHTTP || e.L7Request.IsInbound {
+			continue
+		}
+		parsed += len(parser.Parse(e.L7Request.Method, e.L7Request.Payload, uint64(e.L7Request.Duration)))
+	}
+	require.Equal(t, requests, parsed)
 }

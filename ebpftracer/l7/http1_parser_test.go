@@ -78,3 +78,23 @@ func TestHttp1ParserNoPendingRequestIsIgnored(t *testing.T) {
 	// must not panic or emit a bogus Http1Request.
 	require.Empty(t, p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\n\r\n"), 1))
 }
+
+// The end of a chunked body leaves an empty line that the kernel side used to
+// report as a header event of its own. It must not poison the next response on
+// the same connection.
+func TestHttp1ParserEmptyLineAfterChunkedResponse(t *testing.T) {
+	p := NewHttp1Parser()
+	for i := 0; i < 3; i++ {
+		require.Empty(t, p.Parse(MethodHttpClientHeaders, []byte("POST /echo HTTP/1.1\r\nHost: x\r\n\r\n"), uint64(10*i+1)))
+		got := p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"), uint64(10*i+5))
+		require.Len(t, got, 1, "exchange %d", i)
+		require.Equal(t, "/echo", got[0].Path)
+		require.Empty(t, p.Parse(MethodHttpServerHeaders, []byte("\r\n"), uint64(10*i+6)))
+	}
+	// An empty line before a request is ignored the same way.
+	require.Empty(t, p.Parse(MethodHttpClientHeaders, []byte("\r\n"), 100))
+	require.Empty(t, p.Parse(MethodHttpClientHeaders, []byte("GET /next HTTP/1.1\r\n\r\n"), 101))
+	got := p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 204 No Content\r\n\r\n"), 105)
+	require.Len(t, got, 1)
+	require.Equal(t, "/next", got[0].Path)
+}

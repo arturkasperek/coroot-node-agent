@@ -16,6 +16,12 @@ Measured: about 1 loss per 50k requests at the start of the investigation, still
 1-2 per 8000 later. Every other target (go/node/python/php/java h1, h2c,
 keep-alive) is at 1.00 without stress.
 
+A later latency run (`make docker-test-latency`, see ../latency-benchmark.md)
+showed a higher rate for one case: `node-tls` (a new TLS connection per request,
+10 KB echo body) produced 3275 spans for 3323 requests, 1.4%. The same case with
+a reused connection (`node-tls-ka`) lost 1 of 3323 and `python-tls` lost none.
+That is the best lead so far: fresh TLS connection per request on Node.
+
 ## What we know
 
 - The lost request is not mis-parsed: no span with that `n` exists in any bucket.
