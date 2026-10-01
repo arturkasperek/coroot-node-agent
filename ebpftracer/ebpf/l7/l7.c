@@ -367,6 +367,90 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
                     __u16 is_tls, char *payload, __u64 ret, __u64 total_size,
                     __u8 from_heap, void *tail_progs);
 
+/* A write() the kernel could not (fully) complete — EAGAIN on a full send
+   buffer, or a short write — is retried by the application with the very same
+   bytes. The tracepoint at syscall entry has already walked them once, so the
+   retry would feed the same HTTP frames to the agent a second time (a
+   duplicated HTTP/2 HEADERS block corrupts the HPACK dynamic table for every
+   later request on the connection). Entry records the call in last_write; the
+   exit tracepoints turn an incomplete one into a write_replay entry (the
+   not-yet-sent tail), and the next write on that connection skips it. */
+struct write_replay {
+    __u64 ptr;
+    __u64 len;
+    __u64 iovlen;
+    __u64 ts;
+    __u8 kind; /* 0: plain buffer, 1: iovec array (whole call retried) */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(struct connection_id));
+    __uint(value_size, sizeof(struct write_replay));
+    __uint(max_entries, 8192);
+} write_replay SEC(".maps");
+
+struct last_write {
+    struct connection_id cid;
+    __u64 ptr;
+    __u64 size;
+    __u64 iovlen;
+    __u8 valid;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct last_write);
+} last_write_map SEC(".maps");
+
+#define WRITE_REPLAY_MAX_AGE_NS (30ULL * 1000000000ULL)
+
+static __always_inline
+void l7_last_write_invalidate(void) {
+    struct last_write *lw = scratch_lookup(&last_write_map);
+    if (lw) {
+        lw->valid = 0;
+    }
+}
+
+static __always_inline
+int l7_write_exit(long ret) {
+    struct last_write *lw = scratch_lookup(&last_write_map);
+    struct write_replay rp = {};
+    __u64 size;
+    __u64 sent = 0;
+    if (!lw || !lw->valid) {
+        return 0;
+    }
+    lw->valid = 0;
+    size = lw->size;
+    if (ret > 0) {
+        sent = ret;
+    } else if (ret != -11) { /* anything but EAGAIN: the caller gives up */
+        return 0;
+    }
+    if (sent >= size) {
+        return 0;
+    }
+    rp.ts = bpf_ktime_get_ns();
+    if (lw->iovlen) {
+        if (sent) {
+            return 0;
+        }
+        rp.kind = 1;
+        rp.ptr = lw->ptr;
+        rp.iovlen = lw->iovlen;
+        rp.len = size;
+    } else {
+        rp.ptr = lw->ptr + sent;
+        rp.len = size - sent;
+    }
+    bpf_map_update_elem(&write_replay, &lw->cid, &rp, BPF_ANY);
+    return 0;
+}
+
 static inline __attribute__((__always_inline__))
 int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char *buf, __u64 size, __u64 iovlen, void *tail_progs) {
     __u64 id = bpf_get_current_pid_tgid();
@@ -418,6 +502,46 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
         emit_connection_open_lazy(&cid, conn);
     }
 
+    if (!is_tls && !plain_buf) {
+        struct write_replay *rp = bpf_map_lookup_elem(&write_replay, &cid);
+        struct last_write *lw = scratch_lookup(&last_write_map);
+        /* Recorded before any skipping below, with the buffer and size the
+           syscall was really given: its return value is relative to those, and
+           a retry of a retry must still find its replay entry. */
+        if (lw) {
+            lw->cid = cid;
+            lw->ptr = (__u64)buf;
+            lw->size = size;
+            lw->iovlen = iovlen;
+            lw->valid = 1;
+        }
+        if (rp) {
+            __u64 rptr = rp->ptr;
+            __u64 rlen = rp->len;
+            __u64 riov = rp->iovlen;
+            __u64 rts = rp->ts;
+            __u8 rkind = rp->kind;
+            bpf_map_delete_elem(&write_replay, &cid);
+            if (bpf_ktime_get_ns() - rts < WRITE_REPLAY_MAX_AGE_NS) {
+                if (!iovlen && !rkind && (__u64)buf == rptr) {
+                    count_src_fail(11);
+                    if (size <= rlen) {
+                        return 0;
+                    }
+                    buf += rlen;
+                    size -= rlen;
+                    total_size = size;
+                } else if (iovlen && rkind == 1 && (__u64)buf == rptr && iovlen == riov) {
+                    count_src_fail(11);
+                    if (lw) {
+                        lw->size = rlen;
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+
     char* payload = buf;
     if (iovlen && !plain_buf) {
         http2_load_iovecs(buf, iovlen, 0);
@@ -433,6 +557,12 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
         }
         total_size = 0;
         size = read_iovec(buf, iovlen, 0, payload, &total_size);
+        {
+            struct last_write *lw2 = scratch_lookup(&last_write_map);
+            if (lw2 && lw2->valid) {
+                lw2->size = total_size;
+            }
+        }
     }
     if (!size) {
         return 0;
@@ -935,6 +1065,7 @@ int ssl_check_read_exit(__u64 tid) {
 SEC("tracepoint/syscalls/sys_enter_write")
 int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
+    l7_last_write_invalidate();
     if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
         return 0;
     }
@@ -944,6 +1075,7 @@ int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_writev")
 int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
+    l7_last_write_invalidate();
     if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
         return 0;
     }
@@ -953,6 +1085,7 @@ int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_sendmsg")
 int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
+    l7_last_write_invalidate();
     if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
         return 0;
     }
@@ -1024,6 +1157,7 @@ int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
+    l7_last_write_invalidate();
     if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
         return 0;
     }
@@ -1047,6 +1181,26 @@ int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
 static __always_inline
 void l7_track_last_read_fd(__u64 tid, __u64 fd) {
     bpf_map_update_elem(&ssl_last_fd, &tid, &fd, BPF_ANY);
+}
+
+SEC("tracepoint/syscalls/sys_exit_write")
+int sys_exit_write(struct trace_event_raw_sys_exit__stub* ctx) {
+    return l7_write_exit(ctx->ret);
+}
+
+SEC("tracepoint/syscalls/sys_exit_writev")
+int sys_exit_writev(struct trace_event_raw_sys_exit__stub* ctx) {
+    return l7_write_exit(ctx->ret);
+}
+
+SEC("tracepoint/syscalls/sys_exit_sendmsg")
+int sys_exit_sendmsg(struct trace_event_raw_sys_exit__stub* ctx) {
+    return l7_write_exit(ctx->ret);
+}
+
+SEC("tracepoint/syscalls/sys_exit_sendto")
+int sys_exit_sendto(struct trace_event_raw_sys_exit__stub* ctx) {
+    return l7_write_exit(ctx->ret);
 }
 
 SEC("tracepoint/syscalls/sys_enter_read")

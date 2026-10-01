@@ -924,10 +924,10 @@ func TestHttp1ChunkedSplitAcrossSyscalls(t *testing.T) {
 	require.Equal(t, string(chunkSizeLine), string(req[headEnd:headEnd+len(chunkSizeLine)]))
 
 	cuts := []int{
-		headEnd + 1,                      // mid chunk-size hex digits
-		headEnd + len(chunkSizeLine) + 50, // mid chunk data
+		headEnd + 1,                                 // mid chunk-size hex digits
+		headEnd + len(chunkSizeLine) + 50,           // mid chunk data
 		headEnd + len(chunkSizeLine) + chunkLen + 1, // mid the post-chunk-data "\r\n"
-		len(req) - 2,                      // mid the final "0\r\n\r\n"
+		len(req) - 2,                                // mid the final "0\r\n\r\n"
 	}
 	off := 0
 	for _, cut := range cuts {
@@ -4099,4 +4099,89 @@ func stopSharedTracer() {
 	}
 	close(sharedDone)
 	<-sharedRun
+}
+
+// A write the kernel cannot finish (EAGAIN, or a short write) is retried by
+// the application with the same bytes. The agent must not see them twice: a
+// duplicated HTTP/2 HEADERS block corrupts the HPACK dynamic table for every
+// later request on the connection.
+func TestHttp2WriteRetriedAfterIncompleteWriteIsNotDuplicated(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	lc := net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 2048)
+		})
+	}}
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	release := make(chan struct{})
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		<-release // not reading: the sender's buffers fill up
+		_, _ = io.Copy(io.Discard, c)
+	}()
+
+	d := net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4096)
+		})
+	}}
+	conn, err := d.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+	rc, err := conn.(*net.TCPConn).SyscallConn()
+	require.NoError(t, err)
+
+	const payloadLen = 400
+	_, err = conn.Write([]byte{0, 0, 0, 4, 0, 0, 0, 0, 0}) // SETTINGS: makes the connection HTTP/2
+	require.NoError(t, err)
+
+	// Write whole frames without waiting until one write comes back short.
+	frames := 0
+	var rest []byte
+	for id := uint32(1); id < 400 && rest == nil; id += 2 {
+		frame := http2HeadersRaw(bytes.Repeat([]byte{0xab}, payloadLen), id)
+		frames++
+		var n int
+		var werr error
+		require.NoError(t, rc.Write(func(fd uintptr) bool {
+			n, werr = syscall.Write(int(fd), frame)
+			return true
+		}))
+		if werr != nil && werr != syscall.EAGAIN {
+			require.NoError(t, werr)
+		}
+		if n < 0 {
+			n = 0
+		}
+		if n < len(frame) {
+			rest = frame[n:]
+		}
+	}
+	require.NotNil(t, rest, "the send buffer never filled up")
+
+	close(release)
+	_, err = conn.Write(rest) // the retry: same bytes, same address
+	require.NoError(t, err)
+
+	var got []byte
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		e := getEvent()
+		if e == nil || e.Pid != uint32(os.Getpid()) || e.Type != EventTypeL7Request || e.L7Request == nil ||
+			e.L7Request.Protocol != l7.ProtocolHTTP2 || e.L7Request.IsInbound {
+			continue
+		}
+		got = append(got, e.L7Request.Payload...)
+	}
+	require.Equal(t, frames*payloadLen, bytes.Count(got, []byte{0xab}))
 }

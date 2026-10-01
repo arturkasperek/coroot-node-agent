@@ -4,8 +4,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -29,10 +31,42 @@ func handler() http.Handler {
 	mux.HandleFunc("/error", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
+	// /edge/*: shapes of HTTP/1 traffic at the edge of what the eBPF
+	// capture handles (see e2e/loadgen/edge.go).
+	mux.HandleFunc("/edge/", edgeHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	return mux
+}
+
+func edgeHandler(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.Copy(io.Discard, r.Body)
+	switch r.URL.Path {
+	case "/edge/chunkedresp":
+		f, _ := w.(http.Flusher)
+		for i := 0; i < 200; i++ {
+			_, _ = fmt.Fprintf(w, "chunk-%d\n", i)
+			if f != nil {
+				f.Flush()
+			}
+		}
+	case "/edge/bigresp":
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 200*1024))
+	case "/edge/closedelim":
+		// A response with neither Content-Length nor chunking: the body ends
+		// when the server closes the connection.
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nclose-delimited body\n")
+		_ = buf.Flush()
+		_ = conn.Close()
+	default:
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}
 }
 
 func main() {

@@ -305,6 +305,7 @@ func (t *Tracer) UserMemoryReads() (failed map[string]uint64, rescued uint64) {
 	failed["http2_owner_mismatch"] = sum(8)
 	failed["http2_scratch_or_conn_missing"] = sum(9)
 	failed["http2_tail_call_failed"] = sum(10)
+	failed["write_retry_deduped"] = sum(11)
 	return failed, sum(3)
 }
 
@@ -683,7 +684,7 @@ func (t *Tracer) attachPrograms() error {
 				continue
 			case "sys_enter_read", "sys_enter_readv", "sys_enter_recvfrom", "sys_enter_recvmsg":
 				continue
-			case "sys_exit_read", "sys_exit_readv", "sys_exit_recvfrom", "sys_exit_recvmsg":
+			case "sys_exit_read", "sys_exit_readv", "sys_exit_recvfrom", "sys_exit_recvmsg", "sys_exit_write", "sys_exit_writev", "sys_exit_sendmsg", "sys_exit_sendto":
 				continue
 			}
 		}

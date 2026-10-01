@@ -197,6 +197,9 @@ curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|no
 # every core, memory churn plus forced compaction (page migration is what makes
 # nofault user-memory reads fail transiently), to probe loaded-host behavior.
 STRESS_PIDS=()
+# STRESS=cpu50: one burner per core, each busy STRESS_SLICE_MS / asleep
+# STRESS_SLICE_MS (default 1 ms: short slices, so nothing is blocked for long),
+# i.e. about half the machine's CPU on top of whatever else is running.
 # STRESS=cpu or STRESS=mem runs just one of the two.
 if [ "${STRESS:-0}" != "0" ]; then
   echo "[run-agent] STRESS=${STRESS}: cpu burners + memory churn + forced compaction (cpu/mem select one)"
@@ -204,6 +207,20 @@ fi
 if [ "${STRESS:-0}" = "1" ] || [ "${STRESS:-0}" = "cpu" ]; then
   for _ in $(seq "$(nproc)"); do
     ( while :; do :; done ) &
+    STRESS_PIDS+=($!)
+  done
+fi
+if [ "${STRESS:-0}" = "cpu50" ]; then
+  for _ in $(seq "$(nproc)"); do
+    python3 -c '
+import sys, time
+slice_s = float(sys.argv[1]) / 1000
+while True:
+    end = time.perf_counter() + slice_s
+    while time.perf_counter() < end:
+        pass
+    time.sleep(slice_s)
+' "${STRESS_SLICE_MS:-1}" &
     STRESS_PIDS+=($!)
   done
 fi
@@ -216,12 +233,17 @@ import time; time.sleep(0.5)' 2>/dev/null
   STRESS_PIDS+=($!)
 fi
 
+cpu_snap() { awk '/^cpu /{idle=$5+$6; t=0; for(i=2;i<=NF;i++) t+=$i; print t, idle}' /proc/stat; }
+read -r CPU_T0 CPU_I0 < <(cpu_snap)
+
 echo "[run-agent] generating load: ${N_REQUESTS} requests/target, targets=${TARGETS}"
 if ! loadgen -n "${N_REQUESTS}" -concurrency "${CONCURRENCY}" -targets "${TARGETS}" -manifest "${MANIFEST}"; then
   echo "[run-agent] loadgen failed" >&2
   exit 1
 fi
 
+read -r CPU_T1 CPU_I1 < <(cpu_snap)
+echo "[run-agent] host CPU busy during load: $(awk -v t0="${CPU_T0}" -v i0="${CPU_I0}" -v t1="${CPU_T1}" -v i1="${CPU_I1}" 'BEGIN{d=t1-t0; if(d>0) printf "%.0f%%", 100*(d-(i1-i0))/d; else print "n/a"}')"
 if [ "${#STRESS_PIDS[@]}" -gt 0 ]; then kill "${STRESS_PIDS[@]}" 2>/dev/null || true; fi
 
 echo "[run-agent] waiting ${FLUSH_SECONDS}s for the OTLP batch exporter to flush"

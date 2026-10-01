@@ -85,6 +85,14 @@ TARGETS="${TARGETS},python-tls|h1-tls|https://svc-python:8443"
 # client used for every other h1 target — see e2e/loadgen's newClient.
 TARGETS="${TARGETS},node-keepalive|h1-keepalive|http://svc-node-ka:8081"
 
+# EDGE=1 adds HTTP/1 traffic at the edge of what the capture handles
+# (pipelining, 6 KB headers, 100 KB bodies, chunked and close-delimited
+# bodies); see e2e/loadgen/edge.go. Off by default: some of these are limits
+# by design and keep the suite red.
+if [ "${EDGE:-0}" = "1" ]; then
+  TARGETS="${TARGETS},edge|h1-edge|http://svc-go:8081"
+fi
+
 # ONLY=name1,name2 restricts the measured load to those targets (services all
 # still start).
 if [ -n "${ONLY:-}" ]; then
@@ -119,6 +127,7 @@ docker run --name coroot-e2e-agent \
   -e N_REQUESTS="${N_REQUESTS}" \
   -e CONCURRENCY="${CONCURRENCY:-20}" \
   -e STRESS="${STRESS:-0}" \
+  -e STRESS_SLICE_MS="${STRESS_SLICE_MS:-1}" \
   "${IMAGE}" agent-orchestrator
 RC=$?
 

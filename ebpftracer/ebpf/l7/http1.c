@@ -36,7 +36,7 @@
    practice while staying well under the kernel's 33-tail-call-per-chain
    hard cap (this chain's other call — http1_tail_emit's own tail-call
    into the first round — takes one of those 33). */
-#define HTTP1_MAX_ROUNDS 24
+#define HTTP1_MAX_ROUNDS 30
 
 /* Bound for the header-scanning bpf_loop — NOT the same as HTTP1_CAPTURE_MAX:
    the walker must keep scanning (uncounted) for "\r\n\r\n" past the capture
@@ -682,6 +682,13 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
                HTTP1_LEN_UNKNOWN stays correct there — see the file
                comment and http1_capture_data's own doc comment. */
             sv.body_remaining = sc.have_content_length ? sc.content_length : (s->is_req ? 0 : HTTP1_LEN_UNKNOWN);
+            if (!sv.body_remaining) {
+                /* Known empty body: nothing for a DATA round to do, and each
+                   round costs one of the kernel's 33 tail calls, which is
+                   what bounds how many pipelined requests one buffer can
+                   hold. */
+                sv.phase = HTTP1_PHASE_HEADERS;
+            }
             sv.content_length = 0;
             sv.chunked = 0;
             sv.data_captured = 0;

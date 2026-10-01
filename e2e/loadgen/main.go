@@ -215,6 +215,9 @@ func runOne(client *http.Client, base string, step routeStep, i int, query strin
 }
 
 func driveTarget(t target, n, concurrency int) manifestEntry {
+	if t.proto == "h1-edge" {
+		return driveEdge(t, n, concurrency)
+	}
 	client := newClient(t.proto)
 	routes := routesFor(t.proto)
 	counts := map[[3]any]*int64{}

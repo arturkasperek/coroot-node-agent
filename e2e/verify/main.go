@@ -125,6 +125,7 @@ func main() {
 		// Spans from other traffic (warmup, probes) carry another r= or none,
 		// so they can neither be counted nor mask a missing request.
 		matchedIDs := map[string]map[int]bool{}
+		examples := map[string]string{}
 		for _, sp := range spans {
 			u := sp.Attributes["http.url"]
 			if !strings.Contains(u, hp) {
@@ -141,6 +142,9 @@ func main() {
 			}
 			key := sp.Name + "|" + path + "|" + status
 			matched[key]++
+			if _, ok := examples[key]; !ok {
+				examples[key] = u
+			}
 			if q, err := url.Parse(u); err == nil && entry.Run != "" && q.Query().Get("r") == entry.Run {
 				if n, err := strconv.Atoi(q.Query().Get("n")); err == nil {
 					if matchedIDs[key] == nil {
@@ -161,7 +165,7 @@ func main() {
 		}
 		for key, n := range matched {
 			if !wanted[key] {
-				log.Printf("[%s] unexpected spans: %s x%d", entry.Target, key, n)
+				log.Printf("[%s] unexpected spans: %s x%d e.g. %s", entry.Target, key, n, examples[key])
 			}
 		}
 
