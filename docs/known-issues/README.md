@@ -40,3 +40,12 @@ printed before and after the load (`node_ebpf_*`, `node_l7_*`).
 Harness flakes that are **not** agent bugs: `status 255` (ssh to the docker
 host), `lookup svc-...: no such host`, `DeadlineExceeded` during image build.
 Rerun those.
+
+## HTTP body capture under overload
+
+`--http-body-capture` is best effort. In `STRESS=cpu CONCURRENCY=80` e2e runs (3 runs, ~2000 requests per target,
+`HTTP_BODIES=1`) about 98-100% of `POST /echo` spans carried the exact request and response body; the misses were
+spans with a correct request body but an empty response body (the response data event was lost or arrived after
+the span was emitted), occasionally a whole burst of one h2c target (12 of 400). Span counts themselves were
+within the same 0-1 loss per target as the flag-off baseline under the same stress. Without stress
+(`HTTP_BODIES=1`, 1000 requests/target) every echo span carries both bodies.

@@ -92,6 +92,7 @@ var (
 	// See containers.Registry's l7DroppedUnknownContainer.
 	L7DroppedUnknownContainer = metric("node_l7_dropped_unknown_container_total", "Total number of L7 events that arrived for a PID whose container was not registered yet (now registered on the spot instead of being dropped)")
 
+	HttpBodies               = metric("node_l7_http_bodies_total", "What happened to the bodies of outbound HTTP calls seen with --http-body-capture: captured, truncated (captured but cut), skipped by content type, content encoding or because they look binary, or dropped for lack of a message or a full queue", "result")
 	Http2EventsSeen          = metric("node_l7_http2_events_total", "Total number of outbound HTTP/2 L7 events the kernel delivered to userspace, whether or not they could be correlated to a tracked connection")
 	Http2DroppedNoConnection = metric("node_l7_http2_dropped_no_connection_total", "Total number of outbound HTTP/2 L7 events that arrived before their (pid, fd)'s connection was registered")
 	Http2DroppedTsMismatch   = metric("node_l7_http2_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/2 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")

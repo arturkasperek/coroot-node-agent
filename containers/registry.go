@@ -16,6 +16,7 @@ import (
 	"github.com/coroot/coroot-node-agent/cgroup"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
+	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/metrics"
@@ -227,6 +228,7 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.TracesSpansCreated
 	ch <- metrics.TracesSpansExported
 	ch <- metrics.TracesSpansExportFailed
+	ch <- metrics.HttpBodies
 	ch <- metrics.Http1EventsSeen
 	ch <- metrics.Http1DroppedNoConnection
 	ch <- metrics.Http1DroppedTsMismatch
@@ -264,6 +266,17 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 			ch <- metrics.Counter(metrics.EbpfUserMemoryReadFailures, float64(n), stage)
 		}
 		ch <- metrics.Counter(metrics.EbpfUserMemoryReadsRescued, float64(rescued))
+	}
+	for result, n := range map[string]uint64{
+		"captured":             l7.BodyStats.Captured.Load(),
+		"truncated":            l7.BodyStats.Truncated.Load(),
+		"skipped_content_type": l7.BodyStats.SkippedContentType.Load(),
+		"skipped_encoding":     l7.BodyStats.SkippedEncoding.Load(),
+		"skipped_binary":       l7.BodyStats.SkippedBinary.Load(),
+		"dropped_no_message":   l7.BodyStats.DroppedNoMessage.Load(),
+		"dropped_queue_full":   l7.BodyStats.DroppedQueueFull.Load(),
+	} {
+		ch <- metrics.Counter(metrics.HttpBodies, float64(n), result)
 	}
 	ch <- metrics.Counter(metrics.Http1EventsSeen, float64(r.http1EventsSeen.Load()))
 	ch <- metrics.Counter(metrics.Http1DroppedNoConnection, float64(r.http1DroppedNoConnection.Load()))
@@ -348,8 +361,23 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	defer gcTicker.Stop()
 	tlsAttachTicker := time.NewTicker(tlsAttachRetryInterval)
 	defer tlsAttachTicker.Stop()
+	// Only with --http-body-capture: responses wait for their bodies and need
+	// releasing when no more arrive.
+	var bodyFlush <-chan time.Time
+	if *flags.HttpBodyCapture {
+		t := time.NewTicker(httpBodyFlushInterval)
+		defer t.Stop()
+		bodyFlush = t.C
+	}
 	for {
 		select {
+		case now := <-bodyFlush:
+			if len(r.events) > bodyFlushMaxQueue {
+				break // behind on events: "no more body" would only mean "not read yet"
+			}
+			for _, c := range r.containersById {
+				c.flushHttpBodies(now)
+			}
 		case <-tlsAttachTicker.C:
 			if len(r.events) > eventQueueBusyThreshold {
 				break // events first; these are retried every tick anyway

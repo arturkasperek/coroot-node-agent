@@ -188,6 +188,8 @@ func runOne(client *http.Client, base string, step routeStep, i int, query strin
 		if err != nil {
 			return "", "", 0, err
 		}
+		// text/plain, so a body-capturing agent keeps the body (Node echoes it back)
+		req.Header.Set("Content-Type", "text/plain")
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 		resp, err := client.Do(req)
 		if err != nil {

@@ -85,6 +85,11 @@ func main() {
 	// whether the agent's event loop was starved.
 	minRatio := flag.Float64("min-ratio", 1.0, "minimum fraction of sent requests that must show up as recorded spans, for every target")
 	waitFor := flag.Duration("wait", 20*time.Second, "how long to wait/poll for spans to arrive before giving up")
+	// With --http-body-capture the agent puts the bodies of POST /echo (a body
+	// loadgen derives from the request number, echoed back by every service) on
+	// the span; check both against what was sent.
+	bodies := flag.Bool("bodies", false, "check http.request.body and http.response.body on POST /echo spans")
+	bodyMax := flag.Int("body-max", 4096, "the agent's --http-body-max-bytes")
 	flag.Parse()
 
 	data, err := os.ReadFile(*manifestPath)
@@ -126,6 +131,8 @@ func main() {
 		// so they can neither be counted nor mask a missing request.
 		matchedIDs := map[string]map[int]bool{}
 		examples := map[string]string{}
+		type spanBodies struct{ req, resp string }
+		echoBodies := map[int]spanBodies{}
 		for _, sp := range spans {
 			u := sp.Attributes["http.url"]
 			if !strings.Contains(u, hp) {
@@ -151,6 +158,9 @@ func main() {
 						matchedIDs[key] = map[int]bool{}
 					}
 					matchedIDs[key][n] = true
+					if sp.Name == "POST" && path == "/echo" {
+						echoBodies[n] = spanBodies{sp.Attributes["http.request.body"], sp.Attributes["http.response.body"]}
+					}
 				}
 			}
 		}
@@ -202,6 +212,48 @@ func main() {
 		}
 		fmt.Printf("%-6s target=%-14s proto=%-4s sent=%-5d recorded=%-5d ratio=%.2f\n",
 			status, entry.Target, entry.Proto, wantTotal, gotTotal, ratio)
+		if *bodies {
+			var bad []string
+			checked := 0
+			hasEcho := false
+			for _, oc := range entry.Outcomes {
+				if oc.Method != "POST" || oc.Path != "/echo" {
+					continue
+				}
+				hasEcho = true
+				key := oc.Method + "|" + oc.Path + "|" + strconv.Itoa(oc.Status)
+				for _, id := range oc.IDs {
+					if !matchedIDs[key][id] {
+						continue
+					}
+					checked++
+					n := 200 + id%800
+					if n > *bodyMax {
+						n = *bodyMax
+					}
+					want := strings.Repeat(string(rune('a'+id%26)), n)
+					got := echoBodies[id]
+					if got.req != want || got.resp != want {
+						bad = append(bad, fmt.Sprintf("n=%d(req %d bytes, resp %d bytes, want %d)", id, len(got.req), len(got.resp), n))
+					}
+				}
+			}
+			if hasEcho { // a target without POST /echo has no body to check
+				bodyStatus := "OK"
+				if checked == 0 || len(bad) > 0 {
+					bodyStatus = "FAIL"
+					ok = false
+				}
+				fmt.Printf("%-6s target=%-14s bodies: %d of %d POST /echo spans carry the right request and response body\n",
+					bodyStatus, entry.Target, checked-len(bad), checked)
+				if len(bad) > 0 {
+					if len(bad) > 20 {
+						bad = append(bad[:20], "...")
+					}
+					fmt.Printf("         WRONG %v\n", bad)
+				}
+			}
+		}
 		// Print the per-route breakdown for any shortfall: which routes lose
 		// requests is the single most diagnostic fact about a partial
 		// capture (loss concentrated on the one route with a request body

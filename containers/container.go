@@ -182,6 +182,10 @@ type Container struct {
 	pendingHttp2Parsers map[PidFdTs]*pendingHttp2State
 	pendingHttp1Parsers map[PidFdTs]*pendingHttp1State
 
+	// Connections whose parser holds responses back for their bodies
+	// (--http-body-capture), see flushHttpBodies.
+	bodyHolders map[*ActiveConnection]struct{}
+
 	l7Stats        L7Stats
 	l7InboundStats L7InboundStats
 	dnsStats       *L7Metrics
@@ -750,6 +754,8 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 				delete(c.pendingHttp1Parsers, kts)
 			}
 		}
+		// responses the replayed events left waiting for their bodies
+		c.noteBodyHolder(connection)
 	}
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
 }
@@ -769,7 +775,7 @@ func (c *Container) feedPendingHttp2(pid uint32, fd uint64, timestamp uint64, r 
 	k := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
 	st := c.pendingHttp2Parsers[k]
 	if st == nil {
-		st = &pendingHttp2State{parser: l7.NewHttp2Parser(), timestamp: timestamp}
+		st = &pendingHttp2State{parser: newHttp2Parser(), timestamp: timestamp}
 		c.pendingHttp2Parsers[k] = st
 	}
 	st.updatedAt = time.Now()
@@ -811,7 +817,7 @@ func (c *Container) emitPendingHttp2Requests(conn *ActiveConnection, completed [
 				status = cr.req.GrpcStatus.GRPC()
 			}
 			stats.observe(status, "", cr.req.Duration)
-			trace.Http2Request(cr.req.Method, cr.req.Path, cr.req.Scheme, cr.req.Status, cr.req.GrpcStatus, cr.req.Duration)
+			trace.Http2Request(cr.req.Method, cr.req.Path, cr.req.Scheme, cr.req.Status, cr.req.GrpcStatus, cr.req.Duration, http2Bodies(cr.req), cr.req.At)
 		}
 	}
 }
@@ -834,7 +840,7 @@ func (c *Container) feedPendingHttp1(pid uint32, fd uint64, timestamp uint64, r 
 	k := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
 	st := c.pendingHttp1Parsers[k]
 	if st == nil {
-		st = &pendingHttp1State{parser: l7.NewHttp1Parser(), timestamp: timestamp}
+		st = &pendingHttp1State{parser: newHttp1Parser(), timestamp: timestamp}
 		c.pendingHttp1Parsers[k] = st
 	}
 	st.updatedAt = time.Now()
@@ -875,7 +881,7 @@ func (c *Container) emitPendingHttp1Requests(conn *ActiveConnection, completed [
 		c.registry.http1RequestsParsed.Add(1)
 		if !common.HttpFilter.ShouldBeSkipped(cr.req.Path) {
 			stats.observe(cr.req.Status.Http(), "", cr.req.Duration)
-			trace.HttpRequest(cr.req.Method, cr.req.Path, cr.req.Status, cr.req.Duration)
+			trace.HttpRequest(cr.req.Method, cr.req.Path, cr.req.Status, cr.req.Duration, http1Bodies(cr.req), cr.req.At)
 		}
 	}
 }
@@ -1075,32 +1081,22 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	case l7.ProtocolHTTP:
 		c.registry.http1EventsSeen.Add(1)
 		if conn.http1Parser == nil {
-			conn.http1Parser = l7.NewHttp1Parser()
+			conn.http1Parser = newHttp1Parser()
 		}
 		for _, req := range conn.http1Parser.Parse(r.Method, r.Payload, uint64(r.Duration)) {
-			c.registry.http1RequestsParsed.Add(1)
-			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
-				stats.observe(req.Status.Http(), "", req.Duration)
-				trace.HttpRequest(req.Method, req.Path, req.Status, req.Duration)
-			}
+			c.observeHttp1(stats, trace, req)
 		}
+		c.noteBodyHolder(conn)
 	case l7.ProtocolHTTP2:
 		c.registry.http2EventsSeen.Add(1)
 		if conn.http2Parser == nil {
-			conn.http2Parser = l7.NewHttp2Parser()
+			conn.http2Parser = newHttp2Parser()
 		}
 		requests := conn.http2Parser.Parse(r.Method, r.Payload, uint64(r.Duration))
 		for _, req := range requests {
-			c.registry.http2RequestsParsed.Add(1)
-			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
-				status := req.Status.Http()
-				if req.GrpcStatus >= 0 {
-					status = req.GrpcStatus.GRPC()
-				}
-				stats.observe(status, "", req.Duration)
-				trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration)
-			}
+			c.observeHttp2(stats, trace, req)
 		}
+		c.noteBodyHolder(conn)
 	case l7.ProtocolPostgres:
 		if r.Method != l7.MethodStatementClose {
 			stats.observe(r.Status.String(), "", r.Duration)

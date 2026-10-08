@@ -148,6 +148,8 @@ docker run --name coroot-e2e-agent \
   -e N_REQUESTS="${N_REQUESTS}" \
   -e CONCURRENCY="${CONCURRENCY:-20}" \
   -e STRESS="${STRESS:-0}" \
+  -e HTTP_BODIES="${HTTP_BODIES:-0}" \
+  -e AGENT_FLAGS="${AGENT_FLAGS:-}" \
   -e LAT_TARGETS="${LAT_TARGETS}" \
   -e ROUNDS="${ROUNDS:-3}" \
   -e TOTAL_BYTES="${TOTAL_BYTES:-10485760}" \

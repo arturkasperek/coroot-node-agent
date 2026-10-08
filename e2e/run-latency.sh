@@ -79,7 +79,9 @@ echo "[latency] starting mockbackend and coroot-node-agent"
 mockbackend -addr "${MOCKBACKEND_ADDR}" &
 MOCKBACKEND_PID=$!
 AGENT_LOG=/tmp/agent.log
+# shellcheck disable=SC2086
 coroot-node-agent \
+  ${AGENT_FLAGS:-} \
   --listen=0.0.0.0:10300 \
   --collector-endpoint="http://${MOCKBACKEND_ADDR}" \
   --disable-gpu-monitoring \

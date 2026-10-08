@@ -98,7 +98,17 @@ func Init(machineId, hostname, version string) {
 		klog.Exitln(err)
 	}
 
-	batcher = sdktrace.WithBatcher(countingExporter{exporter})
+	var batchOpts []sdktrace.BatchSpanProcessorOption
+	if *flags.HttpBodyCapture {
+		// Spans that carry bodies are several times larger, so they export more
+		// slowly while a burst of calls keeps arriving; the default queue (2048
+		// spans) then overflows and the SDK drops spans silently (only
+		// node_traces_spans_created_total minus ..._exported_total shows it).
+		// A deeper queue absorbs the burst; it is bounded (16384 spans, a few
+		// tens of MB at the 4 KB body cap).
+		batchOpts = append(batchOpts, sdktrace.WithMaxQueueSize(16384))
+	}
+	batcher = sdktrace.WithBatcher(countingExporter{exporter}, batchOpts...)
 	commonResourceAttrs = []attribute.KeyValue{semconv.HostName(hostname), semconv.HostID(machineId)}
 	agentVersion = version
 	initialized = true
@@ -150,11 +160,51 @@ type Trace struct {
 	commonAttrs []attribute.KeyValue
 }
 
+// HttpBodies are the bodies of an HTTP call as captured by the eBPF side. A
+// size is the real size when the message declared one, -1 when it did not; an
+// empty body is not put on the span.
+type HttpBodies struct {
+	Request      string
+	Response     string
+	RequestSize  int64
+	ResponseSize int64
+}
+
+func (b *HttpBodies) attrs() []attribute.KeyValue {
+	if b == nil {
+		return nil
+	}
+	var res []attribute.KeyValue
+	if b.Request != "" {
+		res = append(res, attribute.String("http.request.body", b.Request))
+	}
+	if b.Response != "" {
+		res = append(res, attribute.String("http.response.body", b.Response))
+	}
+	if b.RequestSize >= 0 && b.Request != "" {
+		res = append(res, attribute.Int64("http.request.body.size", b.RequestSize))
+	}
+	if b.ResponseSize >= 0 && b.Response != "" {
+		res = append(res, attribute.Int64("http.response.body.size", b.ResponseSize))
+	}
+	return res
+}
+
+// createSpan makes a span that ended now.
 func (t *Trace) createSpan(name string, duration time.Duration, error bool, attrs ...attribute.KeyValue) {
+	t.createSpanAt(time.Time{}, name, duration, error, attrs...)
+}
+
+// createSpanAt makes a span that ended at `at` (now when zero): a span whose
+// body was awaited is created later than the call ended.
+func (t *Trace) createSpanAt(at time.Time, name string, duration time.Duration, error bool, attrs ...attribute.KeyValue) {
 	if t.tracer.otel == nil {
 		return
 	}
-	end := time.Now()
+	end := at
+	if end.IsZero() {
+		end = time.Now()
+	}
 
 	if !shouldSample() {
 		return
@@ -171,18 +221,21 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	spansCreated.Add(1)
 }
 
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration) {
+// HttpRequest records an outbound HTTP/1 call. bodies may be nil; at is when
+// the call ended (zero for now).
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, bodies *HttpBodies, at time.Time) {
 	if t == nil || method == "" {
 		return
 	}
-	t.createSpan(method, duration, status >= 400,
+	attrs := []attribute.KeyValue{
 		semconv.HTTPURL(fmt.Sprintf("http://%s%s", t.destination.String(), path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
-	)
+	}
+	t.createSpanAt(at, method, duration, status >= 400, append(attrs, bodies.attrs()...)...)
 }
 
-func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.Status, duration time.Duration) {
+func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.Status, duration time.Duration, bodies *HttpBodies, at time.Time) {
 	if t == nil {
 		return
 	}
@@ -204,7 +257,7 @@ func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.
 	if grpcStatus >= 0 {
 		attrs = append(attrs, semconv.RPCGRPCStatusCodeKey.Int(int(grpcStatus)))
 	}
-	t.createSpan(method, duration, status > 400 || grpcStatus > 0, attrs...)
+	t.createSpanAt(at, method, duration, status > 400 || grpcStatus > 0, append(attrs, bodies.attrs()...)...)
 }
 
 func (t *Trace) PostgresQuery(query string, error bool, duration time.Duration) {

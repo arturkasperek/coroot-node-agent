@@ -25,6 +25,11 @@ var (
 
 	MaxFQDNsPerContainer = kingpin.Flag("max-fqdns-per-container", "Max unique FQDN values per container, extras are bucketed under '~other'").Default("50").Envar(envar("MAX_FQDNS_PER_CONTAINER")).Int()
 
+	HttpBodyCapture      = kingpin.Flag("http-body-capture", "Attach the request and response body of outbound HTTP calls to their traces (http.request.body, http.response.body). Text bodies only; compressed, binary and gRPC bodies are skipped. May contain sensitive data. Enabled by default; disable with --no-http-body-capture.").Default("true").Envar(envar("HTTP_BODY_CAPTURE")).Bool()
+	HttpBodyMaxBytes     = kingpin.Flag("http-body-max-bytes", "Max bytes of a body put on a span (the eBPF side captures at most 4096 per message)").Default("4096").Envar(envar("HTTP_BODY_MAX_BYTES")).Int()
+	HttpBodyContentTypes = kingpin.Flag("http-body-content-types", "Content types whose bodies are captured (glob patterns, e.g. text/*, application/*+json); bodies without a content type are captured when they look like text").Default("application/json", "application/*+json", "application/xml", "application/*+xml", "text/*", "application/x-www-form-urlencoded", "application/graphql").Envar(envar("HTTP_BODY_CONTENT_TYPES")).Strings()
+	HttpBodyWait         = kingpin.Flag("http-body-wait", "How long a message whose end cannot be told (a chunked HTTP/1 body) waits for more body before its span is created").Default("200ms").Envar(envar("HTTP_BODY_WAIT")).Duration()
+
 	ExcludeHTTPMetricsByPath  = kingpin.Flag("exclude-http-requests-by-path", "Skip HTTP metrics and traces by path").Envar(envar("EXCLUDE_HTTP_REQUESTS_BY_PATH")).Strings()
 	ExternalNetworksWhitelist = kingpin.Flag("track-public-network", "Allow track connections to the specified IP networks, all private networks are allowed by default (e.g., Y.Y.Y.Y/mask)").Envar(envar("TRACK_PUBLIC_NETWORK")).Default("0.0.0.0/0").Strings()
 	EphemeralPortRange        = kingpin.Flag("ephemeral-port-range", `Destination and Listen TCP ports from these ranges will be skipped, e.g. "32768-60999" or "1024-23768 30000-65535"`).Default("32768-60999").Envar(envar("EPHEMERAL_PORT_RANGE")).String()

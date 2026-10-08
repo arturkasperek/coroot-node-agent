@@ -21,7 +21,7 @@ function route(req, res) {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
-      res.writeHead(200, {'content-type': 'application/octet-stream'});
+      res.writeHead(200, {'content-type': req.headers['content-type'] || 'application/octet-stream'});
       res.end(Buffer.concat(chunks));
     });
     return;
