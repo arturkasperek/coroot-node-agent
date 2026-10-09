@@ -108,6 +108,9 @@ type Registry struct {
 	http1DroppedNoConnection atomic.Uint64
 	http1DroppedTsMismatch   atomic.Uint64
 	http1RequestsParsed      atomic.Uint64
+	// what gcClosedConnections kept on its last run, see node_tracked_connections
+	trackedConnectionsOpen   atomic.Int64
+	trackedConnectionsClosed atomic.Int64
 	// L7 events dropped because their pid's container could not be
 	// resolved even after trying to register it (process already gone, or a
 	// cgroup that is deliberately ignored). See the EventTypeL7Request case.
@@ -220,6 +223,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.Ip2Fqdn
 	ch <- metrics.EbpfLostSamples
+	ch <- metrics.EbpfLostEvents
+	ch <- metrics.TrackedConnections
 	ch <- metrics.L7PayloadsTruncated
 	ch <- metrics.GoTlsUprobeAttachFailures
 	ch <- metrics.EbpfProgramRecursionMisses
@@ -261,6 +266,9 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	}
 	if r.tracer != nil {
 		ch <- metrics.Counter(metrics.EbpfLostSamples, float64(r.tracer.LostSamples()))
+		for buffer, n := range r.tracer.LostEvents() {
+			ch <- metrics.Counter(metrics.EbpfLostEvents, float64(n), buffer)
+		}
 		ch <- metrics.Counter(metrics.L7PayloadsTruncated, float64(r.tracer.TruncatedPayloads()))
 		ch <- metrics.Counter(metrics.GoTlsUprobeAttachFailures, float64(r.tracer.GoTlsAttachFailures()))
 		for prog, n := range r.tracer.ProgramRecursionMisses() {
@@ -289,6 +297,8 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	ch <- metrics.Counter(metrics.Http1RequestsParsed, float64(r.http1RequestsParsed.Load()))
 	ch <- metrics.Counter(metrics.L7DroppedUnknownContainer, float64(r.l7DroppedUnknownContainer.Load()))
 	ch <- metrics.Gauge(metrics.L7EventQueueDepth, float64(len(r.events)))
+	ch <- metrics.Gauge(metrics.TrackedConnections, float64(r.trackedConnectionsOpen.Load()), "open")
+	ch <- metrics.Gauge(metrics.TrackedConnections, float64(r.trackedConnectionsClosed.Load()), "closed")
 	ch <- metrics.Counter(metrics.L7TlsAttachSeconds, float64(r.tlsAttachNanos.Load())/1e9)
 	ch <- metrics.Counter(metrics.Http2EventsSeen, float64(r.http2EventsSeen.Load()))
 	ch <- metrics.Counter(metrics.Http2DroppedNoConnection, float64(r.http2DroppedNoConnection.Load()))
@@ -386,9 +396,14 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				c.flushHttpBodies(now)
 			}
 		case now := <-closedConnectionsTicker.C:
+			var open, closed int
 			for _, c := range r.containersById {
-				c.gcClosedConnections(now)
+				o, cl := c.gcClosedConnections(now)
+				open += o
+				closed += cl
 			}
+			r.trackedConnectionsOpen.Store(int64(open))
+			r.trackedConnectionsClosed.Store(int64(closed))
 		case <-tlsAttachTicker.C:
 			if len(r.events) > eventQueueBusyThreshold {
 				break // events first; these are retried every tick anyway

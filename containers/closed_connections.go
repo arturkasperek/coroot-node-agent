@@ -17,22 +17,52 @@ import "time"
 const (
 	closedConnectionGrace       = RecentlyExitedTTL
 	closedConnectionsGcInterval = 10 * time.Second
+
+	// Go maps keep their memory when entries are deleted: the maps that indexed a
+	// burst of 100000 connections kept 19 MB after all of them were forgotten. They
+	// are rebuilt once they hold a quarter of their peak, if the peak was large.
+	connectionMapsRebuildMin = 4096
 )
 
 // gcClosedConnections forgets the connections closed more than
 // closedConnectionGrace ago, after their parsers have released the responses
 // still held back for a body, and the parsers of L7 events whose connection was
-// not registered within closedConnectionGrace.
-func (c *Container) gcClosedConnections(now time.Time) {
+// not registered within closedConnectionGrace. It returns how many connections
+// it keeps, open and closed.
+func (c *Container) gcClosedConnections(now time.Time) (open, closed int) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	for k, conn := range c.activeConnections {
-		if conn.Closed.IsZero() || now.Sub(conn.Closed) <= closedConnectionGrace {
+		if conn.Closed.IsZero() {
+			open++
+			continue
+		}
+		if now.Sub(conn.Closed) <= closedConnectionGrace {
+			closed++
 			continue
 		}
 		c.flushConnectionBodies(conn, now)
 		c.forgetConnection(k, conn)
 	}
+	// A server that closes its side frees the client's port right away, so a new
+	// connection can have the addresses of an old one and take its place in
+	// activeConnections. The old one is closed (the kernel has one socket per
+	// addresses) and only connectionsByPidFdTs still has it.
+	for _, conn := range c.connectionsByPidFdTs {
+		if c.activeConnections[conn.key] == conn {
+			continue // counted above
+		}
+		if conn.Closed.IsZero() {
+			conn.Closed = now
+		}
+		if now.Sub(conn.Closed) <= closedConnectionGrace {
+			closed++
+			continue
+		}
+		c.flushConnectionBodies(conn, now)
+		c.forgetConnection(conn.key, conn)
+	}
+	c.rebuildConnectionMaps()
 	for k, st := range c.pendingHttp1Parsers {
 		if now.Sub(st.updatedAt) > closedConnectionGrace {
 			delete(c.pendingHttp1Parsers, k)
@@ -43,6 +73,7 @@ func (c *Container) gcClosedConnections(now time.Time) {
 			delete(c.pendingHttp2Parsers, k)
 		}
 	}
+	return open, closed
 }
 
 // forgetConnection removes a connection from every index. The (pid, fd) of a
@@ -63,4 +94,27 @@ func (c *Container) forgetConnection(k ConnectionKey, conn *ActiveConnection) {
 		}
 	}
 	delete(c.bodyHolders, conn)
+}
+
+// rebuildConnectionMaps copies the connection maps into new ones when they hold a
+// quarter of what they held at their peak, so that the memory of a burst is given
+// back. Called with c.lock held.
+func (c *Container) rebuildConnectionMaps() {
+	n := max(len(c.activeConnections), len(c.connectionsByPidFdTs))
+	if c.connectionsPeak < connectionMapsRebuildMin || n > c.connectionsPeak/4 {
+		return
+	}
+	c.activeConnections = rebuilt(c.activeConnections)
+	c.connectionsByPidFd = rebuilt(c.connectionsByPidFd)
+	c.connectionsByPidFdTs = rebuilt(c.connectionsByPidFdTs)
+	c.connectionsPeak = n
+}
+
+// rebuilt is a copy of m sized for what m holds now (maps.Clone keeps the size of m).
+func rebuilt[K comparable, V any](m map[K]V) map[K]V {
+	out := make(map[K]V, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }

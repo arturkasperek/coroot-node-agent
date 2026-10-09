@@ -251,6 +251,18 @@ func (t *Tracer) LostSamples() uint64 {
 	return t.lostSamples.Load() + t.ringbufDrops("l7_events_dropped") + t.ringbufDrops("tcp_connect_events_dropped")
 }
 
+// LostEvents is LostSamples per buffer: "perf" (the perf buffers: process, file,
+// listen and retransmit events), "l7_events" and "tcp_connect_events" (the ring
+// buffers). They overflow under different loads, and their losses cost different
+// things: a lost connection event leaves a connection that is never closed.
+func (t *Tracer) LostEvents() map[string]uint64 {
+	return map[string]uint64{
+		"perf":               t.lostSamples.Load(),
+		"l7_events":          t.ringbufDrops("l7_events_dropped"),
+		"tcp_connect_events": t.ringbufDrops("tcp_connect_events_dropped"),
+	}
+}
+
 // ProgramRecursionMisses returns, per program, how many times the kernel
 // skipped running it because that same program was already active on the
 // CPU (its recursion guard). A skipped tracepoint/kprobe run simply never

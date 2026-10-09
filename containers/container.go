@@ -65,6 +65,9 @@ type ConnectionKey struct {
 }
 
 type ActiveConnection struct {
+	// the addresses it is indexed by in activeConnections; a newer connection
+	// with the same addresses takes its place there (see gcClosedConnections)
+	key            ConnectionKey
 	DestinationKey common.DestinationKey
 	Pid            uint32
 	Fd             uint64
@@ -174,6 +177,8 @@ type Container struct {
 	// fallback lookup for why a late event needs to find its exact,
 	// possibly-superseded connection rather than whatever now owns the fd.
 	connectionsByPidFdTs map[PidFdTs]*ActiveConnection
+	// the most connections indexed since the maps were last rebuilt, see gcClosedConnections
+	connectionsPeak int
 	// Keyed by the exact (pid, fd, timestamp) of the connection each
 	// buffered parser belongs to, not just (pid, fd) — fd churn (see
 	// onL7Request) means several distinct, not-yet-registered connections
@@ -723,12 +728,13 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		stats.Count++
 		stats.TotalTime += duration
 		connection := &ActiveConnection{
+			key:            ConnectionKey{src: src, dst: dst},
 			DestinationKey: key,
 			Pid:            pid,
 			Fd:             fd,
 			Timestamp:      timestamp,
 		}
-		c.activeConnections[ConnectionKey{src: src, dst: dst}] = connection
+		c.activeConnections[connection.key] = connection
 		k := PidFd{Pid: pid, Fd: fd}
 		prev := c.connectionsByPidFd[k]
 		if prev != nil {
@@ -738,6 +744,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		if timestamp != 0 {
 			c.connectionsByPidFdTs[PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}] = connection
 		}
+		c.connectionsPeak = max(c.connectionsPeak, len(c.activeConnections), len(c.connectionsByPidFdTs))
 		if timestamp != 0 {
 			kts := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
 			if pending, ok := c.pendingHttp2Parsers[kts]; ok {
