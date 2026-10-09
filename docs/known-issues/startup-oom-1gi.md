@@ -3,8 +3,11 @@
 **Status:** reproduced on the dev k3s node (2 of 3 starts killed). Measured 2026-10-08.
 The second heap surge (reading the symbol tables) is fixed in `ebpftracer/elf.go`
 (`GetSymbol` / `PrefetchSymbols` read the tables in place; see the tests in `ebpftracer/elf_test.go`).
-Not yet re-measured on a real restart of the agent. The first surge (`loadCollection`) and the
-fixed cost of the BPF maps are not fixed.
+`loadCollection` now loads at most 4 programs at a time (`maxConcurrentProgramLoads`): with 1 CPU
+the Go heap peak of the load goes from +140-158 MB to +26 MB at the same ~27 s, with 16 CPUs the
+kernel peak from 1.3 GB to 0.7 GB (load 4 s -> 8 s).
+Neither fix is re-measured on a real restart of the agent yet. The fixed cost of the BPF maps
+(461 MB) is not changed.
 Nothing here was measured on EKS: no credentials were available.
 
 The operator's default for the agent is `requests.memory 200Mi, limits.memory 1Gi`
@@ -99,7 +102,7 @@ pods; a production node with more and bigger processes has less margin.
   streams the `.symtab` / `.dynsym` entries and compares the name in the string
   table in place found the same symbols with a **peak heap of 4.2 MB** instead of
   217 / 67 / 57 MB (agent / node / cluster-agent binaries), 0.1-0.4 s each.
-- `loadCollection`: bound the parallelism (a semaphore of 4-8); with a 1 CPU limit
+- (done, 4 at a time) `loadCollection`: bound the parallelism; with a 1 CPU limit
   it does not shorten the 26 s anyway, it only keeps 59 copies of the spec alive.
 - Cache a failed attach by `(dev, ino)` too.
 - `L7_EVENTS_RINGBUF_SIZE` (128 MiB) and `MAX_CONNECTIONS` (1,000,000, two maps of

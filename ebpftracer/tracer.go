@@ -429,9 +429,37 @@ type loadedProgram struct {
 	err  error
 }
 
-// loadCollection creates maps once, then verifies programs in parallel.
-// Privileged BPF_PROG_LOAD is not serialized by bpf_verifier_lock, so the
-// wall time is about the slowest program instead of the sum.
+// maxConcurrentProgramLoads is how many programs are verified at a time. Each loader
+// holds a copy of the whole collection spec (2.8 MB, 59 programs) and the kernel holds
+// the state of its verifier (about 50 MB), and all of it is charged to the memory cgroup
+// of the agent (a 1 GiB limit by default). Measured:
+//   - 1 CPU: 59 at once peaks at +140-158 MB of Go heap, 4 at a time at +26 MB, and the
+//     load takes the same ~27 s (it is CPU bound);
+//   - 16 CPUs: 59 at once peaks at 1.3 GB of kernel memory and loads in 4 s, 4 at a time
+//     peaks at 0.7 GB and loads in 8 s.
+const maxConcurrentProgramLoads = 4
+
+// forEachLimited calls fn for every name, at most limit calls at a time, and returns when
+// all of them are finished. A limit below 1 is 1.
+func forEachLimited(names []string, limit int, fn func(name string)) {
+	sem := make(chan struct{}, max(limit, 1))
+	var wg sync.WaitGroup
+	for _, name := range names {
+		sem <- struct{}{} // taken here, not in the goroutine: no more goroutines than the limit
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fn(name)
+		}(name)
+	}
+	wg.Wait()
+}
+
+// loadCollection creates maps once, then verifies programs in parallel, a few at a time
+// (maxConcurrentProgramLoads). Privileged BPF_PROG_LOAD is not serialized by
+// bpf_verifier_lock, so with enough CPUs the wall time is about the slowest programs
+// instead of the sum.
 func loadCollection(spec *ebpf.CollectionSpec) (*ebpf.Collection, error) {
 	mapsSpec := spec.Copy()
 	mapsSpec.Programs = map[string]*ebpf.ProgramSpec{}
@@ -449,34 +477,28 @@ func loadCollection(spec *ebpf.CollectionSpec) (*ebpf.Collection, error) {
 	}
 
 	results := make(chan loadedProgram, len(names))
-	var wg sync.WaitGroup
-	for _, name := range names {
-		wg.Add(1)
-		go func(name string) {
-			defer wg.Done()
-			one := spec.Copy()
-			one.Programs = map[string]*ebpf.ProgramSpec{name: one.Programs[name]}
-			loaded, err := ebpf.NewCollectionWithOptions(one, ebpf.CollectionOptions{
-				MapReplacements: coll.Maps,
-			})
-			if err != nil {
-				var vErr *ebpf.VerifierError
-				if errors.As(err, &vErr) {
-					klog.Errorf("%s: %+v", name, vErr)
-				}
-				results <- loadedProgram{name: name, err: err}
-				return
+	forEachLimited(names, maxConcurrentProgramLoads, func(name string) {
+		one := spec.Copy() // inside the limit: this copy is the Go heap that the limit bounds
+		one.Programs = map[string]*ebpf.ProgramSpec{name: one.Programs[name]}
+		loaded, err := ebpf.NewCollectionWithOptions(one, ebpf.CollectionOptions{
+			MapReplacements: coll.Maps,
+		})
+		if err != nil {
+			var vErr *ebpf.VerifierError
+			if errors.As(err, &vErr) {
+				klog.Errorf("%s: %+v", name, vErr)
 			}
-			prog := loaded.DetachProgram(name)
-			loaded.Close()
-			if prog == nil {
-				results <- loadedProgram{name: name, err: fmt.Errorf("program missing after load")}
-				return
-			}
-			results <- loadedProgram{name: name, prog: prog}
-		}(name)
-	}
-	wg.Wait()
+			results <- loadedProgram{name: name, err: err}
+			return
+		}
+		prog := loaded.DetachProgram(name)
+		loaded.Close()
+		if prog == nil {
+			results <- loadedProgram{name: name, err: fmt.Errorf("program missing after load")}
+			return
+		}
+		results <- loadedProgram{name: name, prog: prog}
+	})
 	close(results)
 
 	progs := make(map[string]*ebpf.Program, len(names))
