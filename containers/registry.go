@@ -366,6 +366,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	defer gcTicker.Stop()
 	tlsAttachTicker := time.NewTicker(tlsAttachRetryInterval)
 	defer tlsAttachTicker.Stop()
+	closedConnectionsTicker := time.NewTicker(closedConnectionsGcInterval)
+	defer closedConnectionsTicker.Stop()
 	// Only with --http-body-capture: responses wait for their bodies and need
 	// releasing when no more arrive.
 	var bodyFlush <-chan time.Time
@@ -382,6 +384,10 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 			for _, c := range r.containersById {
 				c.flushHttpBodies(now)
+			}
+		case now := <-closedConnectionsTicker.C:
+			for _, c := range r.containersById {
+				c.gcClosedConnections(now)
 			}
 		case <-tlsAttachTicker.C:
 			if len(r.events) > eventQueueBusyThreshold {

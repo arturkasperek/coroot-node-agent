@@ -94,28 +94,35 @@ func (c *Container) flushHttpBodies(now time.Time) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	for conn := range c.bodyHolders {
-		if conn.http1Parser != nil {
-			if reqs := conn.http1Parser.Flush(now); len(reqs) > 0 {
-				stats := c.l7Stats.get(l7.ProtocolHTTP, conn.DestinationKey)
-				trace := c.traceFor(conn)
-				for _, req := range reqs {
-					c.observeHttp1(stats, trace, req)
-				}
-			}
-		}
-		if conn.http2Parser != nil {
-			if reqs := conn.http2Parser.Flush(now); len(reqs) > 0 {
-				stats := c.l7Stats.get(l7.ProtocolHTTP2, conn.DestinationKey)
-				trace := c.traceFor(conn)
-				for _, req := range reqs {
-					c.observeHttp2(stats, trace, req)
-				}
-			}
-		}
-		if (conn.http1Parser == nil || conn.http1Parser.Held() == 0) && (conn.http2Parser == nil || conn.http2Parser.Held() == 0) {
+		if !c.flushConnectionBodies(conn, now) {
 			delete(c.bodyHolders, conn)
 		}
 	}
+}
+
+// flushConnectionBodies creates the spans of the messages of one connection that
+// have waited long enough for their bodies, and says whether it still holds any.
+// Called with c.lock held.
+func (c *Container) flushConnectionBodies(conn *ActiveConnection, now time.Time) (held bool) {
+	if conn.http1Parser != nil {
+		if reqs := conn.http1Parser.Flush(now); len(reqs) > 0 {
+			stats := c.l7Stats.get(l7.ProtocolHTTP, conn.DestinationKey)
+			trace := c.traceFor(conn)
+			for _, req := range reqs {
+				c.observeHttp1(stats, trace, req)
+			}
+		}
+	}
+	if conn.http2Parser != nil {
+		if reqs := conn.http2Parser.Flush(now); len(reqs) > 0 {
+			stats := c.l7Stats.get(l7.ProtocolHTTP2, conn.DestinationKey)
+			trace := c.traceFor(conn)
+			for _, req := range reqs {
+				c.observeHttp2(stats, trace, req)
+			}
+		}
+	}
+	return (conn.http1Parser != nil && conn.http1Parser.Held() > 0) || (conn.http2Parser != nil && conn.http2Parser.Held() > 0)
 }
 
 // observeHttp1 and observeHttp2 count a finished call and create its span; the
