@@ -228,6 +228,8 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.TracesSpansCreated
 	ch <- metrics.TracesSpansExported
 	ch <- metrics.TracesSpansExportFailed
+	ch <- metrics.TracesSpansDropped
+	ch <- metrics.TracesQueueBytes
 	ch <- metrics.HttpBodies
 	ch <- metrics.Http1EventsSeen
 	ch <- metrics.Http1DroppedNoConnection
@@ -247,6 +249,9 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	ch <- metrics.Counter(metrics.TracesSpansCreated, float64(created))
 	ch <- metrics.Counter(metrics.TracesSpansExported, float64(exported))
 	ch <- metrics.Counter(metrics.TracesSpansExportFailed, float64(failed))
+	queueBytes, dropped := tracing.QueueStats()
+	ch <- metrics.Counter(metrics.TracesSpansDropped, float64(dropped))
+	ch <- metrics.Gauge(metrics.TracesQueueBytes, float64(queueBytes))
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	for ip, domain := range r.ip2fqdn {

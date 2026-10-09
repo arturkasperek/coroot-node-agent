@@ -43,20 +43,18 @@ func Stats() (created, exported, failed uint64) {
 	return spansCreated.Load(), spansExported.Load(), spansExportFailed.Load()
 }
 
-type countingExporter struct{ sdktrace.SpanExporter }
-
-func (e countingExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
-	err := e.SpanExporter.ExportSpans(ctx, spans)
-	if err != nil {
-		spansExportFailed.Add(uint64(len(spans)))
-	} else {
-		spansExported.Add(uint64(len(spans)))
+// QueueStats returns the estimated bytes of the spans waiting for the exporter and the
+// number of spans dropped because the queue was full (see queueBudget).
+func QueueStats() (bytes int64, dropped uint64) {
+	if budget == nil {
+		return 0, 0
 	}
-	return err
+	return budget.bytes.Load(), budget.dropped.Load()
 }
 
 var (
 	batcher             sdktrace.TracerProviderOption
+	budget              *queueBudget
 	commonResourceAttrs []attribute.KeyValue
 	agentVersion        string
 	initialized         bool
@@ -98,17 +96,16 @@ func Init(machineId, hostname, version string) {
 		klog.Exitln(err)
 	}
 
-	var batchOpts []sdktrace.BatchSpanProcessorOption
+	maxSpans := int64(sdktrace.DefaultMaxQueueSize)
 	if *flags.HttpBodyCapture {
 		// Spans that carry bodies are several times larger, so they export more
 		// slowly while a burst of calls keeps arriving; the default queue (2048
-		// spans) then overflows and the SDK drops spans silently (only
-		// node_traces_spans_created_total minus ..._exported_total shows it).
-		// A deeper queue absorbs the burst; it is bounded (16384 spans, a few
-		// tens of MB at the 4 KB body cap).
-		batchOpts = append(batchOpts, sdktrace.WithMaxQueueSize(16384))
+		// spans) then overflows. A deeper queue absorbs the burst; what bounds its
+		// memory is --traces-queue-max-bytes.
+		maxSpans = 16384
 	}
-	batcher = sdktrace.WithBatcher(countingExporter{exporter}, batchOpts...)
+	budget = newQueueBudget(int64(*flags.TracesQueueMaxBytes), maxSpans)
+	batcher = sdktrace.WithSpanProcessor(newBatcher(exporter, budget))
 	commonResourceAttrs = []attribute.KeyValue{semconv.HostName(hostname), semconv.HostID(machineId)}
 	agentVersion = version
 	initialized = true

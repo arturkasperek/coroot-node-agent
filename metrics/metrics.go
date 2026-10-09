@@ -69,6 +69,8 @@ var (
 	TracesSpansCreated      = metric("node_traces_spans_created_total", "Spans handed to the OpenTelemetry SDK")
 	TracesSpansExported     = metric("node_traces_spans_exported_total", "Spans the OTLP exporter successfully sent")
 	TracesSpansExportFailed = metric("node_traces_spans_export_failed_total", "Spans the OTLP exporter failed to send. Created minus (exported + failed), once drained, is spans the SDK's batch queue dropped")
+	TracesSpansDropped      = metric("node_traces_spans_dropped_total", "Spans dropped before the export queue because it was full (--traces-queue-max-bytes, or its span limit)")
+	TracesQueueBytes        = metric("node_traces_queue_bytes", "Estimated size of the spans waiting for the OTLP exporter")
 
 	EbpfProgramRecursionMisses = metric("node_ebpf_program_recursion_misses_total", "Times the kernel skipped a BPF program because that program was already running on the same CPU (the skipped run is silently lost)", "program")
 	EbpfUserMemoryReadFailures = metric("node_ebpf_user_memory_read_failures_total", "Reads of a traced application's memory that failed even after retrying (the capture of that request or response is cut short or the connection is not recognised)", "stage")

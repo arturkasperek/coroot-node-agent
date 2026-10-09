@@ -29,6 +29,7 @@ var (
 
 	TracesEndpoint        = kingpin.Flag("traces-endpoint", "The URL of the endpoint to send traces to").Envar("TRACES_ENDPOINT").URL()
 	TracesSampling        = kingpin.Flag("traces-sampling", "Trace sampling rate (0.0 to 1.0)").Default("1.0").Envar("TRACES_SAMPLING").Float64()
+	TracesQueueMaxBytes   = kingpin.Flag("traces-queue-max-bytes", "Maximum size of the spans waiting to be sent to the traces endpoint, estimated from their attributes (HTTP bodies included); spans over it are dropped and counted in node_traces_spans_dropped_total. Supports size suffixes like KB or MB.").Default("32MB").Envar("TRACES_QUEUE_MAX_BYTES").Bytes()
 	ProfilesEndpoint      = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
 	ProfilesPruneFraction = kingpin.Flag("profiles-prune-fraction", "Drop insignificant profile code paths accounting for less than this fraction of the profile total (0 to disable)").Default("0.0025").Envar("PROFILES_PRUNE_FRACTION").Float64()
 )
