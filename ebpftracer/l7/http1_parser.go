@@ -334,6 +334,9 @@ func (p *Http1Parser) finish(ex *http1Exchange) Http1Request {
 	if !ex.noBody {
 		respBody, respSize = p.opts.finishBody(ex.body, ex.hdr.contentType, ex.hdr.contentEncoding, respSize)
 	}
+	// The result holds copies; p.lastReq and p.curResp may still point at this exchange.
+	ex.req.body.release()
+	ex.body.release()
 	return Http1Request{
 		Method:           ex.req.method,
 		Path:             ex.req.path,

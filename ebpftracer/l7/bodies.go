@@ -145,6 +145,16 @@ func (c *bodyCollector) Add(b []byte) {
 	}
 }
 
+// release gives the buffer back once the body has been put on a span. The parser keeps
+// pointers to its last request and response after that, so without it every connection
+// held a body per direction until its next exchange (or for good, if there was none).
+// Add is a no-op afterwards: the rest of a body that comes after its span is not needed.
+func (c *bodyCollector) release() {
+	if c != nil {
+		c.buf, c.max = nil, 0
+	}
+}
+
 func (c *bodyCollector) Bytes() []byte { return c.buf }
 func (c *bodyCollector) Len() int      { return len(c.buf) }
 func (c *bodyCollector) Full() bool    { return len(c.buf) >= c.max }
