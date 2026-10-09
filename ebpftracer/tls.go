@@ -59,6 +59,11 @@ func (t *Tracer) attachUprobes(exePath string, ef *ELFFile, specs []uprobeSpec, 
 			l.Close()
 		}
 	}
+	symbols := make([]string, len(specs))
+	for i, s := range specs {
+		symbols[i] = s.symbol
+	}
+	ef.PrefetchSymbols(symbols...) // one pass over the symbol table, not one per spec
 	for _, s := range specs {
 		sym, err := ef.GetSymbol(s.symbol)
 		if err != nil {

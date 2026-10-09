@@ -53,6 +53,9 @@ func (t *Tracer) attachNodejsUprobes(libPath string) ([]link.Link, error) {
 	}
 	defer ef.Close()
 
+	callbacks := []string{"uv__stream_io", "uv__async_io", "uv__poll_io", "uv__server_io", "uv__udp_io"}
+	ef.PrefetchSymbols(append([]string{"uv__io_poll"}, callbacks...)...) // one pass over the symbol table
+
 	s, err := ef.GetSymbol("uv__io_poll")
 	if err != nil {
 		return nil, err
@@ -73,7 +76,7 @@ func (t *Tracer) attachNodejsUprobes(libPath string) ([]link.Link, error) {
 		return nil, err
 	}
 
-	for _, cb := range []string{"uv__stream_io", "uv__async_io", "uv__poll_io", "uv__server_io", "uv__udp_io"} {
+	for _, cb := range callbacks {
 		s, err = ef.GetSymbol(cb)
 		if err != nil {
 			break

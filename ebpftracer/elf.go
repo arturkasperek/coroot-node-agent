@@ -1,8 +1,10 @@
 package ebpftracer
 
 import (
+	"bufio"
 	"bytes"
 	"debug/elf"
+	"errors"
 	"fmt"
 	"io"
 
@@ -84,8 +86,10 @@ func (s *Symbol) AttachUretprobes(exe *link.Executable, prog *ebpf.Program, pid 
 }
 
 type ELFFile struct {
-	elf               *elf.File
-	symbols           []elf.Symbol
+	elf *elf.File
+	// resolved are the answers of the lookups so far: the symbol of a name, or nil when the
+	// file has no such symbol.
+	resolved          map[string]*elf.Symbol
 	textSection       *elf.Section
 	textSectionReader io.ReadSeeker
 }
@@ -98,33 +102,189 @@ func OpenELFFile(path string) (*ELFFile, error) {
 	return &ELFFile{elf: file}, nil
 }
 
-func (f *ELFFile) readSymbols() error {
-	symbols, _ := f.elf.Symbols()
-	dyn, _ := f.elf.DynamicSymbols()
+// A binary has hundreds of thousands of symbols (821k in the agent's own) and the agent
+// looks for two or three of them. debug/elf's Symbols() decodes the whole table into
+// []elf.Symbol with a string per name: 216 MB of heap for the agent's binary, enough to
+// exceed the memory limit of the agent at startup. The tables are read in place instead:
+// the entries one by one, the name of a candidate from the string table into a reused
+// buffer. Nothing is kept but the symbols that were asked for.
 
-	if len(symbols) == 0 && len(dyn) == 0 {
-		return fmt.Errorf("no symbols found")
+// symbolTable is a symbol table of the file, .symtab or .dynsym.
+type symbolTable struct {
+	entries io.Reader
+	names   io.ReaderAt // the string table of the entries
+	versym  io.ReaderAt // .gnu.version: the versions of the entries of .dynsym, nil for .symtab
+	count   int         // the entries, the null symbol included
+}
+
+const (
+	// a name is read in chunks of this size, up to maxNameLength
+	nameChunk     = 256
+	maxNameLength = 64 * 1024
+	// the "hidden" bit of a symbol version: not the default version of the symbol
+	versionHidden = 0x8000
+)
+
+func (f *ELFFile) entrySize() int {
+	if f.elf.Class == elf.ELFCLASS32 {
+		return 16 // Elf32_Sym
 	}
-	f.symbols = append(symbols, dyn...)
+	return 24 // Elf64_Sym
+}
+
+func sectionReaderAt(s *elf.Section) (io.ReaderAt, error) {
+	if s.Flags&elf.SHF_COMPRESSED == 0 {
+		return s, nil
+	}
+	data, err := s.Data()
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(data), nil
+}
+
+// symbolTables are .symtab, then .dynsym: the order in which the symbols are looked up. A
+// table that holds nothing but the null symbol, or has no string table, is left out.
+func (f *ELFFile) symbolTables() []symbolTable {
+	var tables []symbolTable
+	for _, typ := range []elf.SectionType{elf.SHT_SYMTAB, elf.SHT_DYNSYM} {
+		section := f.elf.SectionByType(typ)
+		if section == nil || int(section.Link) >= len(f.elf.Sections) {
+			continue
+		}
+		count := int(section.Size) / f.entrySize()
+		if count <= 1 {
+			continue
+		}
+		names, err := sectionReaderAt(f.elf.Sections[section.Link])
+		if err != nil {
+			continue
+		}
+		table := symbolTable{entries: bufio.NewReaderSize(section.Open(), 1<<16), names: names, count: count}
+		if typ == elf.SHT_DYNSYM {
+			if versym := f.elf.SectionByType(elf.SHT_GNU_VERSYM); versym != nil {
+				table.versym, _ = sectionReaderAt(versym)
+			}
+		}
+		tables = append(tables, table)
+	}
+	return tables
+}
+
+// decodeSymbol reads the fields of one table entry.
+func (f *ELFFile) decodeSymbol(entry []byte) (name uint32, sym elf.Symbol) {
+	order := f.elf.ByteOrder
+	name = order.Uint32(entry[0:4])
+	if f.elf.Class == elf.ELFCLASS32 {
+		sym.Value = uint64(order.Uint32(entry[4:8]))
+		sym.Size = uint64(order.Uint32(entry[8:12]))
+		sym.Info, sym.Other = entry[12], entry[13]
+		sym.Section = elf.SectionIndex(order.Uint16(entry[14:16]))
+		return
+	}
+	sym.Info, sym.Other = entry[4], entry[5]
+	sym.Section = elf.SectionIndex(order.Uint16(entry[6:8]))
+	sym.Value = order.Uint64(entry[8:16])
+	sym.Size = order.Uint64(entry[16:24])
+	return
+}
+
+// isCallable says whether a symbol is a function that can be probed.
+func isCallable(sym *elf.Symbol) bool {
+	return elf.ST_TYPE(sym.Info) == elf.STT_FUNC && sym.Size != 0 && sym.Value != 0
+}
+
+// isHiddenVersion says whether entry i of a .dynsym is a non-default version of a symbol
+// (libpthread has pthread_cond_timedwait twice: a default and a compatibility one).
+func (f *ELFFile) isHiddenVersion(table *symbolTable, i int) bool {
+	if table.versym == nil {
+		return false
+	}
+	var version [2]byte
+	if _, err := table.versym.ReadAt(version[:], int64(i)*2); err != nil {
+		return false
+	}
+	return f.elf.ByteOrder.Uint16(version[:])&versionHidden != 0
+}
+
+var errNoSymbols = errors.New("no symbols found")
+
+// lookup finds the symbols of names in one pass over the tables and remembers the answers.
+// The first function of a name wins, .symtab before .dynsym; of the versions of a dynamic
+// symbol only the default one counts.
+func (f *ELFFile) lookup(names []string) error {
+	pending := map[string]struct{}{}
+	longest := 0
+	for _, name := range names {
+		if _, ok := f.resolved[name]; !ok {
+			pending[name] = struct{}{}
+			longest = max(longest, len(name))
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	tables := f.symbolTables()
+	if len(tables) == 0 {
+		return errNoSymbols
+	}
+	if f.resolved == nil {
+		f.resolved = map[string]*elf.Symbol{}
+	}
+
+	entry := make([]byte, f.entrySize())
+	// longest + 1 bytes: a name of the table is a match only when the terminator follows it
+	buf := make([]byte, longest+1)
+	for t := range tables {
+		table := &tables[t]
+		for i := 0; i < table.count && len(pending) > 0; i++ {
+			if _, err := io.ReadFull(table.entries, entry); err != nil {
+				return fmt.Errorf("read symbols: %w", err)
+			}
+			if i == 0 { // the null symbol
+				continue
+			}
+			nameOffset, sym := f.decodeSymbol(entry)
+			if !isCallable(&sym) {
+				continue
+			}
+			n, _ := table.names.ReadAt(buf, int64(nameOffset))
+			end := bytes.IndexByte(buf[:n], 0)
+			if end < 0 {
+				continue
+			}
+			if _, ok := pending[string(buf[:end])]; !ok {
+				continue
+			}
+			if f.isHiddenVersion(table, i) {
+				continue
+			}
+			found := sym // a copy: the symbol of the loop must not escape to the heap, one per entry
+			found.Name = string(buf[:end])
+			f.resolved[found.Name] = &found
+			delete(pending, found.Name)
+		}
+	}
+	for name := range pending {
+		f.resolved[name] = nil
+	}
 	return nil
 }
 
+// PrefetchSymbols looks the names up in one pass over the symbol tables, so that GetSymbol
+// of each of them does not read the file again. Whoever needs several symbols of a file
+// (the Go TLS probes need three, Node.js six) should call it first.
+func (f *ELFFile) PrefetchSymbols(names ...string) {
+	_ = f.lookup(names)
+}
+
 func (f *ELFFile) GetSymbol(name string) (*Symbol, error) {
-	if f.symbols == nil {
-		if err := f.readSymbols(); err != nil {
+	if _, ok := f.resolved[name]; !ok {
+		if err := f.lookup([]string{name}); err != nil {
 			return nil, err
 		}
 	}
-	var es *elf.Symbol
-	for _, s := range f.symbols {
-		if elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Size == 0 || s.Value == 0 {
-			continue
-		}
-		if s.Name == name && s.VersionIndex&0x8000 == 0 {
-			es = &s
-			break
-		}
-	}
+	es := f.resolved[name]
 	if es == nil {
 		return nil, fmt.Errorf("symbol %s not found", name)
 	}
@@ -188,27 +348,59 @@ func findSymbolValue(ef *elf.File, sectionName, symName string) (uint64, error) 
 	return 0, fmt.Errorf("%s not found", symName)
 }
 
-func (f *ELFFile) FindSymbolBySubstrings(substrs ...string) *Symbol {
-	if f.symbols == nil {
-		if err := f.readSymbols(); err != nil {
-			return nil
+// readName reads the NUL-terminated name at offset of a string table into buf, growing it
+// when needed. ok is false when the name has no terminator within maxNameLength.
+func readName(names io.ReaderAt, offset int64, buf []byte) (name, grown []byte, ok bool) {
+	buf = buf[:0]
+	for len(buf) < maxNameLength {
+		if cap(buf)-len(buf) < nameChunk {
+			buf = append(make([]byte, 0, 2*cap(buf)+nameChunk), buf...)
+		}
+		chunk := buf[len(buf) : len(buf)+nameChunk]
+		n, err := names.ReadAt(chunk, offset+int64(len(buf)))
+		if end := bytes.IndexByte(chunk[:n], 0); end >= 0 {
+			return buf[:len(buf)+end], buf, true
+		}
+		buf = buf[:len(buf)+n]
+		if err != nil || n == 0 {
+			break
 		}
 	}
-	for _, s := range f.symbols {
-		if elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Size == 0 || s.Value == 0 {
-			continue
-		}
-		name := []byte(s.Name)
-		match := true
-		for _, sub := range substrs {
-			if !bytes.Contains(name, []byte(sub)) {
-				match = false
+	return nil, buf, false
+}
+
+func (f *ELFFile) FindSymbolBySubstrings(substrs ...string) *Symbol {
+	entry := make([]byte, f.entrySize())
+	var buf []byte
+	for _, table := range f.symbolTables() {
+		for i := 0; i < table.count; i++ {
+			if _, err := io.ReadFull(table.entries, entry); err != nil {
 				break
 			}
-		}
-		if match {
-			es := s
-			return &Symbol{s: &es, f: f}
+			if i == 0 { // the null symbol
+				continue
+			}
+			nameOffset, sym := f.decodeSymbol(entry)
+			if !isCallable(&sym) {
+				continue
+			}
+			var name []byte
+			var ok bool
+			if name, buf, ok = readName(table.names, int64(nameOffset), buf); !ok {
+				continue
+			}
+			match := true
+			for _, sub := range substrs {
+				if !bytes.Contains(name, []byte(sub)) {
+					match = false
+					break
+				}
+			}
+			if match {
+				found := sym // a copy: the symbol of the loop must not escape to the heap, one per entry
+				found.Name = string(name)
+				return &Symbol{s: &found, f: f}
+			}
 		}
 	}
 	return nil
