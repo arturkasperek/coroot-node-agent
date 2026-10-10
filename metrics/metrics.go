@@ -79,7 +79,7 @@ var (
 	EbpfUserMemoryReadsRescued = metric("node_ebpf_user_memory_reads_rescued_total", "Reads of a traced application's memory that failed once (a page momentarily unavailable, e.g. under migration) and succeeded on retry")
 
 	Http1EventsSeen          = metric("node_l7_http1_events_total", "Total number of outbound HTTP/1 L7 events the kernel delivered to userspace, whether or not they could be correlated to a tracked connection")
-	Http1DroppedNoConnection = metric("node_l7_http1_dropped_no_connection_total", "Total number of outbound HTTP/1 L7 events that arrived before their (pid, fd)'s connection was registered (buffered into a pending parser, see feedPendingHttp1 — not necessarily lost, but a request completing entirely before registration still is)")
+	Http1DroppedNoConnection = metric("node_l7_http1_dropped_no_connection_total", "Total number of outbound HTTP/1 L7 events dropped because their (pid, fd) has no registered connection (opened before the agent started, its open event lost, or the fd passed to another process)")
 	Http1DroppedTsMismatch   = metric("node_l7_http1_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/1 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")
 	Http1RequestsParsed      = metric("node_l7_http1_requests_parsed_total", "Total number of complete HTTP/1 request/response pairs the parser reconstructed from correlated events")
 
@@ -98,7 +98,7 @@ var (
 
 	HttpBodies               = metric("node_l7_http_bodies_total", "What happened to the bodies of outbound HTTP calls seen with --http-body-capture: captured, truncated (captured but cut), skipped by content type, content encoding or because they look binary, or dropped for lack of a message or a full queue", "result")
 	Http2EventsSeen          = metric("node_l7_http2_events_total", "Total number of outbound HTTP/2 L7 events the kernel delivered to userspace, whether or not they could be correlated to a tracked connection")
-	Http2DroppedNoConnection = metric("node_l7_http2_dropped_no_connection_total", "Total number of outbound HTTP/2 L7 events that arrived before their (pid, fd)'s connection was registered")
+	Http2DroppedNoConnection = metric("node_l7_http2_dropped_no_connection_total", "Total number of outbound HTTP/2 L7 events dropped because their (pid, fd) has no registered connection (opened before the agent started, its open event lost, or the fd passed to another process)")
 	Http2DroppedTsMismatch   = metric("node_l7_http2_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/2 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")
 	Http2RequestsParsed      = metric("node_l7_http2_requests_parsed_total", "Total number of complete HTTP/2 request/response pairs the parser reconstructed from correlated events")
 

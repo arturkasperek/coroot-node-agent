@@ -21,8 +21,6 @@ func newConnectionsTestContainer() *Container {
 		activeConnections:    map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:   map[PidFd]*ActiveConnection{},
 		connectionsByPidFdTs: map[PidFdTs]*ActiveConnection{},
-		pendingHttp1Parsers:  map[PidFdTs]*pendingHttp1State{},
-		pendingHttp2Parsers:  map[PidFdTs]*pendingHttp2State{},
 	}
 }
 
@@ -108,25 +106,6 @@ func TestHeldResponseIsReleasedBeforeTheConnectionIsForgotten(t *testing.T) {
 	assert.Equal(t, uint64(1), c.registry.http1RequestsParsed.Load(), "the held response is a span")
 	assert.NotContains(t, c.activeConnections, k)
 	assert.NotContains(t, c.bodyHolders, conn)
-}
-
-// Parsers of L7 events that came before their connection was registered wait for it
-// for the grace too: a connection that has not shown up by then will not.
-func TestPendingParsersExpireAfterTheGrace(t *testing.T) {
-	c := newConnectionsTestContainer()
-	t0 := time.Now()
-	k1 := PidFdTs{Pid: 4321, Fd: 7, Timestamp: 1000}
-	k2 := PidFdTs{Pid: 4321, Fd: 8, Timestamp: 1000}
-	c.pendingHttp1Parsers[k1] = &pendingHttp1State{parser: l7.NewHttp1Parser(), timestamp: 1000, updatedAt: t0}
-	c.pendingHttp2Parsers[k2] = &pendingHttp2State{parser: l7.NewHttp2Parser(), timestamp: 1000, updatedAt: t0}
-
-	c.gcClosedConnections(t0.Add(closedConnectionGrace / 2))
-	assert.Contains(t, c.pendingHttp1Parsers, k1)
-	assert.Contains(t, c.pendingHttp2Parsers, k2)
-
-	c.gcClosedConnections(t0.Add(closedConnectionGrace + time.Second))
-	assert.NotContains(t, c.pendingHttp1Parsers, k1)
-	assert.NotContains(t, c.pendingHttp2Parsers, k2)
 }
 
 // gcClosedConnections reports what it keeps, which the registry exports: open

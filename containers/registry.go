@@ -134,12 +134,7 @@ type Registry struct {
 	// event processing.
 	tlsAttachNanos atomic.Uint64
 
-	// Same partitioning as the http1* counters above, for HTTP/2 —
-	// h2c connections are normally long-lived (no fd churn), so this race
-	// should be rare there, but it uses the exact same
-	// connectionsByPidFd/connectionsByPidFdTs lookup and the exact same
-	// feedPendingHttp2 buffering as HTTP/1 (see onL7Request), so it's not
-	// immune to it either.
+	// Same partitioning as the http1* counters above, for HTTP/2.
 	http2EventsSeen          atomic.Uint64
 	http2DroppedNoConnection atomic.Uint64
 	http2DroppedTsMismatch   atomic.Uint64

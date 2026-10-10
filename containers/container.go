@@ -101,46 +101,6 @@ type PidFdTs struct {
 	Timestamp uint64
 }
 
-type pendingHttp2State struct {
-	parser    *l7.Http2Parser
-	timestamp uint64
-	updatedAt time.Time
-	// Requests the parser completed while still waiting for their own
-	// connection to register — see feedPendingHttp2/emitPendingHttp2Requests.
-	completed []pendingHttp2CompletedRequest
-}
-
-type pendingHttp2CompletedRequest struct {
-	req l7.Http2Request
-	at  time.Time
-}
-
-type pendingHttp1State struct {
-	parser    *l7.Http1Parser
-	timestamp uint64
-	updatedAt time.Time
-	// Requests the parser completed while still waiting for their own
-	// connection to register — see feedPendingHttp1/emitPendingHttp1Requests.
-	completed []pendingHttp1CompletedRequest
-}
-
-type pendingHttp1CompletedRequest struct {
-	req l7.Http1Request
-	at  time.Time
-}
-
-// pendingL7RequestMaxAge bounds how long a request/response pair completed
-// by feedPendingHttp1/feedPendingHttp2 (before its connection was
-// registered) can wait for onConnectionOpen to recover it. Trace.createSpan
-// (see tracing/tracing.go) stamps a span's absolute start/end from
-// time.Now() at emission, not from any kernel timestamp — the request's
-// Duration is still correct either way (it comes from kernel timestamps),
-// but the longer we hold a completed request before emitting it, the
-// further its reported position in the trace timeline drifts from when it
-// actually happened. Past this age it's better to drop it than emit a
-// visibly stale span.
-const pendingL7RequestMaxAge = 2 * time.Second
-
 type ConnectionStats struct {
 	Count           uint64
 	TotalTime       time.Duration
@@ -179,13 +139,6 @@ type Container struct {
 	connectionsByPidFdTs map[PidFdTs]*ActiveConnection
 	// the most connections indexed since the maps were last rebuilt, see gcClosedConnections
 	connectionsPeak int
-	// Keyed by the exact (pid, fd, timestamp) of the connection each
-	// buffered parser belongs to, not just (pid, fd) — fd churn (see
-	// onL7Request) means several distinct, not-yet-registered connections
-	// can share the same (pid, fd) simultaneously, and each needs its own
-	// slot so a newer one's pending events don't clobber an older one's.
-	pendingHttp2Parsers map[PidFdTs]*pendingHttp2State
-	pendingHttp1Parsers map[PidFdTs]*pendingHttp1State
 
 	// Connections whose parser holds responses back for their bodies
 	// (--http-body-capture), see flushHttpBodies.
@@ -251,8 +204,6 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		connectionsByPidFdTs:     map[PidFdTs]*ActiveConnection{},
-		pendingHttp2Parsers:      map[PidFdTs]*pendingHttp2State{},
-		pendingHttp1Parsers:      map[PidFdTs]*pendingHttp1State{},
 		l7Stats:                  L7Stats{},
 		l7InboundStats:           L7InboundStats{},
 		dnsStats:                 &L7Metrics{},
@@ -745,152 +696,8 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			c.connectionsByPidFdTs[PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}] = connection
 		}
 		c.connectionsPeak = max(c.connectionsPeak, len(c.activeConnections), len(c.connectionsByPidFdTs))
-		if timestamp != 0 {
-			kts := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
-			if pending, ok := c.pendingHttp2Parsers[kts]; ok {
-				connection.http2Parser = pending.parser
-				c.emitPendingHttp2Requests(connection, pending.completed)
-				delete(c.pendingHttp2Parsers, kts)
-			}
-		}
-		if timestamp != 0 {
-			kts := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
-			if pending, ok := c.pendingHttp1Parsers[kts]; ok {
-				connection.http1Parser = pending.parser
-				c.emitPendingHttp1Requests(connection, pending.completed)
-				delete(c.pendingHttp1Parsers, kts)
-			}
-		}
-		// responses the replayed events left waiting for their bodies
-		c.noteBodyHolder(connection)
 	}
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
-}
-
-// feedPendingHttp2 mirrors feedPendingHttp1 (see there for why this race is
-// routine, not exceptional): an HTTP/2 L7 event can arrive for a (pid, fd)
-// before onConnectionOpen has registered that connection, most likely for
-// this protocol when a long-lived multiplexed connection gets transparently
-// redialed (a TCP-level hiccup, a PING timeout, ...) — invisible to the
-// application, but it re-triggers the exact same connection-registration
-// race HTTP/1 hits on every request. A request/response pair that
-// completes entirely before the connection registers is queued in
-// st.completed (bounded by pendingL7RequestMaxAge) and emitted
-// retroactively by emitPendingHttp2Requests once onConnectionOpen finds
-// this state.
-func (c *Container) feedPendingHttp2(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) {
-	k := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
-	st := c.pendingHttp2Parsers[k]
-	if st == nil {
-		st = &pendingHttp2State{parser: newHttp2Parser(), timestamp: timestamp}
-		c.pendingHttp2Parsers[k] = st
-	}
-	st.updatedAt = time.Now()
-	for _, req := range st.parser.Parse(r.Method, r.Payload, uint64(r.Duration)) {
-		st.completed = append(st.completed, pendingHttp2CompletedRequest{req: req, at: st.updatedAt})
-	}
-}
-
-// emitPendingHttp2Requests replays request/response pairs that completed
-// while their connection was still unregistered (see feedPendingHttp2), now
-// that onConnectionOpen has found the real connection for them. Mirrors
-// the l7.ProtocolHTTP2 case in onL7Request's switch — see
-// emitPendingHttp1Requests for why this recomputes stats/trace rather than
-// sharing the live path's.
-func (c *Container) emitPendingHttp2Requests(conn *ActiveConnection, completed []pendingHttp2CompletedRequest) {
-	if len(completed) == 0 {
-		return
-	}
-	now := time.Now()
-	stats := c.l7Stats.get(l7.ProtocolHTTP2, conn.DestinationKey)
-	ebpfTracesDisabled := false
-	for _, p := range c.processes {
-		if p.Flags.EbpfTracesDisabled {
-			ebpfTracesDisabled = true
-			break
-		}
-	}
-	var trace *tracing.Trace
-	if !ebpfTracesDisabled {
-		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
-	}
-	for _, cr := range completed {
-		if now.Sub(cr.at) > pendingL7RequestMaxAge {
-			continue
-		}
-		if !common.HttpFilter.ShouldBeSkipped(cr.req.Path) {
-			status := cr.req.Status.Http()
-			if cr.req.GrpcStatus >= 0 {
-				status = cr.req.GrpcStatus.GRPC()
-			}
-			stats.observe(status, "", cr.req.Duration)
-			trace.Http2Request(cr.req.Method, cr.req.Path, cr.req.Scheme, cr.req.Status, cr.req.GrpcStatus, cr.req.Duration, http2Bodies(cr.req), cr.req.At)
-		}
-	}
-}
-
-// feedPendingHttp1 mirrors feedPendingHttp2: an HTTP/1 L7 event can arrive
-// for a (pid, fd) before onConnectionOpen has registered that connection —
-// the tcp-connect-events and l7-events ring buffers are merged in order (see
-// ringMerger in ebpftracer/ringmerge.go), but a connection event can still be
-// missing: lost to a full ring, or sent before the agent started. Rather than
-// dropping the event
-// (as onL7Request otherwise would for l7.ProtocolHTTP when conn == nil),
-// keep parsing into a pending Http1Parser so header/body framing state
-// isn't lost; onConnectionOpen attaches it to the real connection once
-// registered, and normal dispatch continues from there. A request/response
-// pair that completes entirely before the connection registers is queued
-// in st.completed (bounded by pendingL7RequestMaxAge) and emitted
-// retroactively by emitPendingHttp1Requests once onConnectionOpen finds
-// this state.
-func (c *Container) feedPendingHttp1(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) {
-	k := PidFdTs{Pid: pid, Fd: fd, Timestamp: timestamp}
-	st := c.pendingHttp1Parsers[k]
-	if st == nil {
-		st = &pendingHttp1State{parser: newHttp1Parser(), timestamp: timestamp}
-		c.pendingHttp1Parsers[k] = st
-	}
-	st.updatedAt = time.Now()
-	for _, req := range st.parser.Parse(r.Method, r.Payload, uint64(r.Duration)) {
-		st.completed = append(st.completed, pendingHttp1CompletedRequest{req: req, at: st.updatedAt})
-	}
-}
-
-// emitPendingHttp1Requests replays request/response pairs that completed
-// while their connection was still unregistered (see feedPendingHttp1),
-// now that onConnectionOpen has found the real connection for them.
-// Mirrors the l7.ProtocolHTTP case in onL7Request's switch, but that
-// path's stats/trace are computed once per live event and reused across
-// protocols, whereas this one is only reached rarely (once per recovered
-// connection), so it computes its own rather than restructuring the live
-// path to share them.
-func (c *Container) emitPendingHttp1Requests(conn *ActiveConnection, completed []pendingHttp1CompletedRequest) {
-	if len(completed) == 0 {
-		return
-	}
-	now := time.Now()
-	stats := c.l7Stats.get(l7.ProtocolHTTP, conn.DestinationKey)
-	ebpfTracesDisabled := false
-	for _, p := range c.processes {
-		if p.Flags.EbpfTracesDisabled {
-			ebpfTracesDisabled = true
-			break
-		}
-	}
-	var trace *tracing.Trace
-	if !ebpfTracesDisabled {
-		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
-	}
-	for _, cr := range completed {
-		if now.Sub(cr.at) > pendingL7RequestMaxAge {
-			continue
-		}
-		c.registry.http1RequestsParsed.Add(1)
-		if !common.HttpFilter.ShouldBeSkipped(cr.req.Path) {
-			stats.observe(cr.req.Status.Http(), "", cr.req.Duration)
-			trace.HttpRequest(cr.req.Method, cr.req.Path, cr.req.Status, cr.req.Duration, http1Bodies(cr.req), cr.req.At)
-		}
-	}
 }
 
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
@@ -1036,22 +843,11 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		}
 	}
 	if conn == nil || (timestamp != 0 && conn.Timestamp != timestamp) {
-		// Still unresolved even after the connectionsByPidFdTs fallback
-		// above: either this (pid, fd) has never been registered at all,
-		// or it has but for a *different* connection than this event's
-		// own timestamp (the fallback lookup itself came up empty,
-		// meaning that connection's own connect-open event hasn't been
-		// processed yet either — same cross-ring-buffer race, just late
-		// enough that neither map has caught up). Both cases get one
-		// more chance via feedPendingHttp1, keyed by the event's own
-		// (pid, fd, timestamp) so concurrently-pending connections on a
-		// fast-recycled fd don't clobber each other's buffered state;
-		// onConnectionOpen attaches it once that connection's own
-		// connect-open event finally arrives (see there).
+		// The connection of this event was never registered, and will not
+		// be: ringMerger hands the open of a connection over before its
+		// L7 events, so it was opened before the agent started, its open
+		// was lost to a full ring, or its fd was passed to another process.
 		wasNil := conn == nil
-		if r.Protocol == l7.ProtocolHTTP2 {
-			c.feedPendingHttp2(pid, fd, timestamp, r)
-		}
 		if r.Protocol == l7.ProtocolHTTP2 {
 			if wasNil {
 				c.registry.http2DroppedNoConnection.Add(1)
@@ -1065,7 +861,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			} else {
 				c.registry.http1DroppedTsMismatch.Add(1)
 			}
-			c.feedPendingHttp1(pid, fd, timestamp, r)
 		}
 		return nil
 	}
@@ -1631,16 +1426,6 @@ func (c *Container) gc(now time.Time) {
 			if conn.Timestamp != 0 {
 				delete(c.connectionsByPidFdTs, PidFdTs{Pid: conn.Pid, Fd: conn.Fd, Timestamp: conn.Timestamp})
 			}
-		}
-	}
-	for k, st := range c.pendingHttp2Parsers {
-		if now.Sub(st.updatedAt) > gcInterval {
-			delete(c.pendingHttp2Parsers, k)
-		}
-	}
-	for k, st := range c.pendingHttp1Parsers {
-		if now.Sub(st.updatedAt) > gcInterval {
-			delete(c.pendingHttp1Parsers, k)
 		}
 	}
 	for dst, at := range c.lastConnectionAttempts {

@@ -27,9 +27,8 @@ const (
 
 // gcClosedConnections forgets the connections closed more than
 // closedConnectionGrace ago, after their parsers have released the responses
-// still held back for a body, and the parsers of L7 events whose connection was
-// not registered within closedConnectionGrace. It returns how many connections
-// it keeps, open and closed.
+// still held back for a body. It returns how many connections it keeps, open and
+// closed.
 func (c *Container) gcClosedConnections(now time.Time) (open, closed int) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -64,16 +63,6 @@ func (c *Container) gcClosedConnections(now time.Time) (open, closed int) {
 		c.forgetConnection(conn.key, conn)
 	}
 	c.rebuildConnectionMaps()
-	for k, st := range c.pendingHttp1Parsers {
-		if now.Sub(st.updatedAt) > closedConnectionGrace {
-			delete(c.pendingHttp1Parsers, k)
-		}
-	}
-	for k, st := range c.pendingHttp2Parsers {
-		if now.Sub(st.updatedAt) > closedConnectionGrace {
-			delete(c.pendingHttp2Parsers, k)
-		}
-	}
 	return open, closed
 }
 
