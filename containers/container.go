@@ -831,10 +831,10 @@ func (c *Container) emitPendingHttp2Requests(conn *ActiveConnection, completed [
 
 // feedPendingHttp1 mirrors feedPendingHttp2: an HTTP/1 L7 event can arrive
 // for a (pid, fd) before onConnectionOpen has registered that connection —
-// the tcp-connect-events and l7-events ring buffers are read by two
-// independent goroutines with no ordering guarantee between them (see
-// runTcpConnectEventsReader/runL7EventsReader in ebpftracer/tracer.go), so
-// this race is routine, not exceptional. Rather than dropping the event
+// the tcp-connect-events and l7-events ring buffers are merged in order (see
+// ringMerger in ebpftracer/ringmerge.go), but a connection event can still be
+// missing: lost to a full ring, or sent before the agent started. Rather than
+// dropping the event
 // (as onL7Request otherwise would for l7.ProtocolHTTP when conn == nil),
 // keep parsing into a pending Http1Parser so header/body framing state
 // isn't lost; onConnectionOpen attaches it to the real connection once
@@ -1021,12 +1021,10 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 
 	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
 	if conn == nil || (timestamp != 0 && conn.Timestamp != timestamp) {
-		// (pid, fd) is reused across connections far faster than the
-		// two independent ring-buffer readers (tcp-connect-events and
-		// l7-events, see runTcpConnectEventsReader/runL7EventsReader in
-		// ebpftracer/tracer.go) can be guaranteed to stay in order: a
-		// late event for an older connection on this fd can arrive after
-		// a newer connection has already reused the same fd and
+		// (pid, fd) is reused across connections quickly: an event for an
+		// older connection on this fd (one held back for its body, or
+		// read by another thread after the close) can arrive after a
+		// newer connection has already reused the same fd and
 		// overwritten connectionsByPidFd's entry. Before treating this
 		// as unknown, check whether the *exact* connection this event
 		// belongs to (identified by its own timestamp, not just the

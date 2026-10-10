@@ -46,7 +46,7 @@ func TestPayloadTruncated(t *testing.T) {
 }
 
 func TestParseL7EventHeaderSize(t *testing.T) {
-	require.Equal(t, 48, binary.Size(l7Event{}))
+	require.Equal(t, 56, binary.Size(l7Event{}))
 }
 
 func TestConnectionMapValueSize(t *testing.T) {
@@ -102,7 +102,7 @@ func TestParseL7EventTooShort(t *testing.T) {
 }
 
 func TestParseTcpEventSize(t *testing.T) {
-	require.Equal(t, 110, binary.Size(tcpEvent{}))
+	require.Equal(t, 118, binary.Size(tcpEvent{}))
 }
 
 func TestParseTcpEventConnectionOpen(t *testing.T) {

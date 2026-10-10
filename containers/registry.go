@@ -593,11 +593,9 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					continue
 				}
 				// getOrCreateContainer, not a bare containersByPid lookup.
-				// tcp-connect-events and l7-events are read by independent
-				// goroutines with no ordering guarantee (see
-				// runTcpConnectEventsReader/runL7EventsReader), so an L7 event
-				// routinely arrives before the ConnectionOpen that would have
-				// registered its pid — every other event type here already
+				// An L7 event can come without the ConnectionOpen that would
+				// have registered its pid (lost to a full ring, or sent before
+				// the agent started) — every other event type here already
 				// registers on the spot, and dropping these silently lost
 				// whichever slice of traffic preceded the registration.
 				c := r.containersByPid[e.Pid]

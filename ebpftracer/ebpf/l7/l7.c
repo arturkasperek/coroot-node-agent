@@ -122,7 +122,11 @@ struct l7_event {
     __u8 padding;
     __u32 statement_id;
     __u64 payload_size;
+    /* bpf_ktime_get_ns() when the event is sent, see tcp_event.ts */
+    __u64 ts;
 };
+
+_Static_assert(__builtin_offsetof(struct l7_event, ts) == 48, "l7_event.ts: l7EventTsOffset in ringmerge.go");
 
 struct {
      __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
@@ -294,6 +298,7 @@ void send_event(struct l7_send_args *a) {
     e->fd = a->cid.fd;
     e->pid = a->cid.pid;
     e->payload_size = a->size;
+    e->ts = bpf_ktime_get_ns();
 
     if (bpf_ringbuf_reserve_dynptr(&l7_events, rec, 0, &d)) {
         l7_drop_event();

@@ -175,6 +175,10 @@ struct tcp_event {
     __u64 fd;
     __u64 timestamp;
     __u64 duration;
+    /* bpf_ktime_get_ns() when the event is sent: user space merges this ring and
+       l7_events by it, so that a connection's open, data and close are handled in
+       the order they happened (see ebpftracer/ringmerge.go) */
+    __u64 ts;
     __u32 type;
     __u32 pid;
     __u64 bytes_sent;
@@ -188,6 +192,8 @@ struct tcp_event {
     __u8 is_inbound;
     __u8 pad[7];
 };
+
+_Static_assert(__builtin_offsetof(struct tcp_event, ts) == 24, "tcp_event.ts: tcpEventTsOffset in ringmerge.go");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
@@ -222,6 +228,7 @@ void tcp_connect_drop_event(void) {
 // payload, so bpf_ringbuf_output is enough (no dynptr / reserve lifecycle).
 static __always_inline
 void send_tcp_connect_event(struct tcp_event *e) {
+    e->ts = bpf_ktime_get_ns();
     if (bpf_ringbuf_output(&tcp_connect_events, e, sizeof(*e), 0)) {
         tcp_connect_drop_event();
     }

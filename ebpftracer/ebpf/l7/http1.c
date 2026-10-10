@@ -215,6 +215,7 @@ void http1_flush(struct http1_flush_args *a) {
         e->fd = a->cid.fd;
         e->pid = a->cid.pid;
         e->payload_size = n;
+        e->ts = bpf_ktime_get_ns();
         if (bpf_ringbuf_reserve_dynptr(&l7_events, rec, 0, &d)) {
             l7_drop_event();
             bpf_ringbuf_discard_dynptr(&d, 0);

@@ -21,7 +21,6 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
-	"github.com/cilium/ebpf/ringbuf"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -112,13 +111,12 @@ type Tracer struct {
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 
-	collectionSpec   *ebpf.CollectionSpec
-	collection       *ebpf.Collection
-	readers          map[string]*perf.Reader
-	l7Reader         *ringbuf.Reader
-	tcpConnectReader *ringbuf.Reader
-	links            []link.Link
-	uprobes          map[string]*ebpf.Program
+	collectionSpec *ebpf.CollectionSpec
+	collection     *ebpf.Collection
+	readers        map[string]*perf.Reader
+	merger         *ringMerger // reads l7_events and tcp_connect_events in order
+	links          []link.Link
+	uprobes        map[string]*ebpf.Program
 
 	globalUprobes     map[UprobeKey]*globalUprobe
 	globalUprobesLock sync.Mutex
@@ -169,11 +167,8 @@ func (t *Tracer) Close() {
 	for _, r := range t.readers {
 		_ = r.Close()
 	}
-	if t.l7Reader != nil {
-		_ = t.l7Reader.Close()
-	}
-	if t.tcpConnectReader != nil {
-		_ = t.tcpConnectReader.Close()
+	if t.merger != nil {
+		t.merger.close()
 	}
 	t.globalUprobesLock.Lock()
 	for _, gu := range t.globalUprobes {
@@ -682,23 +677,15 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		go t.runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
 	}
 
-	if !t.disableL7Tracing {
-		rd, err := ringbuf.NewReader(t.collection.Maps["l7_events"])
-		if err != nil {
-			t.Close()
-			return fmt.Errorf("failed to create l7 ringbuf reader: %w", err)
-		}
-		t.l7Reader = rd
-		go t.runL7EventsReader(rd, ch)
-	}
-
-	tcpRd, err := ringbuf.NewReader(t.collection.Maps["tcp_connect_events"])
+	// With L7 tracing disabled l7_events stays empty and the connection records are
+	// handed over as they come.
+	m, err := newRingMerger(t.collection.Maps["l7_events"], t.collection.Maps["tcp_connect_events"])
 	if err != nil {
 		t.Close()
-		return fmt.Errorf("failed to create tcp_connect ringbuf reader: %w", err)
+		return fmt.Errorf("failed to read the l7 and tcp_connect ring buffers: %w", err)
 	}
-	t.tcpConnectReader = tcpRd
-	go t.runTcpConnectEventsReader(tcpRd, ch)
+	t.merger = m
+	go m.run(t.emitMerged(ch))
 
 	t.collectionSpec = collectionSpec
 	return nil
@@ -794,6 +781,7 @@ type tcpEvent struct {
 	Fd            uint64
 	Timestamp     uint64
 	Duration      uint64
+	Ts            uint64 // when the event was sent, see ringmerge.go
 	Type          EventType
 	Pid           uint32
 	BytesSent     uint64
@@ -828,6 +816,7 @@ type l7Event struct {
 	Padding             uint8
 	StatementId         uint32
 	PayloadSize         uint64
+	Ts                  uint64 // when the event was sent, see ringmerge.go
 }
 
 func (t *Tracer) runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
@@ -905,42 +894,25 @@ func parseTcpEvent(raw []byte) (*Event, error) {
 	return &event, nil
 }
 
-func (t *Tracer) runTcpConnectEventsReader(r *ringbuf.Reader, ch chan<- Event) {
-	for {
-		r.SetDeadline(time.Now().Add(10 * time.Millisecond))
-		rec, err := r.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				break
+// emitMerged turns the records ringMerger hands over into events.
+func (t *Tracer) emitMerged(ch chan<- Event) func(fromL7 bool, rec []byte) {
+	return func(fromL7 bool, rec []byte) {
+		if fromL7 {
+			event, truncated, err := parseL7Event(rec)
+			if err != nil {
+				klog.Warningln("failed to read l7 ringbuf record:", err)
+				return
 			}
-			continue
+			if truncated {
+				t.truncatedPayloads.Add(1)
+			}
+			ch <- *event
+			return
 		}
-		event, err := parseTcpEvent(rec.RawSample)
+		event, err := parseTcpEvent(rec)
 		if err != nil {
 			klog.Warningln("failed to read tcp_connect ringbuf record:", err)
-			continue
-		}
-		ch <- *event
-	}
-}
-
-func (t *Tracer) runL7EventsReader(r *ringbuf.Reader, ch chan<- Event) {
-	for {
-		r.SetDeadline(time.Now().Add(100 * time.Millisecond))
-		rec, err := r.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				break
-			}
-			continue
-		}
-		event, truncated, err := parseL7Event(rec.RawSample)
-		if err != nil {
-			klog.Warningln("failed to read l7 ringbuf record:", err)
-			continue
-		}
-		if truncated {
-			t.truncatedPayloads.Add(1)
+			return
 		}
 		ch <- *event
 	}

@@ -2,22 +2,23 @@ package containers
 
 import "time"
 
-// Close events and L7 events reach the agent through different ring buffers
-// (tcp_connect_events and l7_events) read by different goroutines, so the L7
-// events of a connection can be handled after its close: the L7 ring is the one
-// that falls behind under load. closedConnectionGrace is how long a closed
-// connection, with its parsers, is kept for them. It is what the registry
-// allows for events queued behind a process exit (RecentlyExitedTTL), far more
-// than the L7 ring can lag (128 MiB at the ~55 MB/s a 1-CPU agent reads it is
-// 2-3 s) and than a response is held back for its body (5 s).
+// Close events and L7 events come through different ring buffers
+// (tcp_connect_events and l7_events), merged in the order they happened by
+// ebpftracer's ringMerger: the close of a connection is handled after its L7
+// events. closedConnectionGrace covers what the order does not: a socket closed by
+// another thread while one is still in read(), and a response held back for its
+// body, which is released before the connection is forgotten anyway.
 //
-// gc keeps forgetting closed connections after gcInterval as a fallback, but
-// that was the only rule before: with connections kept 10-20 minutes after
-// their close, connection churn held hundreds of MB of connections and parsers.
+// Read by two independent goroutines, the L7 events of a connection were handled
+// seconds after its close under load, so closed connections were kept for 60 s:
+// a connection churn test peaked at 299k closed connections and 700 MB of memory
+// (81-100k and 370-406 MB merged).
 const (
-	closedConnectionGrace       = RecentlyExitedTTL
-	closedConnectionsGcInterval = 10 * time.Second
+	closedConnectionGrace       = 5 * time.Second
+	closedConnectionsGcInterval = 2 * time.Second
+)
 
+const (
 	// Go maps keep their memory when entries are deleted: the maps that indexed a
 	// burst of 100000 connections kept 19 MB after all of them were forgotten. They
 	// are rebuilt once they hold a quarter of their peak, if the peak was large.

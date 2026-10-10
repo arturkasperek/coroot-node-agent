@@ -46,10 +46,10 @@ func requireKnown(t *testing.T, c *Container, k ConnectionKey, conn *ActiveConne
 		"a late L7 event looks its connection up by (pid, fd, timestamp)")
 }
 
-// Close events and L7 events come through different ring buffers that are read
-// independently, so the last response of a connection can be read after its close.
-// A closed connection is kept for closedConnectionGrace for those, and not longer:
-// with 10 minutes, connection churn kept hundreds of MB of connections and parsers.
+// A closed connection is kept for closedConnectionGrace for the events the order of
+// the rings does not cover (a read by another thread after the close), and not
+// longer: with 10 minutes, connection churn kept hundreds of MB of connections and
+// parsers.
 func TestClosedConnectionIsKeptForTheGraceOnly(t *testing.T) {
 	c := newConnectionsTestContainer()
 	k, conn := addConnection(c, 41822, 4321, 7, 1000)
