@@ -1,4 +1,14 @@
-#define MAX_CONNECTIONS 1000000
+/* LRU hash maps are preallocated: their memory is charged to the agent whether
+   they are full or not (~130 MB for 1M connections, ~85 MB for 1M sockets).
+   active_connections holds the sockets of live processes (hundreds on an idle
+   node, the entries of exited processes are swept by the agent, see
+   ebpftracer/connection_sweep.go). Both ends of a local connection count, and an
+   LRU evicts a little before it is full: with 131072 entries, 70k idle local
+   connections (140k sockets) had live connections evicted, whose close was then
+   never sent. connection_id_by_socket holds a connect()ed socket from SYN_SENT
+   until it starts closing. */
+#define MAX_ACTIVE_CONNECTIONS 262144
+#define MAX_CONNECTING_SOCKETS 65536
 #define MAX_PAYLOAD_SIZE 1024
 
 /* A connection's identity in the BPF-side state maps (http1_state,
@@ -268,7 +278,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(key_size, sizeof(void *));
     __uint(value_size, sizeof(struct connection_id));
-    __uint(max_entries, MAX_CONNECTIONS);
+    __uint(max_entries, MAX_CONNECTING_SOCKETS);
 } connection_id_by_socket SEC(".maps");
 
 struct connection {
@@ -301,7 +311,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(key_size, sizeof(struct connection_id));
     __uint(value_size, sizeof(struct connection));
-    __uint(max_entries, MAX_CONNECTIONS);
+    __uint(max_entries, MAX_ACTIVE_CONNECTIONS);
 } active_connections SEC(".maps");
 
 struct l7_request_key {

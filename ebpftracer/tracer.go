@@ -124,6 +124,11 @@ type Tracer struct {
 	lostSamples         atomic.Uint64
 	truncatedPayloads   atomic.Uint64
 	goTlsAttachFailures atomic.Uint64
+
+	// see runConnectionSweeper
+	activeConnectionsKept  atomic.Int64
+	activeConnectionsSwept atomic.Uint64
+	stopped                chan struct{}
 }
 
 func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
@@ -138,6 +143,7 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Trac
 		readers:       map[string]*perf.Reader{},
 		uprobes:       map[string]*ebpf.Program{},
 		globalUprobes: map[UprobeKey]*globalUprobe{},
+		stopped:       make(chan struct{}),
 	}
 }
 
@@ -154,10 +160,16 @@ func (t *Tracer) Run(events chan<- Event) error {
 	if err := t.attachPrograms(); err != nil {
 		return err
 	}
+	go t.runConnectionSweeper()
 	return nil
 }
 
 func (t *Tracer) Close() {
+	select {
+	case <-t.stopped:
+	default:
+		close(t.stopped)
+	}
 	for _, p := range t.uprobes {
 		_ = p.Close()
 	}

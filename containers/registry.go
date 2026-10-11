@@ -220,6 +220,8 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.EbpfLostSamples
 	ch <- metrics.EbpfLostEvents
 	ch <- metrics.TrackedConnections
+	ch <- metrics.EbpfActiveConnections
+	ch <- metrics.EbpfActiveConnectionsSwept
 	ch <- metrics.L7PayloadsTruncated
 	ch <- metrics.GoTlsUprobeAttachFailures
 	ch <- metrics.EbpfProgramRecursionMisses
@@ -265,6 +267,9 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 			ch <- metrics.Counter(metrics.EbpfLostEvents, float64(n), buffer)
 		}
 		ch <- metrics.Counter(metrics.L7PayloadsTruncated, float64(r.tracer.TruncatedPayloads()))
+		activeConnections, swept := r.tracer.ActiveConnectionsStats()
+		ch <- metrics.Gauge(metrics.EbpfActiveConnections, float64(activeConnections))
+		ch <- metrics.Counter(metrics.EbpfActiveConnectionsSwept, float64(swept))
 		ch <- metrics.Counter(metrics.GoTlsUprobeAttachFailures, float64(r.tracer.GoTlsAttachFailures()))
 		for prog, n := range r.tracer.ProgramRecursionMisses() {
 			ch <- metrics.Counter(metrics.EbpfProgramRecursionMisses, float64(n), prog)
