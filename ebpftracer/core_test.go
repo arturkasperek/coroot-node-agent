@@ -3,9 +3,12 @@ package ebpftracer
 import (
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/btf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,6 +47,57 @@ func TestEbpfProgramsReadKernelStructsThroughCORE(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The record of a tracepoint is the program's context, which the verifier lets the
+// program load from directly. Its fields are read by a load whose offset CO-RE
+// patches, not copied with bpf_probe_read_kernel (BPF_CORE_READ), which is for
+// pointers the verifier does not trust, as a kprobe argument. Only an array field
+// is copied: its copy needs a moved context pointer, which the verifier rejects.
+func TestEbpfProgramsLoadTracepointRecordsDirectly(t *testing.T) {
+	for arch := range ebpfProgs {
+		spec, err := ebpfCollectionSpec(arch)
+		require.NoError(t, err)
+		for name, program := range spec.Programs {
+			for _, instruction := range program.Instructions {
+				relocation := btf.CORERelocationMetadata(&instruction)
+				if relocation == nil {
+					continue
+				}
+				record, field, found := tracepointRecordField(relocation.String())
+				if !found || isArrayField(t, spec.Types, record, field) {
+					continue
+				}
+				assert.Truef(t, instruction.OpCode.Class() == asm.LdXClass,
+					"%s/%s: %s is not loaded from the context: %v", arch, name, relocation, instruction)
+			}
+		}
+	}
+}
+
+var tracepointRecordRelocation = regexp.MustCompile(`Struct:"((?:trace_event_raw|syscall_trace)_\w+)"\[0:(\d+)`)
+
+// tracepointRecordField returns the record and the index of its field that a
+// relocation, such as CORERelocation(byte_off, Struct:"syscall_trace_exit"[0:0], ...),
+// points at.
+func tracepointRecordField(relocation string) (record string, field int, found bool) {
+	match := tracepointRecordRelocation.FindStringSubmatch(relocation)
+	if match == nil {
+		return "", 0, false
+	}
+	field, err := strconv.Atoi(match[2])
+	if err != nil {
+		return "", 0, false
+	}
+	return match[1], field, true
+}
+
+func isArrayField(t *testing.T, types *btf.Spec, record string, field int) bool {
+	var structType *btf.Struct
+	require.NoError(t, types.TypeByName(record, &structType))
+	require.Less(t, field, len(structType.Members), record)
+	_, isArray := btf.UnderlyingType(structType.Members[field].Type).(*btf.Array)
+	return isArray
 }
 
 // A stub is a struct written to match a kernel layout at build time (named

@@ -36,9 +36,7 @@ int is_http2_preface(char *buf, __u64 size) {
     if (size < HTTP2_PREFACE_SIZE) {
         return 0;
     }
-    if (bpf_probe_read(p, sizeof(p), buf)) {
-        return 0;
-    }
+    bpf_read(buf, p);
     return p[0] == 'P' && p[1] == 'R' && p[2] == 'I' && p[3] == ' ' && p[4] == '*';
 }
 
@@ -50,9 +48,7 @@ int is_http2_settings(char *buf, __u64 size) {
     if (size < HTTP2_FRAME_HEADER_SIZE) {
         return 0;
     }
-    if (bpf_probe_read(hdr, sizeof(hdr), buf)) {
-        return 0;
-    }
+    bpf_read(buf, hdr);
     if (hdr[3] != HTTP2_FRAME_SETTINGS || (hdr[5] & 0x80)) {
         return 0;
     }

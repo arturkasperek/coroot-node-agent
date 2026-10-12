@@ -333,9 +333,7 @@ __u64 read_iovec(char *iovec, __u64 iovlen, __u64 ret, char *buf, __u64 *total_s
         if (i >= iovlen) {
             break;
         }
-        if (bpf_probe_read(&iov, sizeof(iov), (void *)(iovec+i*sizeof(iov)))) {
-            return 0;
-        }
+        bpf_read((void *)(iovec+i*sizeof(iov)), iov);
         if (iov.size <= 0) {
             continue;
         }
@@ -818,9 +816,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, 
         return 0;
     }
     if (args->ret) {
-        if (bpf_probe_read(&ret, sizeof(ret), (void*)args->ret)) {
-            return 0;
-        };
+        bpf_read((void *)args->ret, ret);
         if (ret <= 0) {
             return 0;
         }
@@ -1095,9 +1091,7 @@ int sys_enter_sendmsg(struct syscall_trace_enter *ctx) {
         return 0;
     }
     struct user_msghdr msghdr = {};
-    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)buf)) {
-        return 0;
-    }
+    bpf_read((void *)buf, msghdr);
     return trace_enter_plain_pack(ctx, fd, 1, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
 }
 
@@ -1251,9 +1245,7 @@ int sys_enter_recvmsg(struct syscall_trace_enter *ctx) {
         return 0;
     }
     struct user_msghdr msghdr = {};
-    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)buf)) {
-        return 0;
-    }
+    bpf_read((void *)buf, msghdr);
     __u32 pid = id >> 32;
     return trace_enter_read(id, pid, fd, 1, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
 }

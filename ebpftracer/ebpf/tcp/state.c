@@ -409,21 +409,21 @@ void emit_connection_open_lazy(struct connection_id *cid, struct connection *con
 }
 
 SEC("tracepoint/sock/inet_sock_set_state")
-int inet_sock_set_state(void *ctx)
+int inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 {
-    struct trace_event_raw_inet_sock_set_state *tp = ctx;
-    struct inet_sock_set_state_args args = {};
-    if (BPF_CORE_READ_INTO(&args.protocol, tp, protocol) ||
-        BPF_CORE_READ_INTO(&args.skaddr, tp, skaddr) ||
-        BPF_CORE_READ_INTO(&args.oldstate, tp, oldstate) ||
-        BPF_CORE_READ_INTO(&args.newstate, tp, newstate) ||
-        BPF_CORE_READ_INTO(&args.sport, tp, sport) ||
-        BPF_CORE_READ_INTO(&args.dport, tp, dport) ||
-        BPF_CORE_READ_INTO(&args.saddr_v6, tp, saddr_v6) ||
-        BPF_CORE_READ_INTO(&args.daddr_v6, tp, daddr_v6)) {
+    if (ctx->protocol != IPPROTO_TCP) {
         return 0;
     }
-    if (args.protocol != IPPROTO_TCP) {
+    struct inet_sock_set_state_args args = {
+        .skaddr = ctx->skaddr,
+        .oldstate = ctx->oldstate,
+        .newstate = ctx->newstate,
+        .sport = ctx->sport,
+        .dport = ctx->dport,
+        .protocol = ctx->protocol,
+    };
+    if (BPF_CORE_READ_INTO(&args.saddr_v6, ctx, saddr_v6) ||
+        BPF_CORE_READ_INTO(&args.daddr_v6, ctx, daddr_v6)) {
         return 0;
     }
     __u64 id = bpf_get_current_pid_tgid();

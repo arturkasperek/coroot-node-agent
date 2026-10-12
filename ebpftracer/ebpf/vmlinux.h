@@ -55,8 +55,17 @@ struct pt_regs {
 
 /* Kernel structs read through CO-RE: only the fields the programs read, matched by
    name against the kernel's BTF when the programs are loaded, which takes the
-   offsets from there. Their layout here does not matter, so they are read with
-   BPF_CORE_READ*, never copied whole. */
+   offsets from there. Their layout here does not matter, so they are never
+   copied whole, only field by field:
+   - the record of a tracepoint (trace_event_raw_*, syscall_trace_*) is the
+     program's context, read straight from it: args->pid. CO-RE patches the
+     offset of the load. An array field (an address) is copied with
+     BPF_CORE_READ_INTO: a copy needs the field's address in a register, and the
+     verifier does not let a program load through a moved context pointer.
+   - a struct behind any other kernel pointer (a kprobe argument) is read with
+     BPF_CORE_READ*, a bpf_probe_read_kernel at the patched offset: the
+     verifier does not let a program load from such a pointer.
+   The traced application's memory has no BTF; it is read with bpf_read. */
 #pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)
 
 struct in6_addr {

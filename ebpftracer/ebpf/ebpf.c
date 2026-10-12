@@ -28,6 +28,10 @@ extern int bpf_probe_read_kernel_dynptr(struct bpf_dynptr *dptr, __u32 off, __u3
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
 
+/* Reads the traced application's data (a payload, an iovec, a msghdr) into dst,
+   or returns 0 from the program. Kernel structs are read through CO-RE instead
+   (see vmlinux.h). Generic bpf_probe_read, not _user: the protocol parsers also
+   get the payload of a writev/readv as its copy in the iovec_buf_heap map. */
 #define bpf_read(src, dst)                            \
 ({                                                    \
     if (bpf_probe_read(&dst, sizeof(dst), src) < 0) { \

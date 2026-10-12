@@ -326,9 +326,7 @@ static inline __attribute__((__always_inline__))
 int is_foundationdb_request(char *payload, __u64 size) {
     if (is_foundationdb_connect_packet(payload)) {
         __u32 connect_length;
-        if (bpf_probe_read(&connect_length, sizeof(connect_length), payload) != 0) {
-            return 0;
-        }
+        bpf_read(payload, connect_length);
         __u32 actual_connect_size = connect_length + 4;
         
         if (size == actual_connect_size) {
@@ -353,9 +351,7 @@ int is_foundationdb_response(char *payload, __u64 size, __s32 *status) {
     
     if (is_foundationdb_connect_packet(payload)) {
         __u32 connect_length;
-        if (bpf_probe_read(&connect_length, sizeof(connect_length), payload) != 0) {
-            return 0;
-        }
+        bpf_read(payload, connect_length);
         __u32 actual_connect_size = connect_length + 4;
         
         if (size > actual_connect_size) {
