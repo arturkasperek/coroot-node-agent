@@ -13,8 +13,11 @@ Not tested:
   (`_Static_assert(sizeof(struct connection) == 56)`), register conventions for
   the uprobes (`PT_REGS_PARM*`) and the Go-ABI argument registers in `gotls.c`.
 - **Other kernels.** Task storage needs 5.11+; `bpf_loop` 5.17+; dynptrs 6.x. The
-  fixed `struct sock_common` offsets in `emit_connection_open_lazy` (56 and 72 for
-  the IPv6 addresses) are checked only on 6.18. Older kernels and `PREEMPT_NONE`
+  kernel structs (`sock_common`, `nf_conn`, `path`, the arguments of every
+  tracepoint, syscalls included) are read through CO-RE, so their layout comes from the kernel's BTF, but the
+  relocations were loaded only on 6.18; a kernel where a tracepoint has another
+  class (as `sched_process_exit` got its own with `group_dead`) fails to load
+  instead of reading wrong offsets. Older kernels and `PREEMPT_NONE`
   or `PREEMPT_FULL` change how often BPF programs are preempted, which is where
   the scratch-space and recursion problems came from.
 - **k3s/Kubernetes under real load.** Only a small k3s is on the test host. A

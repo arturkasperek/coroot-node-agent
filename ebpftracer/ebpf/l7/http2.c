@@ -1701,7 +1701,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, 
    already HTTP/2) or tails to the unchanged read path so the first buffer can
    still be sniffed. Not attached. */
 SEC("tracepoint/http2/readv")
-int http2_readv(struct trace_event_raw_sys_exit__stub *ctx) {
+int http2_readv(struct syscall_trace_exit *ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     __u32 pid = id >> 32;
     struct read_args *args;
@@ -1755,7 +1755,7 @@ int http2_readv(struct trace_event_raw_sys_exit__stub *ctx) {
 /* Today's read path, with no pointer-table branch. The dispatch program
    leaves active_reads in place. If this returns, the table was not consumed. */
 SEC("tracepoint/http2/read_exit")
-int http2_read_exit(struct trace_event_raw_sys_exit__stub *ctx) {
+int http2_read_exit(struct syscall_trace_exit *ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     int rc = trace_exit_read(ctx, id, id >> 32, 0, ctx->ret, &http2_tail_progs);
     http2_iov_clear();

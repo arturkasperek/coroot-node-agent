@@ -42,12 +42,6 @@ extern int bpf_probe_read_kernel_dynptr(struct bpf_dynptr *dptr, __u32 off, __u3
     bpf_trace_printk(____fmt, sizeof(____fmt), ##__VA_ARGS__); \
 })
 
-struct trace_event_raw_sys_exit__stub {
-	__u64 unused;
-	__u64 unused2;
-	long int ret;
-};
-
 #include "nodejs.c"
 #include "python.c"
 #include "proc.c"

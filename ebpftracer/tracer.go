@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -619,38 +618,17 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
 	}
 
-	var flags string
-	if isCtxExtraPaddingRequired(traceFsPath) {
-		flags = "ctx-extra-padding"
-	}
 	kv := common.GetKernelVersion()
-	var prog []byte
-	for _, p := range ebpfProgs[runtime.GOARCH] {
-		pv, _ := common.VersionFromString(p.version)
-		if !kv.GreaterOrEqual(pv) {
-			continue
-		}
-		if flags != p.flags {
-			continue
-		}
-		prog = p.prog
-		break
+	minimal, _ := common.VersionFromString(ebpfProgs[runtime.GOARCH][0].version)
+	if !kv.GreaterOrEqual(minimal) {
+		return fmt.Errorf("unsupported kernel version: %s, %s or newer is required", kv, minimal)
 	}
-	if len(prog) == 0 {
-		return fmt.Errorf("unsupported kernel version: %s %s", kv, flags)
+	if err := requireKernelBTF(kernelBTFPath); err != nil {
+		return err
 	}
-
-	reader, err := gzip.NewReader(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(prog)))
+	collectionSpec, err := ebpfCollectionSpec(runtime.GOARCH)
 	if err != nil {
-		return fmt.Errorf("invalid program encoding: %w", err)
-	}
-	prog, err = io.ReadAll(reader)
-	if err != nil {
-		return fmt.Errorf("failed to ungzip program: %w", err)
-	}
-	collectionSpec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(prog))
-	if err != nil {
-		return fmt.Errorf("failed to load collection spec: %w", err)
+		return err
 	}
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
 	loadStarted := time.Now()
@@ -935,24 +913,32 @@ func ipPort(ip [16]byte, port uint16) netaddr.IPPort {
 	return netaddr.IPPortFrom(i, port)
 }
 
-func isCtxExtraPaddingRequired(traceFsPath string) bool {
-	f, err := os.Open(path.Join(traceFsPath, "events/task/task_newtask/format"))
+// kernelBTFPath is where the kernel exposes its BTF. The programs read kernel structs
+// through CO-RE, which takes their layout from it.
+const kernelBTFPath = "/sys/kernel/btf/vmlinux"
+
+func requireKernelBTF(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("kernel BTF is required, it is exposed at %s by a kernel built with CONFIG_DEBUG_INFO_BTF=y: %w", path, err)
+	}
+	return nil
+}
+
+// ebpfCollectionSpec unpacks the build of the eBPF programs for arch.
+func ebpfCollectionSpec(arch string) (*ebpf.CollectionSpec, error) {
+	reader, err := gzip.NewReader(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(ebpfProgs[arch][0].prog)))
 	if err != nil {
-		klog.Errorln(err)
-		return false
+		return nil, fmt.Errorf("invalid program encoding: %w", err)
 	}
-	defer f.Close()
-	data, err := io.ReadAll(f)
+	prog, err := io.ReadAll(reader)
 	if err != nil {
-		klog.Errorln(err)
-		return false
+		return nil, fmt.Errorf("failed to ungzip program: %w", err)
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.Contains(line, "common_preempt_lazy_count") {
-			return true
-		}
+	collectionSpec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(prog))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load collection spec: %w", err)
 	}
-	return false
+	return collectionSpec, nil
 }
 
 const nfConntrackEventsParameterPath = "/proc/sys/net/netfilter/nf_conntrack_events"

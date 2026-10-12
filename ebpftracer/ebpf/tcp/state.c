@@ -244,20 +244,15 @@ void send_tcp_connect_event(struct tcp_event *e) {
     }
 }
 
-struct trace_event_raw_inet_sock_set_state__stub {
-    __u64 unused;
-#if defined(__CTX_EXTRA_PADDING)
-    __u64 unused2;
-#endif
-    void *skaddr;
+/* The arguments of inet_sock_set_state the program uses, read field by field
+   from the tracepoint's struct (its layout comes from the kernel's BTF). */
+struct inet_sock_set_state_args {
+    const void *skaddr;
     int oldstate;
     int newstate;
     __u16 sport;
     __u16 dport;
-    __u16 family;
     __u16 protocol;
-    __u8 saddr[4];
-    __u8 daddr[4];
     __u8 saddr_v6[16];
     __u8 daddr_v6[16];
 };
@@ -347,27 +342,11 @@ struct {
    task context and is never nested, so it records the socket; the first
    data syscall on a connection whose open was never sent announces it from
    there, reading the addresses off the socket. */
-/* The leading fields of the kernel's struct sock_common. Read at fixed
-   offsets: this program is built without kernel BTF, and this prefix (plus
-   the two IPv6 addresses at 56/72) has had the same layout for many
-   releases. Every value is sanity-checked below. */
-struct sock_common_head {
-    __u32 daddr;
-    __u32 rcv_saddr;
-    __u32 hash;
-    __u16 dport; /* network order */
-    __u16 num;   /* host order */
-    __u16 family;
-};
-#define SKC_V6_DADDR_OFF 56
-#define SKC_V6_RCV_SADDR_OFF 72
-
 /* Working memory lives in a map, not on the stack: this is inlined into
    programs (sendmmsg's per-message loop) that already sit at the 512-byte
    combined stack limit. */
 struct open_scratch {
     struct tcp_event e;
-    struct sock_common_head skc;
     struct connPair src;
 };
 
@@ -387,25 +366,26 @@ void emit_connection_open_lazy(struct connection_id *cid, struct connection *con
         return;
     }
     __builtin_memset(sc, 0, sizeof(*sc));
-    if (bpf_probe_read_kernel(&sc->skc, sizeof(sc->skc), (void *)conn->skaddr)) {
-        return;
-    }
-    sc->e.sport = sc->skc.num;
-    sc->e.dport = bpf_ntohs(sc->skc.dport);
+    struct sock_common *skc = (struct sock_common *)conn->skaddr;
+    sc->e.sport = BPF_CORE_READ(skc, skc_num);
+    sc->e.dport = bpf_ntohs(BPF_CORE_READ(skc, skc_dport));
     if (!sc->e.sport || !sc->e.dport) {
         return;
     }
-    if (sc->skc.family == AF_INET) {
+    unsigned short family = BPF_CORE_READ(skc, skc_family);
+    if (family == AF_INET) {
         /* v4-mapped, like the tracepoint's saddr_v6/daddr_v6 */
         sc->e.saddr[10] = 0xff;
         sc->e.saddr[11] = 0xff;
         sc->e.daddr[10] = 0xff;
         sc->e.daddr[11] = 0xff;
-        __builtin_memcpy(&sc->e.saddr[12], &sc->skc.rcv_saddr, 4);
-        __builtin_memcpy(&sc->e.daddr[12], &sc->skc.daddr, 4);
-    } else if (sc->skc.family == AF_INET6) {
-        if (bpf_probe_read_kernel(&sc->e.saddr, sizeof(sc->e.saddr), (void *)(conn->skaddr + SKC_V6_RCV_SADDR_OFF)) ||
-            bpf_probe_read_kernel(&sc->e.daddr, sizeof(sc->e.daddr), (void *)(conn->skaddr + SKC_V6_DADDR_OFF))) {
+        if (BPF_CORE_READ_INTO((__be32 *)&sc->e.saddr[12], skc, skc_rcv_saddr) ||
+            BPF_CORE_READ_INTO((__be32 *)&sc->e.daddr[12], skc, skc_daddr)) {
+            return;
+        }
+    } else if (family == AF_INET6) {
+        if (BPF_CORE_READ_INTO((struct in6_addr *)&sc->e.saddr, skc, skc_v6_rcv_saddr) ||
+            BPF_CORE_READ_INTO((struct in6_addr *)&sc->e.daddr, skc, skc_v6_daddr)) {
             return;
         }
     } else {
@@ -431,8 +411,16 @@ void emit_connection_open_lazy(struct connection_id *cid, struct connection *con
 SEC("tracepoint/sock/inet_sock_set_state")
 int inet_sock_set_state(void *ctx)
 {
-    struct trace_event_raw_inet_sock_set_state__stub args = {};
-    if (bpf_probe_read(&args, sizeof(args), ctx) < 0) {
+    struct trace_event_raw_inet_sock_set_state *tp = ctx;
+    struct inet_sock_set_state_args args = {};
+    if (BPF_CORE_READ_INTO(&args.protocol, tp, protocol) ||
+        BPF_CORE_READ_INTO(&args.skaddr, tp, skaddr) ||
+        BPF_CORE_READ_INTO(&args.oldstate, tp, oldstate) ||
+        BPF_CORE_READ_INTO(&args.newstate, tp, newstate) ||
+        BPF_CORE_READ_INTO(&args.sport, tp, sport) ||
+        BPF_CORE_READ_INTO(&args.dport, tp, dport) ||
+        BPF_CORE_READ_INTO(&args.saddr_v6, tp, saddr_v6) ||
+        BPF_CORE_READ_INTO(&args.daddr_v6, tp, daddr_v6)) {
         return 0;
     }
     if (args.protocol != IPPROTO_TCP) {
@@ -535,25 +523,16 @@ int inet_sock_set_state(void *ctx)
     return 0;
 }
 
-struct trace_event_raw_args_with_fd__stub {
-    __u64 unused;
-    __u64 unused2;
-    __u64 fd;
-};
-
 SEC("tracepoint/syscalls/sys_enter_connect")
-int sys_enter_connect(void *ctx) {
-    struct trace_event_raw_args_with_fd__stub args = {};
-    if (bpf_probe_read(&args, sizeof(args), ctx) < 0) {
-        return 0;
-    }
+int sys_enter_connect(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
     __u64 id = bpf_get_current_pid_tgid();
-    bpf_map_update_elem(&fd_by_pid_tgid, &id, &args.fd, BPF_ANY);
+    bpf_map_update_elem(&fd_by_pid_tgid, &id, &fd, BPF_ANY);
     return 0;
 }
 
 SEC("tracepoint/syscalls/sys_exit_connect")
-int sys_exit_connect(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_connect(struct syscall_trace_exit *ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     __u64 *fdp = bpf_map_lookup_elem(&fd_by_pid_tgid, &id);
     if (!fdp) {
@@ -585,15 +564,11 @@ int sys_exit_connect(struct trace_event_raw_sys_exit__stub* ctx) {
 }
 
 SEC("tracepoint/syscalls/sys_enter_close")
-int sys_enter_close(void *ctx) {
-    struct trace_event_raw_args_with_fd__stub args = {};
-    if (bpf_probe_read(&args, sizeof(args), ctx) < 0) {
-        return 0;
-    }
+int sys_enter_close(struct syscall_trace_enter *ctx) {
     __u64 id = bpf_get_current_pid_tgid();
     struct connection_id cid = {};
     cid.pid = id >> 32;
-    cid.fd = args.fd;
+    cid.fd = ctx->args[0];
     struct connection *conn = bpf_map_lookup_elem(&active_connections, &cid);
     if (conn) {
         struct tcp_event e = {};
@@ -627,11 +602,11 @@ int handle_accept_exit(long int ret) {
 }
 
 SEC("tracepoint/syscalls/sys_exit_accept")
-int sys_exit_accept(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_accept(struct syscall_trace_exit *ctx) {
     return handle_accept_exit(ctx->ret);
 }
 
 SEC("tracepoint/syscalls/sys_exit_accept4")
-int sys_exit_accept4(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_accept4(struct syscall_trace_exit *ctx) {
     return handle_accept_exit(ctx->ret);
 }

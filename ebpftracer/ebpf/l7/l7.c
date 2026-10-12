@@ -221,14 +221,6 @@ struct {
      __type(value, char[IOVEC_BUF_SIZE]);
 } iovec_buf_heap SEC(".maps");
 
-struct trace_event_raw_sys_enter_rw__stub {
-    __u64 unused;
-    __u64 unused2;
-    __u64 fd;
-    char* buf;
-    __u64 size;
-};
-
 struct iovec {
     char* buf;
     __u64 size;
@@ -1068,37 +1060,45 @@ int ssl_check_read_exit(__u64 tid) {
 }
 
 SEC("tracepoint/syscalls/sys_enter_write")
-int sys_enter_write(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_write(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
+    __u64 size = ctx->args[2];
     __u64 tid = bpf_get_current_pid_tgid();
     l7_last_write_invalidate();
-    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+    if (ssl_check_write(tid, ctx, fd) >= 0) {
         return 0;
     }
-    return trace_enter_plain_pack(ctx, ctx->fd, 0, ctx->buf, ctx->size, 0);
+    return trace_enter_plain_pack(ctx, fd, 0, buf, size, 0);
 }
 
 SEC("tracepoint/syscalls/sys_enter_writev")
-int sys_enter_writev(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_writev(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
+    __u64 size = ctx->args[2];
     __u64 tid = bpf_get_current_pid_tgid();
     l7_last_write_invalidate();
-    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+    if (ssl_check_write(tid, ctx, fd) >= 0) {
         return 0;
     }
-    return trace_enter_plain_pack(ctx, ctx->fd, 0, ctx->buf, 0, ctx->size);
+    return trace_enter_plain_pack(ctx, fd, 0, buf, 0, size);
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendmsg")
-int sys_enter_sendmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_sendmsg(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
     __u64 tid = bpf_get_current_pid_tgid();
     l7_last_write_invalidate();
-    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+    if (ssl_check_write(tid, ctx, fd) >= 0) {
         return 0;
     }
     struct user_msghdr msghdr = {};
-    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
+    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)buf)) {
         return 0;
     }
-    return trace_enter_plain_pack(ctx, ctx->fd, 1, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
+    return trace_enter_plain_pack(ctx, fd, 1, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
 }
 
 struct mmsghdr {
@@ -1138,35 +1138,41 @@ static long sendmmsg_cb(__u32 i, void *ctx) {
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendmmsg")
-int sys_enter_sendmmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_sendmmsg(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
+    __u64 size = ctx->args[2];
     __u64 tid = bpf_get_current_pid_tgid();
     struct sendmmsg_iter it = {};
     __u32 n = SENDMMSG_MAX_MSGS;
-    if (sendmmsg_ssl(tid, ctx, ctx->fd) >= 0) {
+    if (sendmmsg_ssl(tid, ctx, fd) >= 0) {
         return 0;
     }
-    if (ctx->size < n) {
-        n = ctx->size;
+    if (size < n) {
+        n = size;
     }
     if (!n) {
         return 0;
     }
     it.ctx = ctx;
-    it.mmsg = ctx->buf;
-    it.fd = ctx->fd;
+    it.mmsg = buf;
+    it.fd = fd;
     it.vlen = n;
     bpf_loop(n, sendmmsg_cb, &it, 0);
     return 0;
 }
 
 SEC("tracepoint/syscalls/sys_enter_sendto")
-int sys_enter_sendto(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_sendto(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
+    __u64 size = ctx->args[2];
     __u64 tid = bpf_get_current_pid_tgid();
     l7_last_write_invalidate();
-    if (ssl_check_write(tid, ctx, ctx->fd) >= 0) {
+    if (ssl_check_write(tid, ctx, fd) >= 0) {
         return 0;
     }
-    return trace_enter_plain_pack(ctx, ctx->fd, 1, ctx->buf, ctx->size, 0);
+    return trace_enter_plain_pack(ctx, fd, 1, buf, size, 0);
 }
 
 /* ssl_last_fd used to be populated only from inside ssl_check_read_enter's
@@ -1189,75 +1195,84 @@ void l7_track_last_read_fd(__u64 tid, __u64 fd) {
 }
 
 SEC("tracepoint/syscalls/sys_exit_write")
-int sys_exit_write(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_write(struct syscall_trace_exit *ctx) {
     return l7_write_exit(ctx->ret);
 }
 
 SEC("tracepoint/syscalls/sys_exit_writev")
-int sys_exit_writev(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_writev(struct syscall_trace_exit *ctx) {
     return l7_write_exit(ctx->ret);
 }
 
 SEC("tracepoint/syscalls/sys_exit_sendmsg")
-int sys_exit_sendmsg(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_sendmsg(struct syscall_trace_exit *ctx) {
     return l7_write_exit(ctx->ret);
 }
 
 SEC("tracepoint/syscalls/sys_exit_sendto")
-int sys_exit_sendto(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_sendto(struct syscall_trace_exit *ctx) {
     return l7_write_exit(ctx->ret);
 }
 
 SEC("tracepoint/syscalls/sys_enter_read")
-int sys_enter_read(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_read(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
     __u64 id = bpf_get_current_pid_tgid();
-    l7_track_last_read_fd(id, ctx->fd);
-    if (ssl_check_read_enter(id, ctx->fd) >= 0) {
+    l7_track_last_read_fd(id, fd);
+    if (ssl_check_read_enter(id, fd) >= 0) {
         return 0;
     }
     __u32 pid = id >> 32;
-    return trace_enter_read(id, pid, ctx->fd, 0, ctx->buf, 0, 0);
+    return trace_enter_read(id, pid, fd, 0, buf, 0, 0);
 }
 
 SEC("tracepoint/syscalls/sys_enter_readv")
-int sys_enter_readv(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_readv(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
+    __u64 size = ctx->args[2];
     __u64 id = bpf_get_current_pid_tgid();
-    l7_track_last_read_fd(id, ctx->fd);
-    if (ssl_check_read_enter(id, ctx->fd) >= 0) {
+    l7_track_last_read_fd(id, fd);
+    if (ssl_check_read_enter(id, fd) >= 0) {
         return 0;
     }
     __u32 pid = id >> 32;
-    return trace_enter_read(id, pid, ctx->fd, 0, ctx->buf, 0, ctx->size);
+    return trace_enter_read(id, pid, fd, 0, buf, 0, size);
 }
 
 SEC("tracepoint/syscalls/sys_enter_recvmsg")
-int sys_enter_recvmsg(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_recvmsg(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
     __u64 id = bpf_get_current_pid_tgid();
-    l7_track_last_read_fd(id, ctx->fd);
-    if (ssl_check_read_enter(id, ctx->fd) >= 0) {
+    l7_track_last_read_fd(id, fd);
+    if (ssl_check_read_enter(id, fd) >= 0) {
         return 0;
     }
     struct user_msghdr msghdr = {};
-    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)ctx->buf)) {
+    if (bpf_probe_read(&msghdr, sizeof(msghdr), (void *)buf)) {
         return 0;
     }
     __u32 pid = id >> 32;
-    return trace_enter_read(id, pid, ctx->fd, 1, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
+    return trace_enter_read(id, pid, fd, 1, (char*)msghdr.msg_iov, 0, msghdr.msg_iovlen);
 }
 
 SEC("tracepoint/syscalls/sys_enter_recvfrom")
-int sys_enter_recvfrom(struct trace_event_raw_sys_enter_rw__stub* ctx) {
+int sys_enter_recvfrom(struct syscall_trace_enter *ctx) {
+    __u64 fd = ctx->args[0];
+    char *buf = (char *)ctx->args[1];
     __u64 id = bpf_get_current_pid_tgid();
-    l7_track_last_read_fd(id, ctx->fd);
-    if (ssl_check_read_enter(id, ctx->fd) >= 0) {
+    l7_track_last_read_fd(id, fd);
+    if (ssl_check_read_enter(id, fd) >= 0) {
         return 0;
     }
     __u32 pid = id >> 32;
-    return trace_enter_read(id, pid, ctx->fd, 1, ctx->buf, 0, 0);
+    return trace_enter_read(id, pid, fd, 1, buf, 0, 0);
 }
 
 SEC("tracepoint/syscalls/sys_exit_read")
-int sys_exit_read(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_read(struct syscall_trace_exit *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     if (ssl_check_read_exit(pid_tgid) >= 0) {
         return 0;
@@ -1267,7 +1282,7 @@ int sys_exit_read(struct trace_event_raw_sys_exit__stub* ctx) {
 }
 
 SEC("tracepoint/syscalls/sys_exit_readv")
-int sys_exit_readv(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_readv(struct syscall_trace_exit *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     if (ssl_check_read_exit(pid_tgid) >= 0) {
         return 0;
@@ -1277,7 +1292,7 @@ int sys_exit_readv(struct trace_event_raw_sys_exit__stub* ctx) {
 }
 
 SEC("tracepoint/syscalls/sys_exit_recvmsg")
-int sys_exit_recvmsg(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_recvmsg(struct syscall_trace_exit *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     if (ssl_check_read_exit(pid_tgid) >= 0) {
         return 0;
@@ -1287,7 +1302,7 @@ int sys_exit_recvmsg(struct trace_event_raw_sys_exit__stub* ctx) {
 }
 
 SEC("tracepoint/syscalls/sys_exit_recvfrom")
-int sys_exit_recvfrom(struct trace_event_raw_sys_exit__stub* ctx) {
+int sys_exit_recvfrom(struct syscall_trace_exit *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     if (ssl_check_read_exit(pid_tgid) >= 0) {
         return 0;

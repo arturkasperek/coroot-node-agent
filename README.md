@@ -6,6 +6,7 @@
 The agent gathers metrics related to a node and the containers running on it, and it exposes them in the Prometheus format.
 
 It uses eBPF to track container related events such as TCP connects, so the minimum supported Linux kernel version is 6.18.
+The kernel must also expose its BTF (`/sys/kernel/btf/vmlinux`, a kernel built with `CONFIG_DEBUG_INFO_BTF=y`, the default of the major distributions and managed Kubernetes node images): the eBPF programs read kernel structs through CO-RE, which takes their layout from it. The agent does not start without it.
 
 <img src="https://coroot.com/static/img/blog/ebpf.svg" width="800" />
 

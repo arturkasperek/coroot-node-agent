@@ -53,4 +53,107 @@ struct pt_regs {
 };
 #endif
 
+/* Kernel structs read through CO-RE: only the fields the programs read, matched by
+   name against the kernel's BTF when the programs are loaded, which takes the
+   offsets from there. Their layout here does not matter, so they are read with
+   BPF_CORE_READ*, never copied whole. */
+#pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)
+
+struct in6_addr {
+	__u8 s6_addr[16];
+};
+
+struct sock_common {
+	__be32 skc_daddr;
+	__be32 skc_rcv_saddr;
+	__be16 skc_dport;
+	__u16 skc_num;
+	unsigned short skc_family;
+	struct in6_addr skc_v6_daddr;
+	struct in6_addr skc_v6_rcv_saddr;
+};
+
+union nf_inet_addr {
+	__be32 ip6[4];
+};
+
+union nf_conntrack_man_proto {
+	__be16 all;
+};
+
+struct nf_conntrack_man {
+	union nf_inet_addr u3;
+	union nf_conntrack_man_proto u;
+	__u16 l3num;
+};
+
+struct nf_conntrack_tuple {
+	struct nf_conntrack_man src;
+	struct {
+		union nf_inet_addr u3;
+		union {
+			__be16 all;
+		} u;
+		__u8 protonum;
+	} dst;
+};
+
+struct nf_conntrack_tuple_hash {
+	struct nf_conntrack_tuple tuple;
+};
+
+struct nf_conn {
+	struct nf_conntrack_tuple_hash tuplehash[2];
+};
+
+struct path {
+	void *mnt;
+};
+
+struct trace_event_raw_task_newtask {
+	int pid;
+	unsigned long clone_flags;
+};
+
+/* not trace_event_raw_sched_process_template: sched_process_exit has its own
+   class (with group_dead), where pid is at another offset */
+struct trace_event_raw_sched_process_exit {
+	int pid;
+};
+
+struct trace_event_raw_mark_victim {
+	int pid;
+};
+
+struct trace_event_raw_tcp_retransmit_skb {
+	__u16 sport;
+	__u16 dport;
+	__u8 saddr_v6[16];
+	__u8 daddr_v6[16];
+};
+
+struct trace_event_raw_inet_sock_set_state {
+	const void *skaddr;
+	int oldstate;
+	int newstate;
+	__u16 sport;
+	__u16 dport;
+	__u16 protocol;
+	__u8 saddr_v6[16];
+	__u8 daddr_v6[16];
+};
+
+/* The records of the syscalls/sys_enter_* and sys_exit_* tracepoints
+   (kernel/trace/trace.h). The fields are loaded straight from the context: CO-RE
+   patches the offset of the load, which costs no instruction. */
+struct syscall_trace_enter {
+	unsigned long args[6];
+};
+
+struct syscall_trace_exit {
+	long ret;
+};
+
+#pragma clang attribute pop
+
 #endif /* __VMLINUX_H__ */

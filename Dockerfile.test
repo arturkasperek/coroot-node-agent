@@ -4,13 +4,14 @@
 #
 # Mirrors the builder stage of Dockerfile so the test environment does not drift
 # from the one the agent is actually built in. iproute2 provides `tc` for the
-# retransmit test. The tests are the entrypoint rather than a RUN step: those in
+# retransmit test, iptables the DNAT of the conntrack test. The tests are the
+# entrypoint rather than a RUN step: those in
 # ebpftracer load programs into the kernel and need privileges that are not
 # available at build time.
 FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y \
-    curl git build-essential pkg-config libsystemd-dev iproute2 \
+    curl git build-essential pkg-config libsystemd-dev iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 
 ARG GO_VERSION=1.24.9

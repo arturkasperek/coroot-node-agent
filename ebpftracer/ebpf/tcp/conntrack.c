@@ -2,36 +2,6 @@
 #define AF_INET     2
 #define AF_INET6    10
 
-struct inet_addr {
-    __be32 ip[4];
-};
-
-struct nf_conntrack_man {
-    struct inet_addr addr;
-    __be16 port;
-    __be16 l3num;           // Layer 3 protocol (e.g., AF_INET, AF_INET6)
-};
-
-struct nf_conntrack_tuple {
-    struct nf_conntrack_man src;
-    struct {
-        struct inet_addr addr;
-        __be16 port;
-        __u8 protonum;         // Protocol number (TCP, UDP, ICMP, etc.)
-        __u8 dir;              // Direction
-    } dst;
-};
-
-struct nf_conntrack_tuple_hash {
-    __u8 __pad[16];
-    struct nf_conntrack_tuple tuple;
-};
-
-struct nf_conn {
-    __u8 __pad[16];
-    struct nf_conntrack_tuple_hash tuplehash[2];
-};
-
 struct ipPort {
     __u8 ip[16];
     __u16 port;
@@ -58,45 +28,34 @@ struct {
     __uint(max_entries, 10240);
 } actual_destinations SEC(".maps");
 
-static __always_inline
-int handle_ct(struct pt_regs *ctx, struct nf_conn conn)
-{
-    struct nf_conntrack_tuple orig = conn.tuplehash[0].tuple;
-    struct nf_conntrack_tuple repl = conn.tuplehash[1].tuple;
-
-    if (repl.dst.protonum != IPPROTO_TCP) {
+SEC("kprobe/nf_ct_deliver_cached_events")
+int nf_ct_deliver_cached_events(struct pt_regs *ctx) {
+    struct nf_conn *ct = (struct nf_conn *)PT_REGS_PARM1(ctx);
+    if (BPF_CORE_READ(ct, tuplehash[1].tuple.dst.protonum) != IPPROTO_TCP) {
         return 0;
     }
     struct connPair src = {};
     struct ipPort actualDst = {};
-    if (repl.src.l3num == AF_INET) {
+    __u16 family = BPF_CORE_READ(ct, tuplehash[1].tuple.src.l3num);
+    if (family == AF_INET) {
         src.src_ip[10] = 0xff;
         src.src_ip[11] = 0xff;
-        __builtin_memcpy(&src.src_ip[12], &repl.dst.addr.ip, 4);
+        BPF_CORE_READ_INTO((__be32 *)&src.src_ip[12], ct, tuplehash[1].tuple.dst.u3.ip6[0]);
         src.dst_ip[10] = 0xff;
         src.dst_ip[11] = 0xff;
-        __builtin_memcpy(&src.dst_ip[12], &orig.dst.addr.ip, 4);
+        BPF_CORE_READ_INTO((__be32 *)&src.dst_ip[12], ct, tuplehash[0].tuple.dst.u3.ip6[0]);
 
         actualDst.ip[10] = 0xff;
         actualDst.ip[11] = 0xff;
-        __builtin_memcpy(&actualDst.ip[12], &repl.src.addr.ip, 4);
-    } else if (repl.src.l3num == AF_INET6) {
-        __builtin_memcpy(&src.src_ip, &repl.dst.addr.ip, 16);
-        __builtin_memcpy(&src.dst_ip, &orig.dst.addr.ip, 16);
-        __builtin_memcpy(&actualDst.ip, &repl.src.addr.ip, 16);
+        BPF_CORE_READ_INTO((__be32 *)&actualDst.ip[12], ct, tuplehash[1].tuple.src.u3.ip6[0]);
+    } else if (family == AF_INET6) {
+        BPF_CORE_READ_INTO((union nf_inet_addr *)&src.src_ip, ct, tuplehash[1].tuple.dst.u3);
+        BPF_CORE_READ_INTO((union nf_inet_addr *)&src.dst_ip, ct, tuplehash[0].tuple.dst.u3);
+        BPF_CORE_READ_INTO((union nf_inet_addr *)&actualDst.ip, ct, tuplehash[1].tuple.src.u3);
     }
-    src.src_port = bpf_ntohs(repl.dst.port);
-    src.dst_port = bpf_ntohs(orig.dst.port);
-    actualDst.port = bpf_ntohs(repl.src.port);
+    src.src_port = bpf_ntohs(BPF_CORE_READ(ct, tuplehash[1].tuple.dst.u.all));
+    src.dst_port = bpf_ntohs(BPF_CORE_READ(ct, tuplehash[0].tuple.dst.u.all));
+    actualDst.port = bpf_ntohs(BPF_CORE_READ(ct, tuplehash[1].tuple.src.u.all));
     bpf_map_update_elem(&actual_destinations, &src, &actualDst, BPF_ANY);
     return 0;
-}
-
-SEC("kprobe/nf_ct_deliver_cached_events")
-int nf_ct_deliver_cached_events(struct pt_regs *ctx) {
-    struct nf_conn conn;
-    if (bpf_probe_read(&conn, sizeof(conn), (void *)PT_REGS_PARM1(ctx)) != 0) {
-        return 0;
-    }
-    return handle_ct(ctx, conn);
 }
