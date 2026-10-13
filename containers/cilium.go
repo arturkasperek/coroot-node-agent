@@ -1,13 +1,16 @@
 package containers
 
 import (
+	"net/netip"
+	"os"
 	"path/filepath"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/loadbalancer/maps"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
-	"github.com/cilium/cilium/pkg/maps/lbmap"
 	"github.com/cilium/cilium/pkg/tuple"
 	"github.com/cilium/cilium/pkg/u8proto"
 	"github.com/coroot/coroot-node-agent/proc"
@@ -22,16 +25,44 @@ var (
 	backends6Map *bpf.Map
 )
 
-type ciliumMapDefinition struct {
-	key   bpf.MapKey
-	value bpf.MapValue
+// openCiliumBackendMap opens a v3 backend map. A Cilium old enough to create only
+// the v2 map is not supported: connections to its services keep the service
+// address as their destination.
+func openCiliumBackendMap(v3Name, v2Name string, key bpf.MapKey, value bpf.MapValue) *bpf.Map {
+	path := proc.HostPath(filepath.Join(defaults.BPFFSRoot, defaults.TCGlobalsPath, v3Name))
+	backendMap, err := bpf.OpenMap(path, key, value)
+	if err == nil {
+		klog.Infoln("found cilium ebpf-map:", v3Name)
+		return backendMap
+	}
+	v2Path := proc.HostPath(filepath.Join(defaults.BPFFSRoot, defaults.TCGlobalsPath, v2Name))
+	if _, statErr := os.Stat(v2Path); statErr == nil {
+		klog.Warningf("found cilium ebpf-map %s but not %s: this Cilium version is not supported, service connections will not be resolved to their backends", v2Name, v3Name)
+		return nil
+	}
+	klog.Infoln(err)
+	return nil
 }
 
-var ciliumMaps = map[string]ciliumMapDefinition{
-	lbmap.Backend4MapV2Name: {key: &lbmap.Backend4KeyV3{}, value: &lbmap.Backend4Value{}},
-	lbmap.Backend4MapV3Name: {key: &lbmap.Backend4KeyV3{}, value: &lbmap.Backend4ValueV3{}},
-	lbmap.Backend6MapV2Name: {key: &lbmap.Backend6KeyV3{}, value: &lbmap.Backend6Value{}},
-	lbmap.Backend6MapV3Name: {key: &lbmap.Backend6KeyV3{}, value: &lbmap.Backend6ValueV3{}},
+// ciliumBackendAddress returns the address of a backend read from a backend map.
+func ciliumBackendAddress(value bpf.MapValue) (netaddr.IPPort, bool) {
+	var address netip.Addr
+	var networkPort uint16
+	switch backend := value.(type) {
+	case *maps.Backend4ValueV3:
+		address, networkPort = backend.Address.Addr(), backend.Port
+	case *maps.Backend6ValueV3:
+		address, networkPort = backend.Address.Addr(), backend.Port
+	default:
+		return netaddr.IPPort{}, false
+	}
+	var ip netaddr.IP
+	if address.Is4() {
+		ip = netaddr.IPFrom4(address.As4())
+	} else {
+		ip = netaddr.IPv6Raw(address.As16())
+	}
+	return netaddr.IPPortFrom(ip, byteorder.NetworkToHost16(networkPort)), true
 }
 
 func init() {
@@ -57,27 +88,8 @@ func init() {
 	} else {
 		klog.Infoln("found cilium ebpf-map:", ctmap.MapNameTCP6Global)
 	}
-	for _, n := range []string{lbmap.Backend4MapV2Name, lbmap.Backend4MapV3Name} {
-		def := ciliumMaps[n]
-		backends4Map, err = bpf.OpenMap(proc.HostPath(filepath.Join(defaults.BPFFSRoot, defaults.TCGlobalsPath, n)), def.key, def.value)
-		if err != nil {
-			klog.Infoln(err)
-		} else {
-			klog.Infoln("found cilium ebpf-map:", n)
-			break
-		}
-	}
-	for _, n := range []string{lbmap.Backend6MapV2Name, lbmap.Backend6MapV3Name} {
-		def := ciliumMaps[n]
-		backends6Map, err = bpf.OpenMap(proc.HostPath(filepath.Join(defaults.BPFFSRoot, defaults.TCGlobalsPath, n)), def.key, def.value)
-		if err != nil {
-			klog.Infoln(err)
-		} else {
-			klog.Infoln("found cilium ebpf-map:", n)
-			break
-		}
-	}
-
+	backends4Map = openCiliumBackendMap(maps.Backend4MapV3Name, maps.Backend4MapV2Name, &maps.Backend4KeyV3{}, &maps.Backend4ValueV3{})
+	backends6Map = openCiliumBackendMap(maps.Backend6MapV3Name, maps.Backend6MapV2Name, &maps.Backend6KeyV3{}, &maps.Backend6ValueV3{})
 }
 
 func lookupCiliumConntrackTable(src, dst netaddr.IPPort) *netaddr.IPPort {
@@ -110,25 +122,19 @@ func lookupCilium4(src, dst netaddr.IPPort) *netaddr.IPPort {
 	if err != nil || v == nil {
 		return nil
 	}
-	e := v.(*ctmap.CtEntry)
-
-	backendKey := lbmap.NewBackend4KeyV3(loadbalancer.BackendID(e.BackendID))
-	b, err := backends4Map.Lookup(backendKey)
-	if err != nil || b == nil {
+	entry := v.(*ctmap.CtEntry)
+	// A service entry keeps the backend ID in the second half of the union
+	// (struct ct_entry in bpf/lib/conntrack.h).
+	backendKey := maps.NewBackend4KeyV3(loadbalancer.BackendID(entry.Union0[1]))
+	backend, err := backends4Map.Lookup(backendKey)
+	if err != nil || backend == nil {
 		return nil
 	}
-	var backend lbmap.BackendValue
-	switch bv := b.(type) {
-	case *lbmap.Backend4Value:
-		backend = bv.ToHost()
-	case *lbmap.Backend4ValueV3:
-		backend = bv.ToHost()
-	default:
+	address, found := ciliumBackendAddress(backend)
+	if !found {
 		return nil
 	}
-	backendIP, _ := netaddr.FromStdIP(backend.GetAddress())
-	res := netaddr.IPPortFrom(backendIP, backend.GetPort())
-	return &res
+	return &address
 }
 
 func lookupCilium6(src, dst netaddr.IPPort) *netaddr.IPPort {
@@ -151,22 +157,17 @@ func lookupCilium6(src, dst netaddr.IPPort) *netaddr.IPPort {
 	if err != nil || v == nil {
 		return nil
 	}
-	e := v.(*ctmap.CtEntry)
-	backendKey := lbmap.NewBackend6KeyV3(loadbalancer.BackendID(e.BackendID))
-	b, err := backends6Map.Lookup(backendKey)
-	if err != nil || b == nil {
+	entry := v.(*ctmap.CtEntry)
+	// A service entry keeps the backend ID in the second half of the union
+	// (struct ct_entry in bpf/lib/conntrack.h).
+	backendKey := maps.NewBackend6KeyV3(loadbalancer.BackendID(entry.Union0[1]))
+	backend, err := backends6Map.Lookup(backendKey)
+	if err != nil || backend == nil {
 		return nil
 	}
-	var backend lbmap.BackendValue
-	switch bv := b.(type) {
-	case *lbmap.Backend6Value:
-		backend = bv.ToHost()
-	case *lbmap.Backend6ValueV3:
-		backend = bv.ToHost()
-	default:
+	address, found := ciliumBackendAddress(backend)
+	if !found {
 		return nil
 	}
-	backendIP, _ := netaddr.FromStdIP(backend.GetAddress())
-	res := netaddr.IPPortFrom(backendIP, backend.GetPort())
-	return &res
+	return &address
 }

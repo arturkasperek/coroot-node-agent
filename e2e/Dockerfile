@@ -4,7 +4,7 @@
 # command passed to entrypoint.sh. The eBPF bytecode is already embedded in
 # ebpftracer/ebpf.go (committed, built via `make build-ebpf`), so building
 # the agent here is a plain `go build` — no clang/eBPF toolchain needed.
-FROM golang:1.24-bookworm AS build
+FROM golang:1.26-bookworm AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config libsystemd-dev \

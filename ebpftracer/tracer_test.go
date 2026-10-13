@@ -28,8 +28,9 @@ import (
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/proc"
 
-	"github.com/containerd/cgroups"
-	cgroupsV2 "github.com/containerd/cgroups/v2"
+	"github.com/containerd/cgroups/v3"
+	"github.com/containerd/cgroups/v3/cgroup1"
+	"github.com/containerd/cgroups/v3/cgroup2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -3734,17 +3735,17 @@ func startInMemoryCgroup(t *testing.T, cmd *exec.Cmd, limit int64) {
 	var noSwap int64
 	switch cgroups.Mode() {
 	case cgroups.Legacy, cgroups.Hybrid:
-		control, err := cgroups.New(cgroups.V1, cgroups.StaticPath(name), &specs.LinuxResources{
+		control, err := cgroup1.New(cgroup1.StaticPath(name), &specs.LinuxResources{
 			Memory: &specs.LinuxMemory{Limit: &limit, Swap: &limit},
 		})
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = control.Delete() })
 		require.NoError(t, cmd.Start())
 		watchPID(t, uint32(cmd.Process.Pid))
-		require.NoError(t, control.Add(cgroups.Process{Pid: cmd.Process.Pid}))
+		require.NoError(t, control.Add(cgroup1.Process{Pid: cmd.Process.Pid}))
 	case cgroups.Unified:
-		control, err := cgroupsV2.NewManager("/sys/fs/cgroup", name, &cgroupsV2.Resources{
-			Memory: &cgroupsV2.Memory{Max: &limit, Swap: &noSwap},
+		control, err := cgroup2.NewManager("/sys/fs/cgroup", name, &cgroup2.Resources{
+			Memory: &cgroup2.Memory{Max: &limit, Swap: &noSwap},
 		})
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = control.Delete() })
