@@ -148,16 +148,41 @@ func (t *Tracer) init(ch chan<- Event) error {
 		}
 	}
 
+	events, entries := preexistingConnections(socks, uint64(time.Now().UnixNano()))
+	for _, event := range events {
+		ch <- event
+	}
+	ebpfConnectionsMap := t.collection.Maps["active_connections"]
+	for _, entry := range entries {
+		if err := ebpfConnectionsMap.Update(entry.id, entry.conn, ebpf.UpdateNoExist); err != nil {
+			klog.Warningln(err)
+		}
+	}
+	return nil
+}
+
+type activeConnectionEntry struct {
+	id   ConnectionId
+	conn Connection
+}
+
+// preexistingConnections turns the sockets that were open before the tracer
+// started into the events it reports (listens and outbound connections) and the
+// entries it adds to active_connections (every connection). Each connection gets
+// a timestamp of its own, now plus its index: the timestamp is the identity of a
+// connection, and the eBPF side keys its per-connection protocol state by it, so
+// connections sharing one would share that state.
+func preexistingConnections(socks []sock, now uint64) ([]Event, []activeConnectionEntry) {
 	listens := map[uint64]bool{}
 	for _, s := range socks {
 		if s.Listen {
 			listens[uint64(s.pid)<<32|uint64(s.SAddr.Port())] = true
 		}
 	}
-
-	ebpfConnectionsMap := t.collection.Maps["active_connections"]
-	timestamp := uint64(time.Now().UnixNano())
-	for _, s := range socks {
+	var events []Event
+	var entries []activeConnectionEntry
+	for index, s := range socks {
+		timestamp := now + uint64(index)
 		typ := EventTypeConnectionOpen
 		inbound := false
 		if s.Listen {
@@ -166,7 +191,7 @@ func (t *Tracer) init(ch chan<- Event) error {
 			inbound = true
 		}
 		if !inbound {
-			ch <- Event{
+			events = append(events, Event{
 				Type:          typ,
 				Pid:           s.pid,
 				Timestamp:     timestamp,
@@ -174,18 +199,15 @@ func (t *Tracer) init(ch chan<- Event) error {
 				SrcAddr:       s.SAddr,
 				DstAddr:       s.DAddr,
 				ActualDstAddr: s.actualDest,
-			}
+			})
 		}
 		if typ == EventTypeConnectionOpen {
-			id := ConnectionId{FD: s.fd, PID: s.pid}
 			conn := Connection{Timestamp: timestamp}
 			if inbound {
 				conn.IsInbound = 1
 			}
-			if err := ebpfConnectionsMap.Update(id, conn, ebpf.UpdateNoExist); err != nil {
-				klog.Warningln(err)
-			}
+			entries = append(entries, activeConnectionEntry{id: ConnectionId{FD: s.fd, PID: s.pid}, conn: conn})
 		}
 	}
-	return nil
+	return events, entries
 }
