@@ -37,23 +37,60 @@ func TestHttp1ParserHeadersSplitAcrossChunks(t *testing.T) {
 	require.Equal(t, Status(404), got[0].Status)
 }
 
-// TestHttp1ParserPipelinedRequests checks FIFO request/response matching: a
-// second request's headers arriving with no DATA chunk in between (a
-// body-less GET, matching real http1.c behavior — see http1_capture_data)
-// must not get appended onto the first request's already-finished headers.
-func TestHttp1ParserPipelinedRequests(t *testing.T) {
+// One request at a time, like every other eBPF tracer: pipelining is not used in
+// practice, and a request whose response was lost (to a kernel-side bug, say) must
+// cost one span, not shift every later response onto the request before it. A
+// request that arrives while the previous one is unanswered replaces it.
+func TestHttp1ParserNewRequestReplacesAnUnansweredOne(t *testing.T) {
 	p := NewHttp1Parser()
+	replacedBefore := Http1Stats.RequestsWithoutResponse.Load()
 	require.Empty(t, p.Parse(MethodHttpClientHeaders, []byte("GET /one HTTP/1.1\r\nHost: x\r\n\r\n"), 1))
-	require.Empty(t, p.Parse(MethodHttpClientHeaders, []byte("GET /two HTTP/1.1\r\nHost: x\r\n\r\n"), 2))
+	require.Empty(t, p.Parse(MethodHttpClientHeaders, []byte("GET /two HTTP/1.1\r\nHost: x\r\n\r\n"), 20))
+	require.Equal(t, replacedBefore+1, Http1Stats.RequestsWithoutResponse.Load())
 
-	got := p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\n\r\n"), 3)
-	require.Len(t, got, 1)
-	require.Equal(t, "/one", got[0].Path)
-
-	got = p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 201 Created\r\n\r\n"), 4)
+	got := p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 201 Created\r\n\r\n"), 23)
 	require.Len(t, got, 1)
 	require.Equal(t, "/two", got[0].Path)
 	require.Equal(t, Status(201), got[0].Status)
+	require.Equal(t, 3*time.Nanosecond, got[0].Duration)
+
+	require.Empty(t, p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\n\r\n"), 24), "no request is left for a second response")
+}
+
+// A kernel side that lost track of where a response body ends reports the next
+// response's headers as response data. When a request is waiting and no response
+// body is, data that starts like a response is that response.
+func TestHttp1ResponseHeadersArrivingAsDataAreRecovered(t *testing.T) {
+	for name, p := range map[string]*Http1Parser{"without bodies": NewHttp1Parser(), "with bodies": newBodyParser(4096)} {
+		t.Run(name, func(t *testing.T) {
+			recoveredBefore := Http1Stats.ResponsesFromData.Load()
+			p.Parse(MethodHttpClientHeaders, []byte("GET /cached HTTP/1.1\r\nHost: x\r\n\r\n"), 1)
+			require.Len(t, p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 304 Not Modified\r\n\r\n"), 2), 1)
+
+			p.Parse(MethodHttpClientHeaders, []byte("GET /next HTTP/1.1\r\nHost: x\r\n\r\n"), 10)
+			got := p.Parse(MethodHttpServerData, []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"), 15)
+			require.Len(t, got, 1)
+			require.Equal(t, "/next", got[0].Path)
+			require.Equal(t, Status(200), got[0].Status)
+			require.Equal(t, 5*time.Nanosecond, got[0].Duration)
+			if p.opts.Enabled {
+				require.Equal(t, "ok", got[0].ResponseBody, "the bytes after the headers are the body")
+			}
+			require.Equal(t, recoveredBefore+1, Http1Stats.ResponsesFromData.Load())
+		})
+	}
+}
+
+// Response data that merely starts like a response is still body while a
+// response is waiting for its body.
+func TestHttp1ResponseBodyThatLooksLikeAResponseStaysBody(t *testing.T) {
+	p := newBodyParser(4096)
+	p.Parse(MethodHttpClientHeaders, []byte("GET /raw HTTP/1.1\r\nHost: x\r\n\r\n"), 1)
+	require.Empty(t, p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 19\r\n\r\n"), 2))
+	got := p.Parse(MethodHttpServerData, []byte("HTTP/1.1 200 OK\r\n\r\n"), 3)
+	require.Len(t, got, 1)
+	require.Equal(t, "/raw", got[0].Path)
+	require.Equal(t, "HTTP/1.1 200 OK\r\n\r\n", got[0].ResponseBody)
 }
 
 // TestHttp1ParserHeadersOverCapForceCompletes mirrors http1.c's own
@@ -178,16 +215,14 @@ func TestHttp1ChunkedReleasedByNextRequest(t *testing.T) {
 
 func TestHttp1ChunkedReleasedByNextResponse(t *testing.T) {
 	p := newBodyParser(4096)
-	// pipelined: the second request is already sent when the first response is still streaming
 	p.Parse(MethodHttpClientHeaders, []byte("GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), 1)
-	p.Parse(MethodHttpClientHeaders, []byte("GET /b HTTP/1.1\r\nHost: x\r\n\r\n"), 2)
 	p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"), 3)
 	p.Parse(MethodHttpServerData, []byte("first"), 4)
+	// the request of this response was missed: it ends the previous response all the same
 	got := p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"), 5)
-	require.Len(t, got, 2)
+	require.Len(t, got, 1)
 	require.Equal(t, "/a", got[0].Path)
 	require.Equal(t, "first", got[0].ResponseBody)
-	require.Equal(t, "/b", got[1].Path)
 }
 
 func TestHttp1BodyTruncatedAtMax(t *testing.T) {
@@ -229,22 +264,18 @@ func TestHttp1GzipAndBinaryAreSkipped(t *testing.T) {
 	require.Empty(t, got[0].ResponseBody)
 }
 
-func TestHttp1PipelinedBodiesStayWithTheirRequests(t *testing.T) {
+func TestHttp1ReplacedRequestTakesItsBodyAlong(t *testing.T) {
 	p := newBodyParser(4096)
-	p.Parse(MethodHttpClientHeaders, []byte("POST /one HTTP/1.1\r\nContent-Length: 3\r\n\r\n"), 1)
+	p.Parse(MethodHttpClientHeaders, []byte("POST /one HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\n"), 1)
 	p.Parse(MethodHttpClientData, []byte("aaa"), 2)
-	p.Parse(MethodHttpClientHeaders, []byte("POST /two HTTP/1.1\r\nContent-Length: 3\r\n\r\n"), 3)
+	p.Parse(MethodHttpClientHeaders, []byte("POST /two HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\n"), 3)
 	p.Parse(MethodHttpClientData, []byte("bbb"), 4)
-	p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"), 5)
-	r1 := p.Parse(MethodHttpServerData, []byte("1"), 6)
-	p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"), 7)
-	r2 := p.Parse(MethodHttpServerData, []byte("2"), 8)
-	require.Len(t, r1, 1)
-	require.Len(t, r2, 1)
-	require.Equal(t, "aaa", r1[0].RequestBody)
-	require.Equal(t, "1", r1[0].ResponseBody)
-	require.Equal(t, "bbb", r2[0].RequestBody)
-	require.Equal(t, "2", r2[0].ResponseBody)
+	p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 1\r\n\r\n"), 5)
+	got := p.Parse(MethodHttpServerData, []byte("2"), 6)
+	require.Len(t, got, 1)
+	require.Equal(t, "/two", got[0].Path)
+	require.Equal(t, "bbb", got[0].RequestBody)
+	require.Equal(t, "2", got[0].ResponseBody)
 }
 
 func TestHttp1DataWithoutMessageIsDropped(t *testing.T) {
@@ -257,16 +288,16 @@ func TestHttp1DataWithoutMessageIsDropped(t *testing.T) {
 	require.Empty(t, got[0].RequestBody)
 }
 
-func TestHttp1HeldQueueIsBounded(t *testing.T) {
+func TestHttp1HoldsAtMostOneResponse(t *testing.T) {
 	p := newBodyParser(4096)
 	var released int
 	for i := 0; i < 70; i++ {
-		p.Parse(MethodHttpClientHeaders, []byte("GET /s HTTP/1.1\r\n\r\n"), uint64(2*i+1))
+		released += len(p.Parse(MethodHttpClientHeaders, []byte("GET /s HTTP/1.1\r\n\r\n"), uint64(2*i+1)))
 		released += len(p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"), uint64(2*i+2)))
 		// every response is chunked and never finishes, the next request releases it
+		require.Equal(t, 1, p.Held())
 	}
-	require.LessOrEqual(t, p.Held(), 64)
-	_ = released
+	require.Equal(t, 69, released)
 }
 
 func TestHttp1DisabledIsUnchanged(t *testing.T) {

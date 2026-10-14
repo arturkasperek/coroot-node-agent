@@ -237,6 +237,8 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.Http1DroppedNoConnection
 	ch <- metrics.Http1DroppedTsMismatch
 	ch <- metrics.Http1RequestsParsed
+	ch <- metrics.Http1RequestsWithoutResponse
+	ch <- metrics.Http1ResponsesFromData
 	ch <- metrics.L7DroppedUnknownContainer
 	ch <- metrics.L7EventQueueDepth
 	ch <- metrics.L7TlsAttachSeconds
@@ -287,7 +289,6 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 		"skipped_encoding":     l7.BodyStats.SkippedEncoding.Load(),
 		"skipped_binary":       l7.BodyStats.SkippedBinary.Load(),
 		"dropped_no_message":   l7.BodyStats.DroppedNoMessage.Load(),
-		"dropped_queue_full":   l7.BodyStats.DroppedQueueFull.Load(),
 	} {
 		ch <- metrics.Counter(metrics.HttpBodies, float64(n), result)
 	}
@@ -295,6 +296,8 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	ch <- metrics.Counter(metrics.Http1DroppedNoConnection, float64(r.http1DroppedNoConnection.Load()))
 	ch <- metrics.Counter(metrics.Http1DroppedTsMismatch, float64(r.http1DroppedTsMismatch.Load()))
 	ch <- metrics.Counter(metrics.Http1RequestsParsed, float64(r.http1RequestsParsed.Load()))
+	ch <- metrics.Counter(metrics.Http1RequestsWithoutResponse, float64(l7.Http1Stats.RequestsWithoutResponse.Load()))
+	ch <- metrics.Counter(metrics.Http1ResponsesFromData, float64(l7.Http1Stats.ResponsesFromData.Load()))
 	ch <- metrics.Counter(metrics.L7DroppedUnknownContainer, float64(r.l7DroppedUnknownContainer.Load()))
 	ch <- metrics.Gauge(metrics.L7EventQueueDepth, float64(len(r.events)))
 	ch <- metrics.Gauge(metrics.TrackedConnections, float64(r.trackedConnectionsOpen.Load()), "open")

@@ -178,7 +178,6 @@ var BodyStats struct {
 	SkippedEncoding    atomic.Uint64
 	SkippedBinary      atomic.Uint64
 	DroppedNoMessage   atomic.Uint64
-	DroppedQueueFull   atomic.Uint64
 }
 
 func (o BodyOptions) count(d BodyDecision) {

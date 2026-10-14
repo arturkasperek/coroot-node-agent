@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -88,15 +89,23 @@ type http1Exchange struct {
 	released  bool
 }
 
-const (
-	// maxHttp1Pending bounds the requests and the responses a parser holds.
-	maxHttp1Pending = 64
-	// http1HoldMax bounds how long a response with an unknown end is held even
-	// while data keeps arriving (a long-lived stream).
-	http1HoldMax = 5 * time.Second
+// http1HoldMax bounds how long a response with an unknown end is held even while
+// data keeps arriving (a long-lived stream).
+const http1HoldMax = 5 * time.Second
+
+var (
+	http1HeaderEnd      = []byte("\r\n\r\n")
+	http1ResponsePrefix = []byte("HTTP/1.")
 )
 
-var http1HeaderEnd = []byte("\r\n\r\n")
+// Http1Stats counts how often the parser had to recover from a lost message; the
+// containers package exports it.
+var Http1Stats struct {
+	// a request replaced by the next one before its response was seen
+	RequestsWithoutResponse atomic.Uint64
+	// response headers that arrived as response data, see recoverResponseFromData
+	ResponsesFromData atomic.Uint64
+}
 
 // http1CaptureMax mirrors HTTP1_CAPTURE_MAX in ebpf/l7/http1.c: once a
 // header block this large has arrived without a "\r\n\r\n" terminator, the
@@ -110,10 +119,11 @@ const http1CaptureMax = 4096
 // Http1Parser reassembles HTTP/1.x request/response headers captured as
 // METHOD_HTTP_CLIENT_HEADERS/METHOD_HTTP_SERVER_HEADERS chunks (see
 // ebpf/l7/http1.c) into Http1Request values, one per completed
-// request/response pair. Unlike HTTP2, HTTP/1 has no stream id, so
-// requests and responses on the same connection are matched strictly in
-// arrival order (RFC 7230 requires a server to send responses in the same
-// order it received their requests, pipelined or not).
+// request/response pair. HTTP/1 has no stream id, so a response belongs to the
+// one request waiting on the connection. Pipelining (several requests sent
+// before the first response) is not supported, as in Pixie, Beyla and Datadog:
+// clients do not use it, and with one request in flight a lost response costs
+// one span instead of shifting every later response onto an earlier request.
 //
 // A single METHOD_HTTP_CLIENT_HEADERS (or _SERVER_HEADERS) payload never
 // straddles two different requests' header blocks — http1.c always flushes
@@ -128,15 +138,14 @@ type Http1Parser struct {
 	clientBuf      []byte
 	clientBufStart uint64
 	serverBuf      []byte
-	pending        []*http1PendingRequest
+	// the request waiting for its response
+	pending *http1PendingRequest
 
 	opts BodyOptions
-	// body mode only: the newest request (client data belongs to it), the
-	// responses whose body is still awaited, and the newest of them (server data
+	// body mode only: the newest response, held until its body is complete
+	// (released then, but kept: late request data of a request answered early
 	// belongs to it)
-	lastReq *http1PendingRequest
-	held    []*http1Exchange
-	curResp *http1Exchange
+	response *http1Exchange
 }
 
 func NewHttp1Parser() *Http1Parser {
@@ -153,8 +162,13 @@ func NewHttp1ParserWithBodies(opts BodyOptions) *Http1Parser {
 	return &Http1Parser{opts: opts}
 }
 
-// Held is the number of responses waiting for their body.
-func (p *Http1Parser) Held() int { return len(p.held) }
+// Held is the number of responses waiting for their body: 0 or 1.
+func (p *Http1Parser) Held() int {
+	if p.response != nil && !p.response.released {
+		return 1
+	}
+	return 0
+}
 
 // trimLeadingCRLF drops empty lines before the start line of a header block.
 // RFC 7230 3.5 has a recipient ignore at least one empty line before a
@@ -188,30 +202,33 @@ func (p *Http1Parser) ParseAt(method Method, payload []byte, kernelTime uint64, 
 			var released []Http1Request
 			if m, path, ok := parseHttp1RequestLine(p.clientBuf); ok {
 				req := &http1PendingRequest{method: m, path: path, kernelTime: p.clientBufStart}
-				if p.opts.Enabled {
-					// A request while nothing else is pipelined means the
-					// connection moved on: the previous response ended.
-					if len(p.pending) == 0 {
-						released = p.releaseAll(now)
+				if p.pending != nil {
+					Http1Stats.RequestsWithoutResponse.Add(1)
+					if p.pending.body != nil {
+						p.pending.body.release()
 					}
+				}
+				if p.opts.Enabled {
+					// A new request means the connection moved on: the previous
+					// response ended.
+					released = p.releaseResponse()
 					req.hdr = parseHttp1Headers(p.clientBuf)
 					req.body = newBodyCollector(p.opts.MaxBytes)
-					p.lastReq = req
 				}
-				p.pending = append(p.pending, req)
-				if p.opts.Enabled && len(p.pending) > maxHttp1Pending {
-					p.pending = p.pending[1:]
-					BodyStats.DroppedQueueFull.Add(1)
-				}
+				p.pending = req
 			}
 			p.clientBuf = nil
 			return released
 		}
 	case MethodHttpClientData:
 		if p.opts.Enabled {
-			if p.lastReq != nil {
-				p.lastReq.body.Add(payload)
-			} else {
+			switch {
+			case p.pending != nil:
+				p.pending.body.Add(payload)
+			case p.response != nil:
+				// answered before it was fully sent: its body is released, this is dropped
+				p.response.req.body.Add(payload)
+			default:
 				BodyStats.DroppedNoMessage.Add(1)
 			}
 		}
@@ -228,26 +245,25 @@ func (p *Http1Parser) ParseAt(method Method, payload []byte, kernelTime uint64, 
 			block := p.serverBuf
 			p.serverBuf = nil
 			if !p.opts.Enabled {
-				if ok && len(p.pending) > 0 {
-					req := p.pending[0]
-					p.pending = p.pending[1:]
-					return []Http1Request{{
-						Method:   req.method,
-						Path:     req.path,
-						Status:   status,
-						Duration: time.Duration(kernelTime - req.kernelTime),
-					}}
+				if !ok || p.pending == nil {
+					return nil
 				}
-				return nil
+				req := p.pending
+				p.pending = nil
+				return []Http1Request{{
+					Method:   req.method,
+					Path:     req.path,
+					Status:   status,
+					Duration: time.Duration(kernelTime - req.kernelTime),
+				}}
 			}
 			// A new response ends the previous one, whose body had no end marker.
-			released := p.releaseAll(now)
-			p.curResp = nil
-			if !ok || len(p.pending) == 0 {
+			released := p.releaseResponse()
+			if !ok || p.pending == nil {
 				return released
 			}
-			req := p.pending[0]
-			p.pending = p.pending[1:]
+			req := p.pending
+			p.pending = nil
 			ex := &http1Exchange{
 				req:       req,
 				status:    status,
@@ -258,21 +274,18 @@ func (p *Http1Parser) ParseAt(method Method, payload []byte, kernelTime uint64, 
 				lastEvent: now,
 			}
 			ex.noBody = req.method == "HEAD" || status < 200 || status == 204 || status == 304 || ex.hdr.contentLength == 0
-			p.curResp = ex
+			p.response = ex
 			if ex.noBody {
 				return append(released, p.finish(ex))
-			}
-			p.held = append(p.held, ex)
-			if len(p.held) > maxHttp1Pending {
-				oldest := p.held[0]
-				BodyStats.DroppedQueueFull.Add(1)
-				released = append(released, p.finish(oldest))
 			}
 			return released
 		}
 	case MethodHttpServerData:
+		if recovered, ok := p.recoverResponseFromData(payload, kernelTime, now); ok {
+			return recovered
+		}
 		if p.opts.Enabled {
-			ex := p.curResp
+			ex := p.response
 			if ex == nil || ex.released {
 				BodyStats.DroppedNoMessage.Add(1)
 				return nil
@@ -292,35 +305,48 @@ func (p *Http1Parser) ParseAt(method Method, payload []byte, kernelTime uint64, 
 // data for the configured wait, or held for too long overall. A parser without
 // bodies never holds anything.
 func (p *Http1Parser) Flush(now time.Time) []Http1Request {
-	var out []Http1Request
-	for _, ex := range append([]*http1Exchange(nil), p.held...) {
-		if now.Sub(ex.lastEvent) >= p.opts.Wait || now.Sub(ex.at) >= http1HoldMax {
-			out = append(out, p.finish(ex))
-		}
-	}
-	return out
-}
-
-func (p *Http1Parser) releaseAll(now time.Time) []Http1Request {
-	if len(p.held) == 0 {
+	ex := p.response
+	if ex == nil || ex.released {
 		return nil
 	}
-	var out []Http1Request
-	for _, ex := range append([]*http1Exchange(nil), p.held...) {
-		out = append(out, p.finish(ex))
+	if now.Sub(ex.lastEvent) >= p.opts.Wait || now.Sub(ex.at) >= http1HoldMax {
+		return []Http1Request{p.finish(ex)}
 	}
-	return out
+	return nil
 }
 
-// finish takes an exchange out of the held list and builds its result.
+// releaseResponse releases the held response, whose body had no end marker.
+func (p *Http1Parser) releaseResponse() []Http1Request {
+	if p.response == nil || p.response.released {
+		return nil
+	}
+	return []Http1Request{p.finish(p.response)}
+}
+
+// recoverResponseFromData handles response data that is a response: a kernel side
+// that lost track of where a response body ends (it once took a 304 without a
+// Content-Length for a body read until the connection closes) reports the next
+// response's headers as data. When a request is waiting and no response body is,
+// such data is the start of the response to that request.
+func (p *Http1Parser) recoverResponseFromData(payload []byte, kernelTime uint64, now time.Time) ([]Http1Request, bool) {
+	if p.pending == nil || len(p.serverBuf) > 0 || p.Held() > 0 || !bytes.HasPrefix(payload, http1ResponsePrefix) {
+		return nil, false
+	}
+	Http1Stats.ResponsesFromData.Add(1)
+	headers, body := payload, []byte(nil)
+	if end := bytes.Index(payload, http1HeaderEnd); end >= 0 {
+		headers, body = payload[:end+len(http1HeaderEnd)], payload[end+len(http1HeaderEnd):]
+	}
+	out := p.ParseAt(MethodHttpServerHeaders, headers, kernelTime, now)
+	if len(body) > 0 {
+		out = append(out, p.ParseAt(MethodHttpServerData, body, kernelTime, now)...)
+	}
+	return out, true
+}
+
+// finish releases an exchange and builds its result.
 func (p *Http1Parser) finish(ex *http1Exchange) Http1Request {
 	ex.released = true
-	for i, h := range p.held {
-		if h == ex {
-			p.held = append(p.held[:i], p.held[i+1:]...)
-			break
-		}
-	}
 	reqSize := ex.req.hdr.contentLength
 	respSize := ex.hdr.contentLength
 	if ex.hdr.chunked {
@@ -334,7 +360,7 @@ func (p *Http1Parser) finish(ex *http1Exchange) Http1Request {
 	if !ex.noBody {
 		respBody, respSize = p.opts.finishBody(ex.body, ex.hdr.contentType, ex.hdr.contentEncoding, respSize)
 	}
-	// The result holds copies; p.lastReq and p.curResp may still point at this exchange.
+	// The result holds copies; p.response may still point at this exchange.
 	ex.req.body.release()
 	ex.body.release()
 	return Http1Request{

@@ -84,6 +84,10 @@ var (
 	Http1DroppedNoConnection = metric("node_l7_http1_dropped_no_connection_total", "Total number of outbound HTTP/1 L7 events dropped because their (pid, fd) has no registered connection (opened before the agent started, its open event lost, or the fd passed to another process)")
 	Http1DroppedTsMismatch   = metric("node_l7_http1_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/1 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")
 	Http1RequestsParsed      = metric("node_l7_http1_requests_parsed_total", "Total number of complete HTTP/1 request/response pairs the parser reconstructed from correlated events")
+	// The parser keeps one request in flight per connection; these count how it
+	// recovered from a lost message (see l7.Http1Stats).
+	Http1RequestsWithoutResponse = metric("node_l7_http1_requests_without_response_total", "Total number of outbound HTTP/1 requests replaced by the next request on their connection before their response was seen (the response was lost, or the client pipelines)")
+	Http1ResponsesFromData       = metric("node_l7_http1_responses_from_data_total", "Total number of outbound HTTP/1 responses whose headers arrived as response data and were recovered (the kernel side lost track of where a response body ended)")
 
 	// Depth of the registry's event channel at scrape time. handleEvents is
 	// a single goroutine, so a non-trivial reading here means it is behind
@@ -98,7 +102,7 @@ var (
 	// See containers.Registry's l7DroppedUnknownContainer.
 	L7DroppedUnknownContainer = metric("node_l7_dropped_unknown_container_total", "Total number of L7 events that arrived for a PID whose container was not registered yet (now registered on the spot instead of being dropped)")
 
-	HttpBodies               = metric("node_l7_http_bodies_total", "What happened to the bodies of outbound HTTP calls seen with --http-body-capture: captured, truncated (captured but cut), skipped by content type, content encoding or because they look binary, or dropped for lack of a message or a full queue", "result")
+	HttpBodies               = metric("node_l7_http_bodies_total", "What happened to the bodies of outbound HTTP calls seen with --http-body-capture: captured, truncated (captured but cut), skipped by content type, content encoding or because they look binary, or dropped for lack of a message", "result")
 	Http2EventsSeen          = metric("node_l7_http2_events_total", "Total number of outbound HTTP/2 L7 events the kernel delivered to userspace, whether or not they could be correlated to a tracked connection")
 	Http2DroppedNoConnection = metric("node_l7_http2_dropped_no_connection_total", "Total number of outbound HTTP/2 L7 events dropped because their (pid, fd) has no registered connection (opened before the agent started, its open event lost, or the fd passed to another process)")
 	Http2DroppedTsMismatch   = metric("node_l7_http2_dropped_timestamp_mismatch_total", "Total number of outbound HTTP/2 L7 events dropped because their connection timestamp didn't match the tracked connection's (the tracked connection was replaced/reopened)")

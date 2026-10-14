@@ -10,17 +10,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The parser keeps pointers to the last request and the current response after their span
-// is made: their bodies must not stay with them. Under connection churn a parser per
-// connection held ~1 KB per body for every finished exchange (590 MB in a load test).
+// The parser keeps a pointer to the last response after its span is made: its bodies must
+// not stay with it. Under connection churn a parser per connection held ~1 KB per body for
+// every finished exchange (590 MB in a load test).
 func requireBodiesReleased(t *testing.T, p *Http1Parser) {
 	t.Helper()
-	if p.lastReq != nil {
-		assertReleased(t, p.lastReq.body, "request body of a finished exchange")
-	}
-	if p.curResp != nil && p.curResp.released {
-		assertReleased(t, p.curResp.body, "response body of a finished exchange")
-		assertReleased(t, p.curResp.req.body, "request body of a finished exchange")
+	if p.response != nil && p.response.released {
+		assertReleased(t, p.response.body, "response body of a finished exchange")
+		assertReleased(t, p.response.req.body, "request body of a finished exchange")
 	}
 }
 
@@ -69,10 +66,10 @@ func TestHttp1BodiesAreReleasedWithTheirSpan(t *testing.T) {
 		got := p.Parse(MethodHttpClientHeaders, []byte("GET /b HTTP/1.1\r\n\r\n"), 4)
 		require.Len(t, got, 1)
 		require.Equal(t, "part", got[0].ResponseBody)
-		// lastReq is /b now and its body is still being collected; /a's response is released
-		require.True(t, p.curResp.released)
-		assertReleased(t, p.curResp.body, "response body of /a")
-		assertReleased(t, p.curResp.req.body, "request body of /a")
+		// /b waits for its response and still collects its body; /a's response is released
+		require.True(t, p.response.released)
+		assertReleased(t, p.response.body, "response body of /a")
+		assertReleased(t, p.response.req.body, "request body of /a")
 	})
 }
 
@@ -98,25 +95,6 @@ func TestHttp1RequestDataAfterItsSpanIsIgnored(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, "/next", got[0].Path)
 	require.Equal(t, "next", got[0].RequestBody, "the next request collects its own body")
-}
-
-// Pipelining: when the span of the first request is made, the second one may still be
-// receiving its body. Only the finished exchange gives its buffers back.
-func TestHttp1PipelinedRequestKeepsItsBodyAfterAnEarlierSpan(t *testing.T) {
-	p := newBodyParser(4096)
-	p.Parse(MethodHttpClientHeaders, []byte("POST /one HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\n"), 1)
-	p.Parse(MethodHttpClientData, []byte("aaa"), 2)
-	p.Parse(MethodHttpClientHeaders, []byte("POST /two HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\n"), 3)
-	p.Parse(MethodHttpClientData, []byte("bbb"), 4)
-	r1 := p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"), 5)
-	require.Len(t, r1, 1)
-	require.Equal(t, "aaa", r1[0].RequestBody)
-
-	p.Parse(MethodHttpClientData, []byte("ccc"), 6) // the rest of /two, after the span of /one
-	r2 := p.Parse(MethodHttpServerHeaders, []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"), 7)
-	require.Len(t, r2, 1)
-	require.Equal(t, "/two", r2[0].Path)
-	require.Equal(t, "bbbccc", r2[0].RequestBody)
 }
 
 // What the agent keeps per connection, measured: a parser with one finished exchange whose
