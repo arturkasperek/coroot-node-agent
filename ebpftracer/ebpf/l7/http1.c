@@ -108,7 +108,14 @@ struct http1_state_val {
     __u8 chunk_saw_cr;
     __u8 chunk_in_ext;
     __u8 chunk_crlf_consumed;
-    __u8 pad[1];
+    /* The status code of a response, read off its first line ("HTTP/1.1 304
+       ..."): the digits after the first space. Carried across syscalls like
+       the matchers above. A request's first line goes through the same scan
+       and its "status" is ignored. */
+    __u8 status_line_done;
+    __u8 status_space_seen;
+    __u8 status_digits;
+    __u16 status_code;
 };
 
 struct {
@@ -249,6 +256,10 @@ struct http1_hdr_scan_ctx {
     __u8 te_in_value;
     __u8 te_value_pos;
     __u8 chunked;
+    __u8 status_line_done;
+    __u8 status_space_seen;
+    __u8 status_digits;
+    __u16 status_code;
     __u8 done;
     __u8 method;
     /* Set for a chunked trailer block (HTTP1_PHASE_CHUNK_TRAILER): still
@@ -360,6 +371,16 @@ static long http1_hdr_scan_cb(__u32 i, void *ctx) {
                     a->te_in_value = 0;
                 }
             }
+        }
+    }
+    if (!a->status_line_done) {
+        if (b == '\n') {
+            a->status_line_done = 1;
+        } else if (!a->status_space_seen) {
+            a->status_space_seen = (b == ' ');
+        } else if (a->status_digits < 3 && b >= '0' && b <= '9') {
+            a->status_code = a->status_code * 10 + (b - '0');
+            a->status_digits += 1;
         }
     }
     if (b == '\n') {
@@ -563,6 +584,11 @@ int http1_chunk_crlf_step(__u8 *consumed) {
    keeps resuming (via http1_state) across as many later buffers as it
    takes, same as a slow trickle of any other kind. */
 static __always_inline
+int http1_status_has_no_body(__u16 status) {
+    return (status >= 100 && status < 200) || status == 204 || status == 304;
+}
+
+static __always_inline
 int http1_walk_impl(void *ctx, void *tail_progs) {
     __u32 zero = 0;
     struct http1_tail_state *s;
@@ -617,6 +643,10 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         sc.te_in_value = sv.te_in_value;
         sc.te_value_pos = sv.te_value_pos;
         sc.chunked = sv.chunked;
+        sc.status_line_done = sv.status_line_done;
+        sc.status_space_seen = sv.status_space_seen;
+        sc.status_digits = sv.status_digits;
+        sc.status_code = sv.status_code;
         sc.method = s->is_req ? METHOD_HTTP_CLIENT_HEADERS : METHOD_HTTP_SERVER_HEADERS;
 
         bpf_loop(HTTP1_HDR_SCAN_MAX, http1_hdr_scan_cb, &sc, 0);
@@ -643,6 +673,10 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         sv.te_in_value = sc.te_in_value;
         sv.te_value_pos = sc.te_value_pos;
         sv.chunked = sc.chunked;
+        sv.status_line_done = sc.status_line_done;
+        sv.status_space_seen = sc.status_space_seen;
+        sv.status_digits = sc.status_digits;
+        sv.status_code = sc.status_code;
         if (!sc.done) {
             bpf_map_update_elem(&http1_state, &key, &sv, BPF_ANY);
             return 0;
@@ -656,7 +690,21 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         sv.te_line_mismatch = 0;
         sv.te_in_value = 0;
         sv.te_value_pos = 0;
+        sv.status_line_done = 0;
+        sv.status_space_seen = 0;
+        sv.status_digits = 0;
+        sv.status_code = 0;
         if (sc.is_trailer) {
+            sv.phase = HTTP1_PHASE_HEADERS;
+            sv.chunked = 0;
+            sv.content_length = 0;
+            sv.data_captured = 0;
+        } else if (!s->is_req && http1_status_has_no_body(sc.status_code)) {
+            /* 1xx, 204 and 304 responses end with their headers whatever
+               Content-Length or Transfer-Encoding they carry (RFC 9110
+               6.4.1); without this a 304 (no Content-Length) would read as
+               a close-delimited body and swallow every later response on
+               the connection. */
             sv.phase = HTTP1_PHASE_HEADERS;
             sv.chunked = 0;
             sv.content_length = 0;

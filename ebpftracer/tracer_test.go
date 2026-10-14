@@ -772,6 +772,42 @@ func TestHttp1ReadAfterSendmsgOnAnotherSocketCapturesTheResponse(t *testing.T) {
 	require.Equal(t, padLen, bytes.Count(headers, []byte{0xab}))
 }
 
+// A 1xx, 204 or 304 response has no body even without a Content-Length (RFC 9110
+// 6.4.1), so the next response on a keep-alive connection must be captured as
+// headers. Browsers revalidate cached files and get many 304s.
+func TestHttp1ResponseWithoutBodyIsFollowedByTheNextResponseHeaders(t *testing.T) {
+	skipIfNotVM(t)
+	for _, statusLine := range []string{"HTTP/1.1 304 Not Modified", "HTTP/1.1 204 No Content", "HTTP/1.1 100 Continue"} {
+		t.Run(statusLine, func(t *testing.T) {
+			getEvent, stop := runTracer(t)
+			defer stop()
+
+			client, srv := dialAcceptedTCP(t)
+			buf := make([]byte, 4096)
+			exchange := func(request, response string) {
+				t.Helper()
+				_, err := client.Write([]byte(request))
+				require.NoError(t, err)
+				_, err = srv.Read(buf)
+				require.NoError(t, err)
+				_, err = srv.Write([]byte(response))
+				require.NoError(t, err)
+				_, err = client.Read(buf)
+				require.NoError(t, err)
+			}
+			exchange("GET /cached HTTP/1.1\r\nHost: x\r\n\r\n", statusLine+"\r\nDate: Wed, 14 Oct 2026 13:29:45 GMT\r\n\r\n")
+
+			const padLen = 100
+			exchange("GET /next HTTP/1.1\r\nHost: x\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Pad: "+strings.Repeat("\xcd", padLen)+"\r\nContent-Length: 0\r\n\r\n")
+
+			pid := uint32(os.Getpid())
+			require.Equal(t, padLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpServerHeaders, 0xcd, padLen),
+				"the next response was not captured as response headers")
+		})
+	}
+}
+
 // http1RequestWithBody builds a request whose Content-Length exactly
 // matches len(body), so http1.c's Content-Length parsing can find exactly
 // where the body ends.
