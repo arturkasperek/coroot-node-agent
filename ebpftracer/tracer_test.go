@@ -711,6 +711,67 @@ func TestHttp1ServerHeadersAndDataSplit(t *testing.T) {
 	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, true, l7.MethodHttpServerData, 0xcd, bodyLen))
 }
 
+// A thread that sends a message on a socket that is not HTTP with sendmsg (the
+// agent's own taskstats netlink requests, for example) and then reads an HTTP
+// response with a plain read must have the response captured, not the sendmsg's
+// message: sendmsg leaves a vector table loaded for the thread, which the read
+// must not take over.
+func TestHttp1ReadAfterSendmsgOnAnotherSocketCapturesTheResponse(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	client, server := dialAcceptedTCP(t)
+	_, err := client.Write([]byte("GET /test HTTP/1.1\r\nHost: x\r\n\r\n"))
+	require.NoError(t, err)
+	buf := make([]byte, 4096)
+	_, err = server.Read(buf)
+	require.NoError(t, err)
+
+	const padLen = 100
+	response := append([]byte("HTTP/1.1 200 OK\r\nX-Pad: "), bytes.Repeat([]byte{0xab}, padLen)...)
+	response = append(response, []byte("\r\nContent-Length: 0\r\n\r\n")...)
+	_, err = server.Write(response)
+	require.NoError(t, err)
+
+	datagrams, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	require.NoError(t, err)
+	defer unix.Close(datagrams[0])
+	defer unix.Close(datagrams[1])
+	const messageLen = 28
+
+	// Both syscalls on one thread, the sendmsg right before the read.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	raw, err := client.(*net.TCPConn).SyscallConn()
+	require.NoError(t, err)
+	var readErr error
+	require.NoError(t, raw.Read(func(fd uintptr) bool {
+		if _, sendErr := unix.SendmsgN(datagrams[1], bytes.Repeat([]byte{0xee}, messageLen), nil, nil, 0); sendErr != nil {
+			readErr = sendErr
+			return true
+		}
+		_, readErr = unix.Read(int(fd), buf)
+		return true
+	}))
+	require.NoError(t, readErr)
+
+	var headers []byte
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && bytes.Count(headers, []byte{0xab}) < padLen {
+		e := getEvent()
+		if e == nil || e.Pid != uint32(os.Getpid()) || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol != l7.ProtocolHTTP || e.L7Request.IsInbound || e.L7Request.Method != l7.MethodHttpServerHeaders {
+			continue
+		}
+		headers = append(headers, e.L7Request.Payload...)
+	}
+	require.Zero(t, bytes.Count(headers, []byte{0xee}), "the sendmsg's message was captured as the response headers")
+	require.Equal(t, padLen, bytes.Count(headers, []byte{0xab}))
+}
+
 // http1RequestWithBody builds a request whose Content-Length exactly
 // matches len(body), so http1.c's Content-Length parsing can find exactly
 // where the body ends.

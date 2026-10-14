@@ -1574,9 +1574,9 @@ int http2_iov_kp(void *ctx) {
    enters http2_resume, which tail-calls straight into the iovec walker. */
 /* Makes http2_iovecs ready to walk `size` bytes starting at `buf` (a real
    userspace pointer) or, when from_heap is set, at iovec_buf_heap's scratch
-   buffer standing in for one — unless a real writev/readv/sendmsg vector
-   list is already loaded and ready (http2_load_iovecs), in which case that
-   takes priority and buf/size/from_heap are ignored. Shared by
+   buffer standing in for one — unless the caller passes no buf and a real
+   writev/readv/sendmsg vector list is already loaded and ready
+   (http2_load_iovecs), in which case that list is walked instead. Shared by
    http2_tail_emit and http1_tail_emit (see http1.c): every L7 protocol that
    walks a byte stream through this same iovec abstraction funnels through
    here first. Returns the ready table, or NULL if neither source is
@@ -1593,6 +1593,14 @@ struct http2_iovec_table *http2_iov_adopt(char *buf, __u64 size, __u8 from_heap)
        race for this CPU's scratch slot — not usable here. */
     if (iovs && iovs->ready && http2_owner_mismatch(iovs->owner)) {
         iovs = 0;
+    }
+    /* A caller with its own buffer (plain read/write, TLS) is never the
+       syscall that loaded a vector list: those pass no buf. A ready list here
+       is left over from an earlier syscall of this thread whose socket was
+       neither HTTP nor HTTP2 (a sendmsg to netlink, say), and walking it would
+       report that syscall's bytes as this one's. */
+    if (iovs && iovs->ready && buf) {
+        iovs->ready = 0;
     }
     if (iovs && iovs->ready && iovs->total) {
         iovs->idx = 0;
