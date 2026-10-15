@@ -4408,3 +4408,102 @@ func TestHttp1KeepAlivePostWithChunkedResponses(t *testing.T) {
 	}
 	require.Equal(t, requests, parsed)
 }
+
+// clickhouseQueryPacket is a native-protocol Query packet as one ClickHouse server
+// sends another for a distributed query (secondary, from user "default").
+func clickhouseQueryPacket(initialQueryID string) []byte {
+	packet := []byte{1, 0, 2, 7}
+	packet = append(packet, "default"...)
+	packet = append(packet, byte(len(initialQueryID)))
+	packet = append(packet, initialQueryID...)
+	address := "10.42.0.40:9000"
+	packet = append(packet, byte(len(address)))
+	packet = append(packet, address...)
+	packet = append(packet, make([]byte, 8)...) // initial_query_start_time_microseconds
+	packet = append(packet, 1)                  // interface: TCP
+	return append(packet, make([]byte, 64)...)  // the rest of the query
+}
+
+func clickhouseEvent(t *testing.T, getEvent func() *Event) *l7.RequestData {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		e := getEvent()
+		if e == nil || e.Pid != uint32(os.Getpid()) || e.Type != EventTypeL7Request || e.L7Request == nil {
+			continue
+		}
+		if e.L7Request.Protocol == l7.ProtocolClickhouse && !e.L7Request.IsInbound {
+			return e.L7Request
+		}
+	}
+	return nil
+}
+
+// A distributed INSERT is answered first with TableColumns (compressed or not)
+// and finished with Progress and EndOfStream; neither starts with Data, which was
+// all that counted as a response, so the INSERT never got one.
+func TestClickhouseInsertResponses(t *testing.T) {
+	skipIfNotVM(t)
+	compressedTableColumns := append([]byte{0x0b}, bytes.Repeat([]byte{0x82}, 16)...) // checksum
+	compressedTableColumns = append(compressedTableColumns, 0x90)                     // ZSTD
+	compressedTableColumns = append(compressedTableColumns, 0x4f, 0x02, 0x00, 0x00, 0xb2, 0x09, 0x00, 0x00, 0x28, 0xb5, 0x2f, 0xfd)
+	columns := "columns format version: 1\n1 columns:\n`id` UInt64\n"
+	tableColumns := append([]byte{0x0b, 0x00, byte(len(columns))}, columns...)
+	progress := []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9f, 0xc8, 0x91, 0xfd, 0x01, 0x05}
+	for name, response := range map[string][]byte{
+		"compressed TableColumns": compressedTableColumns,
+		"TableColumns":            tableColumns,
+		"Progress":                progress,
+	} {
+		t.Run(name, func(t *testing.T) {
+			getEvent, stop := runTracer(t)
+			defer stop()
+			client, srv := dialAcceptedTCP(t)
+			buf := make([]byte, 4096)
+
+			_, err := client.Write(clickhouseQueryPacket("53c91ca8-a446-457c-9abc-0123456789ab"))
+			require.NoError(t, err)
+			_, err = srv.Read(buf)
+			require.NoError(t, err)
+			_, err = srv.Write(response)
+			require.NoError(t, err)
+			_, err = client.Read(buf)
+			require.NoError(t, err)
+
+			event := clickhouseEvent(t, getEvent)
+			require.NotNil(t, event, "the query got no response")
+			require.Equal(t, l7.StatusOk, event.Status)
+		})
+	}
+}
+
+// A query whose response was not recognized must not stay waiting: the next query
+// on the connection replaces it, so the next response is timed from the query it
+// answers, not from the one before it.
+func TestClickhouseQueryReplacesAnUnansweredOne(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+	client, srv := dialAcceptedTCP(t)
+	buf := make([]byte, 4096)
+	exchange := func(query, response []byte) {
+		t.Helper()
+		_, err := client.Write(query)
+		require.NoError(t, err)
+		_, err = srv.Read(buf)
+		require.NoError(t, err)
+		_, err = srv.Write(response)
+		require.NoError(t, err)
+		_, err = client.Read(buf)
+		require.NoError(t, err)
+	}
+
+	exchange(clickhouseQueryPacket("11111111-1111-1111-1111-111111111111"), []byte{0x42, 0x42, 0x42})
+	time.Sleep(300 * time.Millisecond)
+	data := []byte{0x01, 0x00, 0x01, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00}
+	exchange(clickhouseQueryPacket("22222222-2222-2222-2222-222222222222"), data)
+
+	event := clickhouseEvent(t, getEvent)
+	require.NotNil(t, event)
+	require.Less(t, event.Duration, 200*time.Millisecond, "the response was timed from the unanswered query before")
+}

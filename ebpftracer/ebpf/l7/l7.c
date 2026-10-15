@@ -770,7 +770,10 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
         req->ns = bpf_ktime_get_ns();
     }
     COPY_PAYLOAD(req->payload, size, payload);
-    bpf_map_update_elem(&active_l7_requests, &k, req, BPF_NOEXIST);
+    /* A ClickHouse query replaces one still waiting: queries on a connection do
+       not overlap, so the waiting one's response was missed, and keeping it
+       would time the next response from it. */
+    bpf_map_update_elem(&active_l7_requests, &k, req, req->protocol == PROTOCOL_CLICKHOUSE ? BPF_ANY : BPF_NOEXIST);
     return 0;
 }
 
