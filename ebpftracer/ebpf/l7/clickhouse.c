@@ -1,4 +1,6 @@
-#define CLICKHOUSE_QUERY_ID_SIZE 36
+// A query id is a UUID unless the client chose its own (clickhouse-client
+// --query_id, most drivers): any short printable string.
+#define CLICKHOUSE_MAX_QUERY_ID_SIZE 64
 
 #define CLICKHOUSE_QUERY_KIND_INITIAL 1
 #define CLICKHOUSE_QUERY_KIND_SECONDARY 2
@@ -9,7 +11,9 @@
 #define CLICKHOUSE_SERVER_CODE_EXCEPTION 2
 #define CLICKHOUSE_SERVER_CODE_PROGRESS 3
 #define CLICKHOUSE_SERVER_CODE_END_OF_STREAM 5
+#define CLICKHOUSE_SERVER_CODE_LOG 10
 #define CLICKHOUSE_SERVER_CODE_TABLE_COLUMNS 11
+#define CLICKHOUSE_SERVER_CODE_PROFILE_EVENTS 14
 
 // rows, bytes, total rows, total bytes, written rows, written bytes, elapsed ns
 #define CLICKHOUSE_PROGRESS_FIELDS 7
@@ -23,17 +27,23 @@
 #define CLICKHOUSE_MAX_USER_SIZE 63
 #define CLICKHOUSE_MAX_ADDRESS_SIZE 48
 
-// the max legitimate offset within the query header is 197 (2+36+1+1+63+1+36+1+48+8)
-#define CLICKHOUSE_MAX_OFFSET 200 // checking this fixes the program load on 5.4
+// the max legitimate offset within the query header is 253 (2+64+1+1+63+1+64+1+48+8)
+#define CLICKHOUSE_MAX_OFFSET 256 // checking this fixes the program load on 5.4
 
+// A query id of len bytes at buf: empty, or printable at both ends.
 static __always_inline
-int is_clickhouse_uuid(char *buf) {
-    __u8 u[CLICKHOUSE_QUERY_ID_SIZE];
-    bpf_read(buf, u);
-    if (u[8] != '-' || u[13] != '-' || u[18] != '-' || u[23] != '-') {
+int is_clickhouse_query_id(char *buf, __u8 len) {
+    __u8 first = 0;
+    __u8 last = 0;
+    if (len == 0) {
+        return 1;
+    }
+    if (len > CLICKHOUSE_MAX_QUERY_ID_SIZE) {
         return 0;
     }
-    return 1;
+    bpf_read(buf, first);
+    bpf_read(buf+len-1, last);
+    return first >= 0x20 && first <= 0x7e && last >= 0x20 && last <= 0x7e;
 }
 
 static __always_inline
@@ -46,15 +56,10 @@ int is_clickhouse_query(char *buf, __u64 buf_size) {
     if (b[0] != CLICKHOUSE_CLIENT_CODE_QUERY) {
         return 0;
     }
-    __u64 offset = 2;
-    if (b[1] == CLICKHOUSE_QUERY_ID_SIZE) {
-        if (!is_clickhouse_uuid(buf+2)) {
-            return 0;
-        }
-        offset += CLICKHOUSE_QUERY_ID_SIZE;
-    } else if (b[1] != 0) {
+    if (!is_clickhouse_query_id(buf+2, b[1])) {
         return 0;
     }
+    __u64 offset = 2 + b[1];
     __u8 kind = 0;
     bpf_read(buf+offset, kind);
     if (kind != CLICKHOUSE_QUERY_KIND_INITIAL && kind != CLICKHOUSE_QUERY_KIND_SECONDARY) {
@@ -71,11 +76,7 @@ int is_clickhouse_query(char *buf, __u64 buf_size) {
         return 0;
     }
     bpf_read(buf+offset, len); // initial_query_id
-    if (len == CLICKHOUSE_QUERY_ID_SIZE) {
-        if (!is_clickhouse_uuid(buf+offset+1)) {
-            return 0;
-        }
-    } else if (len != 0) {
+    if (!is_clickhouse_query_id(buf+offset+1, len)) {
         return 0;
     }
     offset += 1 + len;
@@ -98,8 +99,10 @@ int is_clickhouse_query(char *buf, __u64 buf_size) {
         return 0;
     }
     __u8 iface = 0;
-    bpf_read(buf+offset, iface); // TCP, HTTP, GRPC, MYSQL, POSTGRESQL, LOCAL, TCP_INTERSERVER, PROMETHEUS
-    if (iface < 1 || iface > 8) {
+    // TCP, HTTP, GRPC, MYSQL, POSTGRESQL, LOCAL, TCP_INTERSERVER, PROMETHEUS, BACKGROUND,
+    // ARROW_FLIGHT, ICEBERG_REST_CATALOG
+    bpf_read(buf+offset, iface);
+    if (iface < 1 || iface > 11) {
         return 0;
     }
     return 1;
@@ -141,15 +144,19 @@ int is_clickhouse_progress(char *buf, __u64 buf_size) {
     return scan.fields == CLICKHOUSE_PROGRESS_FIELDS;
 }
 
-// The first packet of the server's answer to a query: Data or Exception, and for
-// an INSERT TableColumns (newer servers send it before anything else), or
-// Progress for a query that has no rows to send yet.
+// The first packet of the server's answer to a query: Data or Exception; for an
+// INSERT TableColumns (newer servers send it before anything else); Log or
+// ProfileEvents for a client that asked for them; or Progress for a query that
+// has no rows to send yet.
 static __always_inline
 int is_clickhouse_response(char *buf, __u64 buf_size, __s32 *status) {
     __u8 b[3];
     bpf_read(buf, b);
-    if (b[0] == CLICKHOUSE_SERVER_CODE_DATA) {
-        if (b[1] != 0) { // temporary table name is always empty
+    if (b[0] == CLICKHOUSE_SERVER_CODE_DATA || b[0] == CLICKHOUSE_SERVER_CODE_LOG ||
+        b[0] == CLICKHOUSE_SERVER_CODE_PROFILE_EVENTS) {
+        // a block packet: an empty name (of a temporary table, of the logs),
+        // then the block
+        if (b[1] != 0) {
             return 0;
         }
         if (b[2] == 1) { // uncompressed block: BlockInfo field number 1

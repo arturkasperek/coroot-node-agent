@@ -4411,8 +4411,16 @@ func TestHttp1KeepAlivePostWithChunkedResponses(t *testing.T) {
 
 // clickhouseQueryPacket is a native-protocol Query packet as one ClickHouse server
 // sends another for a distributed query (secondary, from user "default").
-func clickhouseQueryPacket(initialQueryID string) []byte {
-	packet := []byte{1, 0, 2, 7}
+func clickhouseQueryPacket(queryID, initialQueryID string) []byte {
+	return clickhouseQueryPacketFrom(queryID, initialQueryID, 1)
+}
+
+// clickhouseQueryPacketFrom is clickhouseQueryPacket for a query that came in
+// through the given interface (1 TCP, 9 BACKGROUND, ...).
+func clickhouseQueryPacketFrom(queryID, initialQueryID string, iface byte) []byte {
+	packet := []byte{1, byte(len(queryID))}
+	packet = append(packet, queryID...)
+	packet = append(packet, 2, 7)
 	packet = append(packet, "default"...)
 	packet = append(packet, byte(len(initialQueryID)))
 	packet = append(packet, initialQueryID...)
@@ -4420,8 +4428,8 @@ func clickhouseQueryPacket(initialQueryID string) []byte {
 	packet = append(packet, byte(len(address)))
 	packet = append(packet, address...)
 	packet = append(packet, make([]byte, 8)...) // initial_query_start_time_microseconds
-	packet = append(packet, 1)                  // interface: TCP
-	return append(packet, make([]byte, 64)...)  // the rest of the query
+	packet = append(packet, iface)
+	return append(packet, make([]byte, 64)...) // the rest of the query
 }
 
 func clickhouseEvent(t *testing.T, getEvent func() *Event) *l7.RequestData {
@@ -4439,10 +4447,11 @@ func clickhouseEvent(t *testing.T, getEvent func() *Event) *l7.RequestData {
 	return nil
 }
 
-// A distributed INSERT is answered first with TableColumns (compressed or not)
-// and finished with Progress and EndOfStream; neither starts with Data, which was
-// all that counted as a response, so the INSERT never got one.
-func TestClickhouseInsertResponses(t *testing.T) {
+// The first packet of an answer is not always Data: a distributed INSERT is
+// answered with TableColumns (compressed or not) and finished with Progress and
+// EndOfStream, and a client that asks for logs or profile events can get a Log
+// or ProfileEvents block before anything else.
+func TestClickhouseResponses(t *testing.T) {
 	skipIfNotVM(t)
 	compressedTableColumns := append([]byte{0x0b}, bytes.Repeat([]byte{0x82}, 16)...) // checksum
 	compressedTableColumns = append(compressedTableColumns, 0x90)                     // ZSTD
@@ -4450,10 +4459,15 @@ func TestClickhouseInsertResponses(t *testing.T) {
 	columns := "columns format version: 1\n1 columns:\n`id` UInt64\n"
 	tableColumns := append([]byte{0x0b, 0x00, byte(len(columns))}, columns...)
 	progress := []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9f, 0xc8, 0x91, 0xfd, 0x01, 0x05}
+	log := []byte{0x0a, 0x00, 0x01, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0x00, 0x09, 0x01}       // an uncompressed block
+	profileEvents := append([]byte{0x0e, 0x00}, bytes.Repeat([]byte{0x5a}, 16)...)              // checksum
+	profileEvents = append(profileEvents, 0x82, 0x20, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00) // LZ4
 	for name, response := range map[string][]byte{
-		"compressed TableColumns": compressedTableColumns,
-		"TableColumns":            tableColumns,
-		"Progress":                progress,
+		"compressed TableColumns":  compressedTableColumns,
+		"TableColumns":             tableColumns,
+		"Progress":                 progress,
+		"Log":                      log,
+		"compressed ProfileEvents": profileEvents,
 	} {
 		t.Run(name, func(t *testing.T) {
 			getEvent, stop := runTracer(t)
@@ -4461,7 +4475,7 @@ func TestClickhouseInsertResponses(t *testing.T) {
 			client, srv := dialAcceptedTCP(t)
 			buf := make([]byte, 4096)
 
-			_, err := client.Write(clickhouseQueryPacket("53c91ca8-a446-457c-9abc-0123456789ab"))
+			_, err := client.Write(clickhouseQueryPacket("", "53c91ca8-a446-457c-9abc-0123456789ab"))
 			require.NoError(t, err)
 			_, err = srv.Read(buf)
 			require.NoError(t, err)
@@ -4498,12 +4512,57 @@ func TestClickhouseQueryReplacesAnUnansweredOne(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	exchange(clickhouseQueryPacket("11111111-1111-1111-1111-111111111111"), []byte{0x42, 0x42, 0x42})
+	exchange(clickhouseQueryPacket("", "11111111-1111-1111-1111-111111111111"), []byte{0x42, 0x42, 0x42})
 	time.Sleep(300 * time.Millisecond)
 	data := []byte{0x01, 0x00, 0x01, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00}
-	exchange(clickhouseQueryPacket("22222222-2222-2222-2222-222222222222"), data)
+	exchange(clickhouseQueryPacket("", "22222222-2222-2222-2222-222222222222"), data)
 
 	event := clickhouseEvent(t, getEvent)
 	require.NotNil(t, event)
 	require.Less(t, event.Duration, 200*time.Millisecond, "the response was timed from the unanswered query before")
+}
+
+// A distributed query started by a refreshable materialized view comes from the
+// BACKGROUND interface (9), one of those added after the first eight.
+func TestClickhouseQueryOfABackgroundQuery(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+	client, srv := dialAcceptedTCP(t)
+	buf := make([]byte, 4096)
+
+	_, err := client.Write(clickhouseQueryPacketFrom("", "33333333-3333-3333-3333-333333333333", 9))
+	require.NoError(t, err)
+	_, err = srv.Read(buf)
+	require.NoError(t, err)
+	_, err = srv.Write([]byte{0x01, 0x00, 0x01, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00})
+	require.NoError(t, err)
+	_, err = client.Read(buf)
+	require.NoError(t, err)
+
+	require.NotNil(t, clickhouseEvent(t, getEvent), "the query was not recognized")
+}
+
+// A client can choose its own query id (clickhouse-client --query_id, most drivers),
+// and a distributed query carries it on as the initial query id; the query is
+// recognized whatever the id looks like, not only when it is a UUID.
+func TestClickhouseQueryWithItsOwnQueryID(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+	client, srv := dialAcceptedTCP(t)
+	buf := make([]byte, 4096)
+
+	_, err := client.Write(clickhouseQueryPacket("nightly-report-42", "nightly-report-42"))
+	require.NoError(t, err)
+	_, err = srv.Read(buf)
+	require.NoError(t, err)
+	_, err = srv.Write([]byte{0x01, 0x00, 0x01, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00})
+	require.NoError(t, err)
+	_, err = client.Read(buf)
+	require.NoError(t, err)
+
+	event := clickhouseEvent(t, getEvent)
+	require.NotNil(t, event, "the query was not recognized")
+	require.Equal(t, l7.StatusOk, event.Status)
 }
