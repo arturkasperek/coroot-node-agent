@@ -772,13 +772,19 @@ func TestHttp1ReadAfterSendmsgOnAnotherSocketCapturesTheResponse(t *testing.T) {
 	require.Equal(t, padLen, bytes.Count(headers, []byte{0xab}))
 }
 
-// A 1xx, 204 or 304 response has no body even without a Content-Length (RFC 9110
-// 6.4.1), so the next response on a keep-alive connection must be captured as
-// headers. Browsers revalidate cached files and get many 304s.
+// A 1xx, 204 or 304 response, and any response to a HEAD request, has no body
+// whatever its Content-Length says (RFC 9110 6.4.1, 9.3.2), so the next response
+// on a keep-alive connection must be captured as headers. Browsers revalidate
+// cached files and get many 304s; health checks send HEAD.
 func TestHttp1ResponseWithoutBodyIsFollowedByTheNextResponseHeaders(t *testing.T) {
 	skipIfNotVM(t)
-	for _, statusLine := range []string{"HTTP/1.1 304 Not Modified", "HTTP/1.1 204 No Content", "HTTP/1.1 100 Continue"} {
-		t.Run(statusLine, func(t *testing.T) {
+	for _, testCase := range []struct{ request, response string }{
+		{"GET /cached HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 304 Not Modified\r\nDate: Wed, 14 Oct 2026 13:29:45 GMT\r\n\r\n"},
+		{"GET /cached HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 204 No Content\r\nDate: Wed, 14 Oct 2026 13:29:45 GMT\r\n\r\n"},
+		{"GET /cached HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 100 Continue\r\nDate: Wed, 14 Oct 2026 13:29:45 GMT\r\n\r\n"},
+		{"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n"},
+	} {
+		t.Run(strings.Fields(testCase.request)[0]+" "+strings.Fields(testCase.response)[1], func(t *testing.T) {
 			getEvent, stop := runTracer(t)
 			defer stop()
 
@@ -795,15 +801,26 @@ func TestHttp1ResponseWithoutBodyIsFollowedByTheNextResponseHeaders(t *testing.T
 				_, err = client.Read(buf)
 				require.NoError(t, err)
 			}
-			exchange("GET /cached HTTP/1.1\r\nHost: x\r\n\r\n", statusLine+"\r\nDate: Wed, 14 Oct 2026 13:29:45 GMT\r\n\r\n")
+			exchange(testCase.request, testCase.response)
 
 			const padLen = 100
 			exchange("GET /next HTTP/1.1\r\nHost: x\r\n\r\n",
-				"HTTP/1.1 200 OK\r\nX-Pad: "+strings.Repeat("\xcd", padLen)+"\r\nContent-Length: 0\r\n\r\n")
+				"HTTP/1.1 202 Accepted\r\nX-Pad: "+strings.Repeat("\xcd", padLen)+"\r\nContent-Length: 0\r\n\r\n")
 
-			pid := uint32(os.Getpid())
-			require.Equal(t, padLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpServerHeaders, 0xcd, padLen),
-				"the next response was not captured as response headers")
+			var headers []byte
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) && bytes.Count(headers, []byte{0xcd}) < padLen {
+				e := getEvent()
+				if e == nil || e.Pid != uint32(os.Getpid()) || e.Type != EventTypeL7Request || e.L7Request == nil {
+					continue
+				}
+				if e.L7Request.Protocol != l7.ProtocolHTTP || e.L7Request.IsInbound || e.L7Request.Method != l7.MethodHttpServerHeaders {
+					continue
+				}
+				headers = append(headers, e.L7Request.Payload...)
+			}
+			require.Contains(t, string(headers), "HTTP/1.1 202 Accepted\r\nX-Pad: ",
+				"the next response, status line included, was not captured as response headers")
 		})
 	}
 }
@@ -996,6 +1013,55 @@ func TestHttp1ChunkedMultipleChunksThenNextRequest(t *testing.T) {
 	pid := uint32(os.Getpid())
 	require.Equal(t, chunk1Len+chunk2Len, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xab, chunk1Len+chunk2Len))
 	require.Equal(t, markerLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xef, markerLen))
+}
+
+// A buffer can hold more chunks than the walker has rounds for in one syscall
+// (ClickHouse replication reads a dozen small chunks at once). The chunks it did
+// not get to must not leave the connection out of step: the next message on it
+// must still be found.
+func TestHttp1ManyChunksInOneBufferThenNextRequest(t *testing.T) {
+	skipIfNotVM(t)
+	for _, testCase := range []struct {
+		name      string
+		chunks    int
+		chunkSize int
+	}{
+		{"more chunks than tail-call rounds", 20, 10},
+		{"past the 4 KB capture budget", 300, 30},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			getEvent, stop := runTracer(t)
+			defer stop()
+
+			addr, stopDiscard := startTCPDiscard(t)
+			defer stopDiscard()
+
+			conn, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			watchConn(t, conn)
+			defer conn.Close()
+
+			const markerLen = 50
+			body := make([][]byte, testCase.chunks)
+			for i := range body {
+				body[i] = bytes.Repeat([]byte{0xab}, testCase.chunkSize)
+			}
+			req2 := append([]byte("GET /two HTTP/1.1\r\nHost: x\r\nX-Pad: "), bytes.Repeat([]byte{0xef}, markerLen)...)
+			req2 = append(req2, []byte("\r\n\r\n")...)
+
+			_, err = conn.Write(http1ChunkedRequest("/one", body))
+			require.NoError(t, err)
+			_, err = conn.Write(req2)
+			require.NoError(t, err)
+
+			pid := uint32(os.Getpid())
+			captured := min(testCase.chunks*testCase.chunkSize, 4096)
+			require.Equal(t, captured, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xab, captured),
+				"the chunk data up to the capture budget")
+			require.Equal(t, markerLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xef, markerLen),
+				"the request after the many-chunk one was not captured as headers")
+		})
+	}
 }
 
 // TestHttp1ChunkedSplitAcrossSyscalls cuts a chunked request at four points

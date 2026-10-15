@@ -3,7 +3,7 @@
    fixed 9-byte length prefix), and the body's real length comes from either
    a Content-Length header or Transfer-Encoding: chunked's own chunk-size
    lines, both parsed out of the byte stream itself (see http1_hdr_scan_cb
-   and http1_chunk_size_scan_cb), not a frame prefix. A body with neither
+   and http1_chunks_walk_cb), not a frame prefix. A body with neither
    (allowed for a response closed by the peer instead of framed) is still
    not handled — HTTP1_LEN_UNKNOWN sticks and every byte after the headers
    is (capped) DATA forever, same as Etap 1's behavior for that one case.
@@ -19,23 +19,21 @@
 /* Content-Length not seen (or not yet known) for the request/response whose
    body is being walked — sticks until Etap 3 adds chunked support (or a
    future change adds a close-delimited-body fallback for responses). While
-   set, http1_capture_data never signals "body done", so no later pipelined
-   request on the same connection is recognized — see the file comment. */
+   set, http1_body_step never brings the body to its end, so no later message
+   on the same connection is recognized — see the file comment. */
 #define HTTP1_LEN_UNKNOWN (~0ULL)
 
-/* How many phase transitions (HEADERS, DATA, or one chunk's worth of
-   CHUNK_SIZE/CHUNK_DATA/CHUNK_CRLF) http1_walk_impl's self-tail-call chases
-   in one buffer. Unlike a genuine cross-syscall resume (state saved,
-   picked back up when the next syscall's buffer arrives), running out of
-   rounds mid-buffer has no "next buffer" to resume into — this exact
-   buffer's remaining bytes are simply never looked at again once its
-   iovec table is replaced by the next call's. That only matters for
-   pipelining (rare) or a chunked body with many chunks landing in one
-   buffer (also rare — most either arrive one chunk at a time or coalesce
-   into far fewer, larger reads); a generous bound keeps it rare in
-   practice while staying well under the kernel's 33-tail-call-per-chain
-   hard cap (this chain's other call — http1_tail_emit's own tail-call
-   into the first round — takes one of those 33). */
+/* How many phases (HEADERS, DATA, a chunked body's framing, its trailer)
+   http1_walk_impl's self-tail-call chases in one buffer. Unlike a genuine
+   cross-syscall resume (state saved, picked back up when the next syscall's
+   buffer arrives), running out of rounds mid-buffer has no "next buffer" to
+   resume into — this exact buffer's remaining bytes are simply never looked
+   at again once its iovec table is replaced by the next call's. A message
+   takes at most three phases, so it only matters for many messages in one
+   buffer (pipelining, which the agent does not follow anyway); a generous
+   bound stays well under the kernel's 33-tail-call-per-chain hard cap (this
+   chain's other call — http1_tail_emit's own tail-call into the first
+   round — takes one of those 33). */
 #define HTTP1_MAX_ROUNDS 30
 
 /* Bound for the header-scanning bpf_loop — NOT the same as HTTP1_CAPTURE_MAX:
@@ -79,7 +77,7 @@ struct http1_state_val {
        the overall Content-Length body in HTTP1_PHASE_DATA, or the current
        chunk's size in HTTP1_PHASE_CHUNK_DATA (and the chunk size itself
        being accumulated, in hex, while in HTTP1_PHASE_CHUNK_SIZE — see
-       http1_chunk_size_scan_cb). HTTP1_LEN_UNKNOWN if no Content-Length
+       http1_chunks_walk_cb). HTTP1_LEN_UNKNOWN if no Content-Length
        and not chunked. */
     __u64 body_remaining;
     __u32 hdr_captured;
@@ -116,6 +114,10 @@ struct http1_state_val {
     __u8 status_space_seen;
     __u8 status_digits;
     __u16 status_code;
+    /* The first word of a request line, matched against "HEAD": how many of
+       its bytes were seen, and whether one did not match. */
+    __u8 first_word_len;
+    __u8 not_head;
 };
 
 struct {
@@ -124,6 +126,17 @@ struct {
     __uint(value_size, sizeof(struct http1_state_val));
     __uint(max_entries, 4096);
 } http1_state SEC(".maps");
+
+/* Connections (by conn_ts) whose request waiting for a response is a HEAD: its
+   response carries the Content-Length of the resource but no body (RFC 9110
+   9.3.2). Set by the request direction, taken by the response direction — a map
+   of its own because each direction rewrites its http1_state entry whole. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u64);
+    __type(value, __u8);
+    __uint(max_entries, 4096);
+} http1_head_requests SEC(".maps");
 
 /* Percpu scratch carrying http1_tail_emit's arguments across the
    bpf_tail_call to http1_walk_impl — same reasoning as http2_tail_state:
@@ -260,6 +273,8 @@ struct http1_hdr_scan_ctx {
     __u8 status_space_seen;
     __u8 status_digits;
     __u16 status_code;
+    __u8 first_word_len;
+    __u8 not_head;
     __u8 done;
     __u8 method;
     /* Set for a chunked trailer block (HTTP1_PHASE_CHUNK_TRAILER): still
@@ -285,6 +300,7 @@ static const char http1_content_length_name[] = "content-length:";
 static const char http1_transfer_encoding_name[] = "transfer-encoding:";
 #define HTTP1_TRANSFER_ENCODING_NAME_LEN 18
 static const char http1_chunked_value[] = "chunked";
+static const char http1_head_method[] = "HEAD";
 #define HTTP1_CHUNKED_VALUE_LEN 7
 
 /* One byte per bpf_loop iteration: unlike a DATA chunk (a flat byte count),
@@ -377,7 +393,16 @@ static long http1_hdr_scan_cb(__u32 i, void *ctx) {
         if (b == '\n') {
             a->status_line_done = 1;
         } else if (!a->status_space_seen) {
-            a->status_space_seen = (b == ' ');
+            if (b == ' ') {
+                a->status_space_seen = 1;
+            } else {
+                if (a->first_word_len >= 4 || b != http1_head_method[a->first_word_len]) {
+                    a->not_head = 1;
+                }
+                if (a->first_word_len < 0xff) {
+                    a->first_word_len += 1;
+                }
+            }
         } else if (a->status_digits < 3 && b >= '0' && b <= '9') {
             a->status_code = a->status_code * 10 + (b - '0');
             a->status_digits += 1;
@@ -419,113 +444,141 @@ static long http1_hdr_scan_cb(__u32 i, void *ctx) {
     return 0;
 }
 
-/* Flat cap, no framing: copies whatever's left in the iovec source, up to
-   both HTTP1_CAPTURE_MAX total for this (connection, direction) and
-   *body_remaining (the real body length from Content-Length, if known —
-   see http1_hdr_scan_cb), in MAX_PAYLOAD_SIZE-sized ring records
-   (http2_flush's per-slot ceiling applies here too). Skips whatever of the
-   real body wasn't captured (over budget) so the source cursor lands
-   exactly at the end of this body — the start of the next pipelined
-   request's headers, if there is one, rather than partway into it.
-   Returns 1 once *body_remaining reaches 0 (the whole real body has been
-   accounted for, whether or not all of it was captured), 0 otherwise —
-   either the source ran out first, or the length is unknown and there is
-   no "done" to reach (see HTTP1_LEN_UNKNOWN). */
+/* One step through a body: up to MAX_PAYLOAD_SIZE bytes of it captured while
+   the message's HTTP1_CAPTURE_MAX budget lasts, or all that this buffer holds
+   of it skipped once the budget is spent, so the source cursor lands exactly at
+   the end of the body when it is in the buffer. *remaining is what is left of
+   the body (or of the current chunk), HTTP1_LEN_UNKNOWN for a body that ends
+   with the connection. Returns the bytes stepped over, 0 once the buffer is
+   out. Small on purpose: it runs inside bpf_loop callbacks, and the 4 KB of a
+   capture take four iterations rather than an unrolled copy loop. */
 static __always_inline
-int http1_capture_data(struct connection_id cid, __u32 *data_captured, __u64 *body_remaining, char *dst, __u8 method) {
+__u32 http1_body_step(struct connection_id cid, char *dst, __u8 method, __u32 *data_captured, __u64 *remaining) {
     struct http2_iovec_table *iovs;
     struct http1_flush_args f;
     __u32 zero = 0;
-    __u32 remain;
-    __u32 avail;
-    __u32 want;
-    __u32 captured_now = 0;
-    __u32 chunk;
-    int i;
+    __u32 n;
 
     iovs = scratch_lookup(&http2_iovecs);
-    if (!iovs) {
+    if (!iovs || iovs->consumed >= iovs->total) {
         return 0;
     }
-    remain = 0;
-    if (iovs->consumed < iovs->total) {
-        remain = iovs->total - iovs->consumed;
+    n = iovs->total - iovs->consumed;
+    if (*remaining != HTTP1_LEN_UNKNOWN && *remaining < (__u64)n) {
+        n = (__u32)*remaining;
     }
-    if (!remain) {
+    if (!n) {
         return 0;
     }
-    avail = remain;
-    if (*body_remaining != HTTP1_LEN_UNKNOWN && *body_remaining < (__u64)avail) {
-        avail = (__u32)*body_remaining;
-    }
-    want = 0;
     if (*data_captured < HTTP1_CAPTURE_MAX) {
-        want = HTTP1_CAPTURE_MAX - *data_captured;
-    }
-    if (want > avail) {
-        want = avail;
-    }
-#pragma unroll
-    for (i = 0; i < (HTTP1_CAPTURE_MAX / MAX_PAYLOAD_SIZE); i++) {
-        if (!want) {
-            continue;
+        if (n > HTTP1_CAPTURE_MAX - *data_captured) {
+            n = HTTP1_CAPTURE_MAX - *data_captured;
         }
-        chunk = want;
-        if (chunk > MAX_PAYLOAD_SIZE) {
-            chunk = MAX_PAYLOAD_SIZE;
+        if (n > MAX_PAYLOAD_SIZE) {
+            n = MAX_PAYLOAD_SIZE;
         }
-        if (http2_iov_copy(dst, 0, chunk)) {
+        if (http2_iov_copy(dst, 0, n)) {
             return 0;
         }
         f.cid = cid;
         f.dst = dst;
-        f.out_len = chunk;
+        f.out_len = n;
         f.method = method;
         http1_flush(&f);
-        *data_captured += chunk;
-        captured_now += chunk;
-        want -= chunk;
+        *data_captured += n;
+    } else {
+        http2_iov_skip(n);
     }
-    if (avail > captured_now) {
-        http2_iov_skip(avail - captured_now);
+    if (*remaining != HTTP1_LEN_UNKNOWN) {
+        *remaining -= n;
     }
-    if (*body_remaining == HTTP1_LEN_UNKNOWN) {
-        return 0;
-    }
-    *body_remaining -= avail;
-    return *body_remaining == 0;
+    return n;
 }
 
-struct http1_chunk_size_scan_ctx {
-    __u64 chunk_size;
-    __u8 saw_cr;
-    __u8 in_ext;
-    __u8 done;
+/* A body framed by Content-Length (or ending with the connection), walked in
+   steps of http1_body_step until it ends or the buffer runs out. */
+struct http1_body_walk {
+    struct connection_id cid;
+    char *dst;
+    __u64 remaining;
+    __u32 data_captured;
+    __u8 method;
 };
 
-/* A chunk-size line: hex digits, an optional ";extension" (skipped, not
-   parsed), terminated by a plain "\r\n" (not "\r\n\r\n" — a chunk-size line
-   is exactly one line). Same byte-at-a-time/resumable shape as
-   http1_hdr_scan_cb's "\r\n\r\n" search, just a 2-byte terminator and hex
-   instead of decimal. */
-static long http1_chunk_size_scan_cb(__u32 i, void *ctx) {
-    struct http1_chunk_size_scan_ctx *a = ctx;
+static long http1_body_walk_cb(__u32 i, void *ctx) {
+    struct http1_body_walk *w = ctx;
+    (void)i;
+
+    if (!http1_body_step(w->cid, w->dst, w->method, &w->data_captured, &w->remaining)) {
+        return 1;
+    }
+    return w->remaining == 0;
+}
+
+/* A chunked body (RFC 9112 7.1): a hex size line ended by "\r\n" (an optional
+   ";extension" is skipped), that many bytes of data, "\r\n", and again, until a
+   size of 0, after which a trailer block ends the body. A buffer can hold many
+   chunks (ClickHouse replication reads a dozen small ones at once), so the whole
+   framing is walked in one bpf_loop, one step per iteration, instead of one
+   tail-call round per chunk phase: rounds are bounded by the kernel's 33 tail
+   calls, and a buffer with more chunks than that left the walk out of step with
+   the stream, swallowing every later message on the connection as chunk data. */
+struct http1_chunks_walk {
+    struct connection_id cid;
+    char *dst;
+    /* data bytes left of the current chunk; while its size line is read, the
+       size accumulated so far */
+    __u64 chunk_remaining;
+    __u32 data_captured;
+    __u8 phase;
+    __u8 saw_cr;
+    __u8 in_ext;
+    __u8 crlf_consumed;
+    __u8 method;
+};
+
+/* One step: a step through the current chunk's data (see http1_body_step), or
+   one byte of a size line or of the "\r\n" after the data. Stops at the last chunk (the trailer is
+   walked as a header block) or when the buffer runs out. */
+static long http1_chunks_walk_cb(__u32 i, void *ctx) {
+    struct http1_chunks_walk *w = ctx;
     __u8 b;
     __u8 v;
     (void)i;
 
-    if (!a) {
-        return 1;
+    if (w->phase == HTTP1_PHASE_CHUNK_DATA) {
+        if (!http1_body_step(w->cid, w->dst, w->method, &w->data_captured, &w->chunk_remaining)) {
+            return 1;
+        }
+        if (!w->chunk_remaining) {
+            w->phase = HTTP1_PHASE_CHUNK_CRLF;
+            w->crlf_consumed = 0;
+        }
+        return 0;
     }
     if (http2_iov_pull(&b)) {
         return 1;
     }
-    if (a->saw_cr && b == '\n') {
-        a->done = 1;
-        return 1;
+    if (w->phase == HTTP1_PHASE_CHUNK_CRLF) {
+        w->crlf_consumed += 1;
+        if (w->crlf_consumed == 2) {
+            w->phase = HTTP1_PHASE_CHUNK_SIZE;
+            w->chunk_remaining = 0;
+            w->saw_cr = 0;
+            w->in_ext = 0;
+        }
+        return 0;
     }
-    a->saw_cr = (b == '\r');
-    if (!a->saw_cr && !a->in_ext) {
+    if (w->saw_cr && b == '\n') {
+        if (!w->chunk_remaining) {
+            w->phase = HTTP1_PHASE_CHUNK_TRAILER;
+            return 1;
+        }
+        w->phase = HTTP1_PHASE_CHUNK_DATA;
+        return 0;
+    }
+    w->saw_cr = (b == '\r');
+    if (!w->saw_cr && !w->in_ext) {
         v = 0xff;
         if (b >= '0' && b <= '9') {
             v = b - '0';
@@ -535,11 +588,11 @@ static long http1_chunk_size_scan_cb(__u32 i, void *ctx) {
             v = b - 'A' + 10;
         }
         if (v != 0xff) {
-            if (a->chunk_size < (HTTP1_LEN_UNKNOWN >> 4)) {
-                a->chunk_size = (a->chunk_size << 4) | v;
+            if (w->chunk_remaining < (HTTP1_LEN_UNKNOWN >> 4)) {
+                w->chunk_remaining = (w->chunk_remaining << 4) | v;
             }
         } else if (b == ';') {
-            a->in_ext = 1;
+            w->in_ext = 1;
         }
         /* Anything else on the line (stray whitespace, ...) is tolerated:
            neither a hex digit nor ';', so just ignored until the "\r\n". */
@@ -547,47 +600,23 @@ static long http1_chunk_size_scan_cb(__u32 i, void *ctx) {
     return 0;
 }
 
-/* The mandatory "\r\n" after a chunk's data, before the next chunk-size
-   line. Always exactly 2 bytes with no content to interpret, but still
-   needs to resume correctly if a syscall boundary lands between them —
-   *consumed persists across calls the same way every other partial-scan
-   counter in this file does. Returns 1 once both bytes are in. */
 static __always_inline
-int http1_chunk_crlf_step(__u8 *consumed) {
-    __u8 b;
-    int i;
-
-#pragma unroll
-    for (i = 0; i < 2; i++) {
-        if (*consumed < 2) {
-            if (http2_iov_pull(&b)) {
-                return 0;
-            }
-            *consumed += 1;
-        }
-    }
-    return *consumed >= 2;
+int http1_status_has_no_body(__u16 status) {
+    return (status >= 100 && status < 200) || status == 204 || status == 304;
 }
 
 /* Not attached: tail-called only, so the bpf_loop-heavy header/chunk scan
    gets its own verifier budget separate from whichever real hook
    (sys_enter_write, sys_exit_read, a TLS uprobe, ...) triggered it — the
    same reason HTTP2's frame walk is a separate stage. Processes exactly one
-   phase transition (HEADERS, DATA, or one of the chunked sub-phases — see
-   the HTTP1_PHASE_* comments); reaching the end of one with more of this
+   phase (HEADERS, DATA, or a chunked body's framing — see the HTTP1_PHASE_*
+   comments); reaching the end of one with more of this
    buffer still unconsumed tail-calls itself again for the next phase,
    bounded by http1_tail_state.round rather than unrolling a loop over
    phases in one call — an earlier version did that and blew the same
    1M-instruction verifier budget HTTP2's own frame walk needs its own
-   stage to avoid. A single chunked body with many small chunks can need
-   more rounds than one buffer's worth of tail-calls provides; it simply
-   keeps resuming (via http1_state) across as many later buffers as it
-   takes, same as a slow trickle of any other kind. */
-static __always_inline
-int http1_status_has_no_body(__u16 status) {
-    return (status >= 100 && status < 200) || status == 204 || status == 304;
-}
-
+   stage to avoid. A chunked body's framing takes a single phase, however many
+   chunks the buffer holds (see http1_chunks_walk). */
 static __always_inline
 int http1_walk_impl(void *ctx, void *tail_progs) {
     __u32 zero = 0;
@@ -596,12 +625,14 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
     struct http1_state_val sv = {};
     struct http1_state_val *st;
     struct http1_hdr_scan_ctx sc;
-    struct http1_chunk_size_scan_ctx cs;
+    struct http1_chunks_walk cw;
+    struct http1_body_walk bw;
     struct http1_flush_args f;
     struct http2_iovec_table *iovs;
     char *dst;
     __u32 source_left;
-    __u8 method;
+    __u8 head_response;
+    __u8 one = 1;
 
     s = scratch_lookup(&http1_tail_state);
     if (!s) {
@@ -647,6 +678,8 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         sc.status_space_seen = sv.status_space_seen;
         sc.status_digits = sv.status_digits;
         sc.status_code = sv.status_code;
+        sc.first_word_len = sv.first_word_len;
+        sc.not_head = sv.not_head;
         sc.method = s->is_req ? METHOD_HTTP_CLIENT_HEADERS : METHOD_HTTP_SERVER_HEADERS;
 
         bpf_loop(HTTP1_HDR_SCAN_MAX, http1_hdr_scan_cb, &sc, 0);
@@ -677,6 +710,8 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         sv.status_space_seen = sc.status_space_seen;
         sv.status_digits = sc.status_digits;
         sv.status_code = sc.status_code;
+        sv.first_word_len = sc.first_word_len;
+        sv.not_head = sc.not_head;
         if (!sc.done) {
             bpf_map_update_elem(&http1_state, &key, &sv, BPF_ANY);
             return 0;
@@ -694,17 +729,33 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         sv.status_space_seen = 0;
         sv.status_digits = 0;
         sv.status_code = 0;
+        sv.first_word_len = 0;
+        sv.not_head = 0;
+        head_response = 0;
+        if (!sc.is_trailer) {
+            if (s->is_req) {
+                if (sc.first_word_len == 4 && !sc.not_head) {
+                    bpf_map_update_elem(&http1_head_requests, &key.conn_ts, &one, BPF_ANY);
+                } else {
+                    bpf_map_delete_elem(&http1_head_requests, &key.conn_ts);
+                }
+            } else if (bpf_map_lookup_elem(&http1_head_requests, &key.conn_ts)) {
+                head_response = 1;
+                bpf_map_delete_elem(&http1_head_requests, &key.conn_ts);
+            }
+        }
         if (sc.is_trailer) {
             sv.phase = HTTP1_PHASE_HEADERS;
             sv.chunked = 0;
             sv.content_length = 0;
             sv.data_captured = 0;
-        } else if (!s->is_req && http1_status_has_no_body(sc.status_code)) {
-            /* 1xx, 204 and 304 responses end with their headers whatever
-               Content-Length or Transfer-Encoding they carry (RFC 9110
-               6.4.1); without this a 304 (no Content-Length) would read as
-               a close-delimited body and swallow every later response on
-               the connection. */
+        } else if (!s->is_req && (head_response || http1_status_has_no_body(sc.status_code))) {
+            /* 1xx, 204 and 304 responses, and responses to HEAD, end with
+               their headers whatever Content-Length or Transfer-Encoding they
+               carry (RFC 9110 6.4.1); without this a 304 (no Content-Length)
+               would read as a close-delimited body and swallow every later
+               response on the connection, and a HEAD response would take the
+               start of the next one for its body. */
             sv.phase = HTTP1_PHASE_HEADERS;
             sv.chunked = 0;
             sv.content_length = 0;
@@ -724,12 +775,12 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
                carry one). Getting this wrong is not just "one unknown
                body's bytes are misread" — on a reused (keep-alive)
                connection it is fatal: HTTP1_LEN_UNKNOWN never reaches 0
-               (see http1_capture_data), so the phase never returns to
+               (see http1_body_step), so the phase never returns to
                HEADERS and every later request on the same connection is
                parsed as more of this "body" forever. A RESPONSE genuinely
                can be close-delimited instead of framed (rare, legacy), so
                HTTP1_LEN_UNKNOWN stays correct there — see the file
-               comment and http1_capture_data's own doc comment. */
+               comment and http1_body_step's own doc comment. */
             sv.body_remaining = sc.have_content_length ? sc.content_length : (s->is_req ? 0 : HTTP1_LEN_UNKNOWN);
             if (!sv.body_remaining) {
                 /* Known empty body: nothing for a DATA round to do, and each
@@ -742,42 +793,44 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
             sv.chunked = 0;
             sv.data_captured = 0;
         }
-    } else if (sv.phase == HTTP1_PHASE_CHUNK_SIZE) {
-        cs.chunk_size = sv.body_remaining;
-        cs.saw_cr = sv.chunk_saw_cr;
-        cs.in_ext = sv.chunk_in_ext;
-        cs.done = 0;
+    } else if (sv.phase == HTTP1_PHASE_CHUNK_SIZE || sv.phase == HTTP1_PHASE_CHUNK_DATA ||
+               sv.phase == HTTP1_PHASE_CHUNK_CRLF) {
+        cw.cid = s->cid;
+        cw.dst = dst;
+        cw.chunk_remaining = sv.body_remaining;
+        cw.data_captured = sv.data_captured;
+        cw.phase = sv.phase;
+        cw.saw_cr = sv.chunk_saw_cr;
+        cw.in_ext = sv.chunk_in_ext;
+        cw.crlf_consumed = sv.chunk_crlf_consumed;
+        cw.method = s->is_req ? METHOD_HTTP_CLIENT_DATA : METHOD_HTTP_SERVER_DATA;
 
-        bpf_loop(HTTP1_HDR_SCAN_MAX, http1_chunk_size_scan_cb, &cs, 0);
+        bpf_loop(HTTP1_HDR_SCAN_MAX, http1_chunks_walk_cb, &cw, 0);
 
-        sv.body_remaining = cs.chunk_size;
-        sv.chunk_saw_cr = cs.saw_cr;
-        sv.chunk_in_ext = cs.in_ext;
-        if (!cs.done) {
+        sv.body_remaining = cw.chunk_remaining;
+        sv.data_captured = cw.data_captured;
+        sv.phase = cw.phase;
+        sv.chunk_saw_cr = cw.saw_cr;
+        sv.chunk_in_ext = cw.in_ext;
+        sv.chunk_crlf_consumed = cw.crlf_consumed;
+        if (sv.phase != HTTP1_PHASE_CHUNK_TRAILER) {
+            /* the buffer ran out mid-body */
             bpf_map_update_elem(&http1_state, &key, &sv, BPF_ANY);
             return 0;
         }
-        sv.phase = sv.body_remaining ? HTTP1_PHASE_CHUNK_DATA : HTTP1_PHASE_CHUNK_TRAILER;
-    } else if (sv.phase == HTTP1_PHASE_CHUNK_DATA) {
-        method = s->is_req ? METHOD_HTTP_CLIENT_DATA : METHOD_HTTP_SERVER_DATA;
-        if (!http1_capture_data(s->cid, &sv.data_captured, &sv.body_remaining, dst, method)) {
-            bpf_map_update_elem(&http1_state, &key, &sv, BPF_ANY);
-            return 0;
-        }
-        sv.phase = HTTP1_PHASE_CHUNK_CRLF;
-        sv.chunk_crlf_consumed = 0;
-    } else if (sv.phase == HTTP1_PHASE_CHUNK_CRLF) {
-        if (!http1_chunk_crlf_step(&sv.chunk_crlf_consumed)) {
-            bpf_map_update_elem(&http1_state, &key, &sv, BPF_ANY);
-            return 0;
-        }
-        sv.phase = HTTP1_PHASE_CHUNK_SIZE;
-        sv.body_remaining = 0;
-        sv.chunk_saw_cr = 0;
-        sv.chunk_in_ext = 0;
     } else {
-        method = s->is_req ? METHOD_HTTP_CLIENT_DATA : METHOD_HTTP_SERVER_DATA;
-        if (!http1_capture_data(s->cid, &sv.data_captured, &sv.body_remaining, dst, method)) {
+        bw.cid = s->cid;
+        bw.dst = dst;
+        bw.remaining = sv.body_remaining;
+        bw.data_captured = sv.data_captured;
+        bw.method = s->is_req ? METHOD_HTTP_CLIENT_DATA : METHOD_HTTP_SERVER_DATA;
+
+        bpf_loop(HTTP1_HDR_SCAN_MAX, http1_body_walk_cb, &bw, 0);
+
+        sv.body_remaining = bw.remaining;
+        sv.data_captured = bw.data_captured;
+        if (sv.body_remaining) {
+            /* the buffer ran out mid-body, or the body ends with the connection */
             bpf_map_update_elem(&http1_state, &key, &sv, BPF_ANY);
             return 0;
         }
