@@ -141,8 +141,8 @@ func TestConnectionWhoseAddressesAreReusedIsForgotten(t *testing.T) {
 	c := newOpenTestContainer()
 	src := netaddr.MustParseIPPort("10.0.0.1:41822")
 	dst := netaddr.MustParseIPPort("10.0.0.5:8080")
-	c.onConnectionOpen(4321, 7, src, dst, dst, 1000, false, 0)
-	c.onConnectionOpen(4321, 8, src, dst, dst, 2000, false, 0) // the same addresses, a new connection
+	c.onConnectionOpen(4321, 7, src, dst, dst, 1000, false, false, 0)
+	c.onConnectionOpen(4321, 8, src, dst, dst, 2000, false, false, 0) // the same addresses, a new connection
 
 	now := time.Now()
 	open, closed := c.gcClosedConnections(now)
@@ -171,7 +171,7 @@ func TestConnectionMapsAreRebuiltAfterABurst(t *testing.T) {
 	const burst = 100000
 	for i := 0; i < burst; i++ {
 		src := netaddr.IPPortFrom(netaddr.IPv4(10, 1, byte(i>>8), byte(i)), uint16(1024+i%60000))
-		c.onConnectionOpen(4321, uint64(10+i), src, dst, dst, uint64(1+i), false, 0)
+		c.onConnectionOpen(4321, uint64(10+i), src, dst, dst, uint64(1+i), false, false, 0)
 	}
 	now := time.Now()
 	for _, conn := range c.activeConnections {

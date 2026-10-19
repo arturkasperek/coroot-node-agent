@@ -212,6 +212,13 @@ func (s Status) GRPC() string {
 	return ""
 }
 
+// HttpServerError tells an HTTP status of a failed request (5xx), the way
+// Coroot counts failed requests in its SLIs (model.IsRequestStatusFailed); a
+// 4xx is the client's mistake, not a failure of the server.
+func (s Status) HttpServerError() bool {
+	return s >= 500 && s < 600
+}
+
 func (s Status) Error() bool {
 	return s == StatusFailed
 }

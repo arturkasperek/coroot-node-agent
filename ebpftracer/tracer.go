@@ -86,6 +86,11 @@ type Event struct {
 	Mnt           uint64
 	Log           bool
 	IsInbound     bool
+	// Preexisting is a connection the process had before the tracer saw it
+	// open: open before the tracer started, or accepted by another process
+	// (a server that forks after accept, as Postgres). Its requests before
+	// then were not seen, so they cannot be numbered.
+	Preexisting bool
 }
 
 type perfMapType uint8
@@ -129,6 +134,10 @@ type Tracer struct {
 	activeConnectionsKept  atomic.Int64
 	activeConnectionsSwept atomic.Uint64
 	stopped                chan struct{}
+
+	// the IPs in traced_clients (16 bytes, IPv4 mapped), see SetTracedClients
+	tracedClients     map[[16]byte]bool
+	tracedClientsLock sync.Mutex
 }
 
 func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
@@ -429,7 +438,8 @@ type Connection struct {
 	H2SkipRespStream uint32
 	H2SkipReqData    uint8
 	H2SkipRespData   uint8
-	_                [2]uint8
+	SkipBodies       uint8
+	_                [1]uint8
 	// struct sock * recorded at SYN_SENT; only read by the eBPF side
 	// (emit_connection_open_lazy)
 	Skaddr uint64
@@ -726,7 +736,11 @@ func (t *Tracer) attachPrograms() error {
 			if strings.HasPrefix(programSpec.SectionName, "uprobe/") { // attached to a process on demand
 				continue
 			}
-			l, err = link.Kprobe(programSpec.AttachTo, program, nil)
+			if strings.HasPrefix(programSpec.SectionName, "kretprobe/") {
+				l, err = link.Kretprobe(programSpec.AttachTo, program, nil)
+			} else {
+				l, err = link.Kprobe(programSpec.AttachTo, program, nil)
+			}
 			if err != nil && programSpec.SectionName == "kprobe/nf_ct_deliver_cached_events" {
 				klog.Warningln("nf_conntrack may not be in use:", err)
 				continue
@@ -800,7 +814,8 @@ type tcpEvent struct {
 	DAddr         [16]byte
 	AAddr         [16]byte
 	IsInbound     uint8
-	_             [7]uint8
+	NotSeenOpen   uint8
+	_             [6]uint8
 }
 
 type fileEvent struct {
@@ -891,6 +906,7 @@ func parseTcpEvent(raw []byte) (*Event, error) {
 		Timestamp:     v.Timestamp,
 		Duration:      time.Duration(v.Duration),
 		IsInbound:     v.IsInbound != 0,
+		Preexisting:   v.NotSeenOpen != 0,
 	}
 	if v.Type == EventTypeConnectionClose {
 		event.TrafficStats = &TrafficStats{

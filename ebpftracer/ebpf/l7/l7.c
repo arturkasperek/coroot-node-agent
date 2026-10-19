@@ -474,6 +474,10 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
         struct connection new_conn = {};
         new_conn.timestamp = conn_timestamp(cid.pid, cid.fd);
         new_conn.is_inbound = 0;
+        /* a connection this process did not open: written first, so the
+           client side; its addresses from its socket, announced below */
+        new_conn.skaddr = socket_of_fd(cid.fd);
+        new_conn.not_seen_open = 1;
         /* BPF_ANY, not BPF_NOEXIST: this cid's slot can hold a stale entry
            from an earlier, unrelated connection that reused the same
            (pid, fd) — BPF_NOEXIST would silently keep it (and its leftover
@@ -830,6 +834,15 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, 
         struct connection new_conn = {};
         new_conn.timestamp = conn_timestamp(cid.pid, cid.fd);
         new_conn.is_inbound = 1;
+        /* a connection this process did not accept, read first, so the
+           server side: one the process that accepted it handed over (the
+           postmaster of Postgres forks a backend for it). Its addresses from
+           its socket, so that its requests know their client. */
+        new_conn.skaddr = socket_of_fd(cid.fd);
+        new_conn.not_seen_open = 1;
+        if (new_conn.skaddr) {
+            new_conn.skip_bodies = is_traced_client((struct sock_common *)new_conn.skaddr);
+        }
         /* BPF_ANY: see the matching fallback in trace_enter_write for why
            BPF_NOEXIST here can hand back a stale, unrelated connection's
            leftover HTTP2 skip state on a (pid, fd) reuse. */
@@ -837,6 +850,9 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, 
         conn = bpf_map_lookup_elem(&active_connections, &cid);
         if (!conn) {
             return 0;
+        }
+        if (conn->skaddr) {
+            emit_connection_open_lazy(&cid, conn);
         }
     }
     if (!conn->is_inbound && !conn->open_sent && conn->skaddr) {

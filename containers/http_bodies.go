@@ -80,12 +80,10 @@ func (c *Container) noteBodyHolder(conn *ActiveConnection) {
 }
 
 func (c *Container) traceFor(conn *ActiveConnection) *tracing.Trace {
-	for _, p := range c.processes {
-		if p.Flags.EbpfTracesDisabled {
-			return nil
-		}
+	if c.ebpfTracesDisabled() {
+		return nil
 	}
-	return c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+	return c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.key.src)
 }
 
 // flushHttpBodies creates the spans of the messages that were held back for
@@ -96,6 +94,18 @@ func (c *Container) flushHttpBodies(now time.Time) {
 	for conn := range c.bodyHolders {
 		if !c.flushConnectionBodies(conn, now) {
 			delete(c.bodyHolders, conn)
+		}
+	}
+	for _, p := range c.processes {
+		for fd, state := range p.inboundHttp1Parsers {
+			if state.parser.Held() > 0 {
+				c.observeInboundHttp1(p, fd, state, state.parser.Flush(now))
+			}
+		}
+		for fd, state := range p.inboundHttp2Parsers {
+			if state.parser.Held() > 0 {
+				c.observeInboundHttp2(p, fd, state, state.parser.Flush(now))
+			}
 		}
 	}
 }
@@ -109,7 +119,7 @@ func (c *Container) flushConnectionBodies(conn *ActiveConnection, now time.Time)
 			stats := c.l7Stats.get(l7.ProtocolHTTP, conn.DestinationKey)
 			trace := c.traceFor(conn)
 			for _, req := range reqs {
-				c.observeHttp1(stats, trace, req)
+				c.observeOutboundHttp1(conn, stats, trace, req)
 			}
 		}
 	}
@@ -118,7 +128,7 @@ func (c *Container) flushConnectionBodies(conn *ActiveConnection, now time.Time)
 			stats := c.l7Stats.get(l7.ProtocolHTTP2, conn.DestinationKey)
 			trace := c.traceFor(conn)
 			for _, req := range reqs {
-				c.observeHttp2(stats, trace, req)
+				c.observeHttp2(stats, trace, req, outboundHttp2RequestKey(conn, req))
 			}
 		}
 	}
@@ -128,16 +138,24 @@ func (c *Container) flushConnectionBodies(conn *ActiveConnection, now time.Time)
 // observeHttp1 and observeHttp2 count a finished call and create its span; the
 // live path, the replay of events that arrived before their connection was
 // registered and flushHttpBodies all end here.
-func (c *Container) observeHttp1(stats *L7Metrics, trace *tracing.Trace, req l7.Http1Request) {
+// observeOutboundHttp1 numbers a request of an outbound connection, in the
+// order the parser hands the requests over (a request held for its body
+// comes later, but still before the requests after it), and observes it.
+func (c *Container) observeOutboundHttp1(conn *ActiveConnection, stats *L7Metrics, trace *tracing.Trace, req l7.Http1Request) {
+	conn.http1Requests++
+	c.observeHttp1(stats, trace, req, outboundRequestKey(conn, req))
+}
+
+func (c *Container) observeHttp1(stats *L7Metrics, trace *tracing.Trace, req l7.Http1Request, requestKey uint64) {
 	c.registry.http1RequestsParsed.Add(1)
 	if common.HttpFilter.ShouldBeSkipped(req.Path) {
 		return
 	}
 	stats.observe(req.Status.Http(), "", req.Duration)
-	trace.HttpRequest(req.Method, req.Path, req.Status, req.Duration, http1Bodies(req), req.At)
+	trace.HttpRequest(req.Method, req.Path, req.Status, req.Duration, http1Bodies(req), req.At, requestKey)
 }
 
-func (c *Container) observeHttp2(stats *L7Metrics, trace *tracing.Trace, req l7.Http2Request) {
+func (c *Container) observeHttp2(stats *L7Metrics, trace *tracing.Trace, req l7.Http2Request, requestKey uint64) {
 	c.registry.http2RequestsParsed.Add(1)
 	if common.HttpFilter.ShouldBeSkipped(req.Path) {
 		return
@@ -147,5 +165,5 @@ func (c *Container) observeHttp2(stats *L7Metrics, trace *tracing.Trace, req l7.
 		status = req.GrpcStatus.GRPC()
 	}
 	stats.observe(status, "", req.Duration)
-	trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration, http2Bodies(req), req.At)
+	trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration, http2Bodies(req), req.At, requestKey)
 }

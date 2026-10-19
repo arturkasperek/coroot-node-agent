@@ -41,12 +41,27 @@ struct {
     __uint(max_entries, 10240);
 } ssl_last_fd SEC(".maps");
 
+/* The parent of each process: a process that lives a few milliseconds (one
+   a server forks for a connection) is gone before the agent reads its
+   /proc/<pid>; it belongs to the container of its parent, whose cgroup it
+   inherited. Read by user space (Tracer.ParentPid), so it outlives the
+   process: entries go when the map is full. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, 32768);
+} process_parents SEC(".maps");
+
 SEC("tracepoint/task/task_newtask")
 int task_newtask(struct trace_event_raw_task_newtask *args)
 {
     if (args->clone_flags & CLONE_THREAD) { // skipping threads
         return 0;
     }
+    __u32 child = args->pid;
+    __u32 parent = bpf_get_current_pid_tgid() >> 32;
+    bpf_map_update_elem(&process_parents, &child, &parent, BPF_ANY);
     struct proc_event e = {
         .type = EVENT_TYPE_PROCESS_START,
         .pid = args->pid,

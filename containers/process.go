@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/coroot/coroot-node-agent/apptype"
+	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
@@ -15,6 +16,7 @@ import (
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/jpillora/backoff"
 	"github.com/mdlayher/taskstats"
+	"inet.af/netaddr"
 )
 
 type GpuUsage struct {
@@ -30,6 +32,9 @@ func (gu *GpuUsage) Reset() {
 type Process struct {
 	Pid       uint32
 	StartedAt time.Time
+	// goneAt is when the agent met a process that was gone already
+	// (newGoneProcess); zero for a live one.
+	goneAt time.Time
 
 	Flags proc.Flags
 
@@ -60,16 +65,86 @@ type Process struct {
 
 	inboundHttp1Parsers map[uint64]*inboundHttp1State
 	inboundHttp2Parsers map[uint64]*inboundHttp2State
+	inboundConnections  map[uint64]*inboundConnection
+	inboundQueries      map[uint64]*inboundQueryState
+}
+
+// inboundQueryState is the query parsing state of an accepted database
+// connection, as queryParsers is of an outbound one.
+type inboundQueryState struct {
+	connTimestamp uint64
+	parsers       queryParsers
+}
+
+// inboundConnection returns the accepted connection on fd, if it is the one
+// with this timestamp.
+func (p *Process) inboundConnection(fd uint64, timestamp uint64) *inboundConnection {
+	if connection := p.inboundConnections[fd]; connection != nil && connection.timestamp == timestamp {
+		return connection
+	}
+	return nil
+}
+
+// inboundConnection is a connection the process accepted: its local (server)
+// and remote (client) ends, and whether the agent saw it open, without which
+// its requests cannot be numbered.
+type inboundConnection struct {
+	timestamp uint64
+	server    netaddr.IPPort
+	client    netaddr.IPPort
+	seenOpen  bool
 }
 
 type inboundHttp1State struct {
 	parser        *l7.Http1Parser
 	connTimestamp uint64
+	// requests is the number of requests parsed on the connection so far
+	requests uint64
 }
 
 type inboundHttp2State struct {
 	parser        *l7.Http2Parser
 	connTimestamp uint64
+}
+
+// processGone tells whether the process pid no longer exists.
+func processGone(pid uint32) bool {
+	_, err := proc.ReadCgroup(pid)
+	return err != nil && common.IsNotExist(err)
+}
+
+// newGoneProcess is a stand-in for a process that was gone when the agent
+// handled its events (one a server forked for a connection): it has the flags
+// and the network namespace of its parent, which it inherited, and nothing to
+// instrument.
+func newGoneProcess(pid uint32, parent *Process, now time.Time) *Process {
+	p := &Process{Pid: pid, StartedAt: now, goneAt: now, instrumentDone: make(chan struct{})}
+	close(p.instrumentDone)
+	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
+	if parent != nil {
+		p.Flags = parent.Flags
+		p.netNsId = parent.NetNsId()
+		p.tracer = parent.tracer
+	}
+	return p
+}
+
+// hasInboundState tells whether the process has the state of inbound
+// connections: their ends, their parsers, the requests held for their bodies.
+func (p *Process) hasInboundState() bool {
+	return len(p.inboundConnections) > 0 || len(p.inboundHttp1Parsers) > 0 || len(p.inboundHttp2Parsers) > 0 || len(p.inboundQueries) > 0
+}
+
+// goneStandIn is the stand-in of the process once it exited, with the state of
+// its inbound connections, for its events handled after its exit.
+func (p *Process) goneStandIn(now time.Time) *Process {
+	stand := newGoneProcess(p.Pid, p, now)
+	stand.StartedAt = p.StartedAt
+	stand.inboundConnections = p.inboundConnections
+	stand.inboundHttp1Parsers = p.inboundHttp1Parsers
+	stand.inboundHttp2Parsers = p.inboundHttp2Parsers
+	stand.inboundQueries = p.inboundQueries
+	return stand
 }
 
 func NewProcess(pid uint32, stats *taskstats.Stats, tracer *ebpftracer.Tracer) *Process {

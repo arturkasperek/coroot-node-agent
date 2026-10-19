@@ -42,3 +42,33 @@ func TestEarlyCgroupResolvesContainerOfDeadProcess(t *testing.T) {
 		t.Fatal("stale entry must not resolve")
 	}
 }
+
+// A pid no process has any more (as high as pids go, so never a live one in
+// the test): a process forked for one connection, gone before the agent read
+// its /proc.
+const goneChildPid = 4194000
+
+// The process a server forks for one connection lives a few milliseconds:
+// its /proc is gone when its events are handled, and so may be its cgroup read
+// early. It belongs to the container of its parent, whose cgroup it inherited.
+func TestGoneProcessBelongsToTheContainerOfItsParent(t *testing.T) {
+	parent := &Container{}
+	r := &Registry{
+		containersByPid:        map[uint32]*Container{100: parent},
+		containersByPidIgnored: map[uint32]*time.Time{},
+		earlyCg:                map[uint32]earlyCgroup{},
+		containersByCgroupId:   map[string]*Container{},
+		parentPid: func(pid uint32) (uint32, bool) {
+			return 100, pid == goneChildPid
+		},
+	}
+	if r.getOrCreateContainer(goneChildPid) != parent {
+		t.Fatal("a gone child must resolve to the container of its parent")
+	}
+	if r.lateEventContainer(goneChildPid) != parent {
+		t.Fatal("its later events must resolve too, as those of an exited process")
+	}
+	if r.getOrCreateContainer(goneChildPid+1) != nil {
+		t.Fatal("a gone pid with no known parent must not resolve")
+	}
+}

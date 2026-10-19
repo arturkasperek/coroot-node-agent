@@ -147,6 +147,22 @@ func TestParseTcpEventConnectionCloseHasTraffic(t *testing.T) {
 	require.Equal(t, uint64(200), got.TrafficStats.BytesReceived)
 }
 
+// A connection the agent did not see open in this process (accepted by
+// another one, as the postmaster of Postgres does for the backend it forks)
+// cannot have its requests numbered, as one open before the agent started.
+func TestParseTcpEventNotSeenOpen(t *testing.T) {
+	raw := encodeTcpSample(t, tcpEvent{Type: EventTypeConnectionOpen, Pid: 7, Fd: 3, IsInbound: 1, NotSeenOpen: 1})
+	got, err := parseTcpEvent(raw)
+	require.NoError(t, err)
+	require.True(t, got.IsInbound)
+	require.True(t, got.Preexisting)
+
+	raw = encodeTcpSample(t, tcpEvent{Type: EventTypeConnectionOpen, Pid: 7, Fd: 3, IsInbound: 1})
+	got, err = parseTcpEvent(raw)
+	require.NoError(t, err)
+	require.False(t, got.Preexisting, "accepted in this process")
+}
+
 func TestParseTcpEventTooShort(t *testing.T) {
 	_, err := parseTcpEvent([]byte{1, 2, 3})
 	require.Error(t, err)

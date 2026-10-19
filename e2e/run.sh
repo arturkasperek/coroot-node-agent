@@ -60,6 +60,7 @@ echo "[run.sh] starting example services"
 start_service svc-go go-service -addr1 :8081 -addr2 :8082
 start_service svc-node node-service 8081 8082 8443
 start_service svc-python python-service 8081 8443
+start_service svc-python-fork python-service 8081 --fork
 start_service svc-php php-service 8081
 start_service svc-java java-service 8081
 start_service svc-node-ka node-keepalive-service 8081
@@ -69,6 +70,7 @@ TARGETS="${TARGETS},go-h2c|h2c|http://svc-go:8082"
 TARGETS="${TARGETS},node-h1|h1|http://svc-node:8081"
 TARGETS="${TARGETS},node-h2c|h2c|http://svc-node:8082"
 TARGETS="${TARGETS},python-h1|h1|http://svc-python:8081"
+TARGETS="${TARGETS},python-fork|h1|http://svc-python-fork:8081"
 TARGETS="${TARGETS},php-h1|h1|http://svc-php:8081"
 TARGETS="${TARGETS},java-h1|h1|http://svc-java:8081"
 # TLS scenarios: Node embeds its own OpenSSL, Python's ssl module wraps

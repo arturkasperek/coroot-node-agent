@@ -46,7 +46,9 @@ func TestPreexistingConnectionsGetATimestampEach(t *testing.T) {
 		conn, ok := byConnection[ConnectionId{FD: event.Fd, PID: event.Pid}]
 		require.True(t, ok)
 		require.Equal(t, conn.Timestamp, event.Timestamp, "the event names the connection the eBPF side knows")
+		require.True(t, event.Preexisting, "its requests before the tracer started were not seen")
+		require.Equal(t, conn.IsInbound == 1, event.IsInbound)
 	}
-	require.Equal(t, 3, reported, "inbound connections are not reported")
+	require.Equal(t, 4, reported, "inbound connections too: their server spans need the client's address")
 	require.Equal(t, uint8(1), byConnection[ConnectionId{FD: 7, PID: 10}].IsInbound)
 }

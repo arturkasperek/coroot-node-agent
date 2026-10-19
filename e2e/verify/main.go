@@ -39,6 +39,16 @@ type recordedSpan struct {
 	Attributes map[string]string `json:"attributes"`
 }
 
+// ofRun tells whether a request target carries the r= tag of one of runs.
+func ofRun(target string, runs map[string]bool) bool {
+	for run := range runs {
+		if run != "" && strings.Contains(target, "r="+run) {
+			return true
+		}
+	}
+	return false
+}
+
 func fetchSpans(backend string) ([]recordedSpan, error) {
 	resp, err := http.Get(strings.TrimRight(backend, "/") + "/api/spans")
 	if err != nil {
@@ -90,6 +100,13 @@ func main() {
 	// the span; check both against what was sent.
 	bodies := flag.Bool("bodies", false, "check http.request.body and http.response.body on POST /echo spans")
 	bodyMax := flag.Int("body-max", 4096, "the agent's --http-body-max-bytes")
+	// The agent records the server side of the requests too, and every server
+	// span must tell both ends: a server that forks after accept (the process
+	// that accepted the connection is not the one that reads it, as Postgres)
+	// is where it could lose them. For these targets every request must also
+	// have a server span: a process forked for one connection lives a few
+	// milliseconds, gone before the agent reads its /proc.
+	serverSpans := flag.String("server-spans", "", "comma-separated targets whose requests must each have a server span")
 	flag.Parse()
 
 	data, err := os.ReadFile(*manifestPath)
@@ -272,6 +289,75 @@ func main() {
 					line += fmt.Sprintf("   MISSING n=%v", missing)
 				}
 				fmt.Println(line)
+			}
+		}
+	}
+
+	// every server span of this run tells both ends
+	runs := map[string]bool{}
+	for _, entry := range manifest {
+		runs[entry.Run] = true
+	}
+	var serverSpansOfRun, withoutAddresses int64
+	for _, sp := range spans {
+		a := sp.Attributes
+		if a["http.url"] != "" || !ofRun(a["http.target"], runs) {
+			continue // a client span, or another run's
+		}
+		serverSpansOfRun++
+		if a["server.address"] == "" || a["client.address"] == "" {
+			withoutAddresses++
+		}
+	}
+	status := "OK    "
+	if withoutAddresses > 0 {
+		status = "FAIL  "
+		ok = false
+	}
+	fmt.Printf("%s server spans: %d, %d of them without the server's or the client's address\n", status, serverSpansOfRun, withoutAddresses)
+
+	for _, entry := range manifest {
+		if !strings.Contains(","+*serverSpans+",", ","+entry.Target+",") {
+			continue
+		}
+		hp, err := hostPort(entry.BaseURL)
+		if err != nil {
+			log.Printf("[%s] bad base url %q: %v", entry.Target, entry.BaseURL, err)
+			ok = false
+			continue
+		}
+		var sent, recorded int64
+		for _, oc := range entry.Outcomes {
+			sent += oc.Count
+		}
+		seen := map[string]bool{}
+		for _, sp := range spans {
+			a := sp.Attributes
+			if a["http.url"] == "" && strings.Contains(a["http.target"], "r="+entry.Run) &&
+				net.JoinHostPort(a["server.address"], a["server.port"]) == hp {
+				recorded++
+				if query, err := url.ParseQuery(strings.SplitN(a["http.target"]+"?", "?", 2)[1]); err == nil {
+					seen[query.Get("n")] = true
+				}
+			}
+		}
+		status := "OK    "
+		if float64(recorded) < *minRatio*float64(sent) {
+			status = "FAIL  "
+			ok = false
+		}
+		fmt.Printf("%s target=%-12s server spans: %d of %d requests\n", status, entry.Target, recorded, sent)
+		if recorded < sent {
+			for _, oc := range entry.Outcomes {
+				var missing []int
+				for _, n := range oc.IDs {
+					if !seen[strconv.Itoa(n)] {
+						missing = append(missing, n)
+					}
+				}
+				if len(missing) > 0 {
+					fmt.Printf("         %-6s %-6s -> server spans MISSING n=%v\n", oc.Method, oc.Path, missing)
+				}
 			}
 		}
 	}

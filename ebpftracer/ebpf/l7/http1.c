@@ -155,6 +155,9 @@ struct http1_tail_state {
     /* the connection's direction as seen when the chain started (see
        http1_flush for why it is not looked up again there) */
     __u8 is_inbound;
+    /* its bodies are captured by the client's agent (connection.skip_bodies):
+       the body steps skip them as if the capture budget were spent */
+    __u8 skip_bodies;
 };
 
 struct {
@@ -798,7 +801,7 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         cw.cid = s->cid;
         cw.dst = dst;
         cw.chunk_remaining = sv.body_remaining;
-        cw.data_captured = sv.data_captured;
+        cw.data_captured = s->skip_bodies ? HTTP1_CAPTURE_MAX : sv.data_captured;
         cw.phase = sv.phase;
         cw.saw_cr = sv.chunk_saw_cr;
         cw.in_ext = sv.chunk_in_ext;
@@ -822,7 +825,7 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         bw.cid = s->cid;
         bw.dst = dst;
         bw.remaining = sv.body_remaining;
-        bw.data_captured = sv.data_captured;
+        bw.data_captured = s->skip_bodies ? HTTP1_CAPTURE_MAX : sv.data_captured;
         bw.method = s->is_req ? METHOD_HTTP_CLIENT_DATA : METHOD_HTTP_SERVER_DATA;
 
         bpf_loop(HTTP1_HDR_SCAN_MAX, http1_body_walk_cb, &bw, 0);
@@ -896,6 +899,7 @@ int http1_tail_emit(void *ctx, struct connection_id cid, struct connection *conn
     s->cid = cid;
     s->conn_ts = conn->timestamp;
     s->is_inbound = conn->is_inbound;
+    s->skip_bodies = conn->skip_bodies;
     s->is_req = is_req;
     s->round = 0;
     bpf_tail_call(ctx, tail_progs, HTTP1_TAIL_WALK);

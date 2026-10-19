@@ -66,6 +66,7 @@ var (
 	EbpfLostEvents             = metric("node_ebpf_lost_events_total", "Events the kernel dropped because their buffer was full, per buffer (perf, l7_events, tcp_connect_events)", "buffer")
 	EbpfActiveConnections      = metric("node_ebpf_active_connections", "Entries of the active_connections eBPF map after its last sweep: the sockets of live processes the eBPF programs track")
 	EbpfActiveConnectionsSwept = metric("node_ebpf_active_connections_swept_total", "Entries of the active_connections eBPF map deleted because their socket was closed without close() (the process exited, or the fd was replaced or closed by an exec)")
+	TracedClients              = metric("node_traced_clients", "The client IPs whose requests a node agent records at the client: their servers skip the bodies of their requests")
 	TrackedConnections         = metric("node_tracked_connections", "Outbound connections the agent keeps state for: open, or closed and kept for the L7 events still on their way", "state")
 	L7PayloadsTruncated        = metric("node_l7_payloads_truncated_total", "Total number of L7 events whose payload was truncated to 1024 bytes")
 	GoTlsUprobeAttachFailures  = metric("node_go_tls_uprobe_attach_failures_total", "Total number of Go binaries where crypto/tls uprobes could not be attached (typically stripped binaries)")
@@ -100,6 +101,7 @@ var (
 	L7TlsAttachSeconds = metric("node_l7_tls_attach_seconds_total", "Cumulative time the registry's event-dispatch goroutine spent attaching TLS uprobes (ELF parsing, symbol resolution, uprobe syscalls) instead of processing events")
 
 	// See containers.Registry's l7DroppedUnknownContainer.
+	L7InboundDroppedNoProcess = metric("node_l7_inbound_dropped_no_process_total", "Total number of inbound L7 events dropped because their process was neither known nor gone")
 	L7DroppedUnknownContainer = metric("node_l7_dropped_unknown_container_total", "Total number of L7 events that arrived for a PID whose container was not registered yet (now registered on the spot instead of being dropped)")
 
 	HttpBodies               = metric("node_l7_http_bodies_total", "What happened to the bodies of outbound HTTP calls seen with --http-body-capture: captured, truncated (captured but cut), skipped by content type, content encoding or because they look binary, or dropped for lack of a message", "result")

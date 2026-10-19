@@ -167,8 +167,10 @@ type activeConnectionEntry struct {
 }
 
 // preexistingConnections turns the sockets that were open before the tracer
-// started into the events it reports (listens and outbound connections) and the
-// entries it adds to active_connections (every connection). Each connection gets
+// started into the events it reports (listens and connections, marked
+// Preexisting; for an inbound one the source is the local end, as for an
+// accepted connection) and the entries it adds to active_connections (every
+// connection). Each connection gets
 // a timestamp of its own, now plus its index: the timestamp is the identity of a
 // connection, and the eBPF side keys its per-connection protocol state by it, so
 // connections sharing one would share that state.
@@ -190,17 +192,17 @@ func preexistingConnections(socks []sock, now uint64) ([]Event, []activeConnecti
 		} else if listens[uint64(s.pid)<<32|uint64(s.SAddr.Port())] || s.DAddr.Port() > s.SAddr.Port() {
 			inbound = true
 		}
-		if !inbound {
-			events = append(events, Event{
-				Type:          typ,
-				Pid:           s.pid,
-				Timestamp:     timestamp,
-				Fd:            s.fd,
-				SrcAddr:       s.SAddr,
-				DstAddr:       s.DAddr,
-				ActualDstAddr: s.actualDest,
-			})
-		}
+		events = append(events, Event{
+			Type:          typ,
+			Pid:           s.pid,
+			Timestamp:     timestamp,
+			Fd:            s.fd,
+			SrcAddr:       s.SAddr,
+			DstAddr:       s.DAddr,
+			ActualDstAddr: s.actualDest,
+			IsInbound:     inbound,
+			Preexisting:   typ == EventTypeConnectionOpen,
+		})
 		if typ == EventTypeConnectionOpen {
 			conn := Connection{Timestamp: timestamp}
 			if inbound {

@@ -163,6 +163,38 @@ struct syscall_trace_exit {
 	long ret;
 };
 
+/* The socket behind a file descriptor of the current task (socket_of_fd):
+   task->files->fdt->fd[fd] is a struct file, a socket's private_data its
+   struct socket, whose sk is the struct sock (sock_common first). */
+struct fdtable {
+	unsigned int max_fds;
+	struct file **fd;
+};
+
+struct files_struct {
+	struct fdtable *fdt;
+};
+
+struct task_struct {
+	struct files_struct *files;
+};
+
+struct inode {
+	unsigned short i_mode;
+};
+
+struct file {
+	struct inode *f_inode;
+	void *private_data;
+};
+
+struct sock;
+
+struct socket {
+	short type;
+	struct sock *sk;
+};
+
 #pragma clang attribute pop
 
 #endif /* __VMLINUX_H__ */

@@ -2,11 +2,14 @@ package tracing
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/coroot/coroot-node-agent/api"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
@@ -19,6 +22,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.18.0"
 	"go.opentelemetry.io/otel/trace"
+	"inet.af/netaddr"
 	"k8s.io/klog/v2"
 )
 
@@ -96,14 +100,12 @@ func Init(machineId, hostname, version string) {
 		klog.Exitln(err)
 	}
 
-	maxSpans := int64(sdktrace.DefaultMaxQueueSize)
-	if *flags.HttpBodyCapture {
-		// Spans that carry bodies are several times larger, so they export more
-		// slowly while a burst of calls keeps arriving; the default queue (2048
-		// spans) then overflows. A deeper queue absorbs the burst; what bounds its
-		// memory is --traces-queue-max-bytes.
-		maxSpans = 16384
-	}
+	// Every request between two containers with agents makes two spans (the
+	// client's and the server's), and spans that carry bodies are several times
+	// larger, so a burst of calls overflows the default queue (2048 spans). A
+	// deeper queue absorbs the burst; what bounds its memory is
+	// --traces-queue-max-bytes.
+	const maxSpans = 16384
 	budget = newQueueBudget(int64(*flags.TracesQueueMaxBytes), maxSpans)
 	batcher = sdktrace.WithSpanProcessor(newBatcher(exporter, budget))
 	commonResourceAttrs = []attribute.KeyValue{semconv.HostName(hostname), semconv.HostID(machineId)}
@@ -134,25 +136,70 @@ func GetContainerTracer(containerId string) *Tracer {
 		batcher,
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
-			append(
-				commonResourceAttrs,
-				semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
-				semconv.ContainerID(containerId),
-			)...,
+			append(commonResourceAttrs, containerResourceAttributes(containerId)...)...,
 		)),
 	)
 	return &Tracer{otel: provider.Tracer("coroot-node-agent", trace.WithInstrumentationVersion(agentVersion))}
 }
 
-func (t *Tracer) NewTrace(destination common.HostPort) *Trace {
-	return &Trace{tracer: t, destination: destination, commonAttrs: []attribute.KeyValue{
-		semconv.NetPeerName(destination.Host()),
-		semconv.NetPeerPort(int(destination.Port())),
-	}}
+// containerResourceAttributes describe the container whose calls the spans
+// are: its service and id, and for a container of a Kubernetes pod its
+// namespace, pod (or cron job) and name, as an instrumented application
+// running there reports them.
+func containerResourceAttributes(containerId string) []attribute.KeyValue {
+	attributes := []attribute.KeyValue{
+		semconv.ServiceName(common.ContainerIdToOtelServiceName(containerId)),
+		semconv.ContainerID(containerId),
+	}
+	container, ok := common.KubernetesContainerOf(containerId)
+	if !ok {
+		return attributes
+	}
+	attributes = append(attributes, semconv.K8SNamespaceName(container.Namespace), semconv.K8SContainerName(container.Container))
+	if container.Pod != "" {
+		attributes = append(attributes, semconv.K8SPodName(container.Pod))
+	}
+	if container.CronJob != "" {
+		attributes = append(attributes, semconv.K8SCronJobName(container.CronJob))
+	}
+	return attributes
 }
 
+// NewTrace records the client side of the calls a container makes to
+// destination.
+// NewTrace records the client side of the requests of a connection to
+// destination; client is its local end (zero when not known), by which Coroot
+// knows a client pod before its world does.
+func (t *Tracer) NewTrace(destination common.HostPort, client netaddr.IPPort) *Trace {
+	attrs := []attribute.KeyValue{
+		semconv.NetPeerName(destination.Host()),
+		semconv.NetPeerPort(int(destination.Port())),
+	}
+	if client.IsValid() {
+		attrs = append(attrs, attribute.String("network.local.address", client.IP().Unmap().String()), attribute.Int("network.local.port", int(client.Port())))
+	}
+	return &Trace{tracer: t, kind: trace.SpanKindClient, destination: destination, commonAttrs: attrs}
+}
+
+// NewServerTrace records the server side of the requests of a connection a
+// container accepted: server is its local end, client the remote one (zero
+// when the agent did not see the connection open).
+func (t *Tracer) NewServerTrace(server, client netaddr.IPPort) *Trace {
+	var attrs []attribute.KeyValue
+	if server.IsValid() {
+		attrs = append(attrs, attribute.String("server.address", server.IP().Unmap().String()), attribute.Int("server.port", int(server.Port())))
+	}
+	if client.IsValid() {
+		attrs = append(attrs, attribute.String("client.address", client.IP().Unmap().String()), attribute.Int("client.port", int(client.Port())))
+	}
+	return &Trace{tracer: t, kind: trace.SpanKindServer, commonAttrs: attrs}
+}
+
+// Trace makes the spans of one side of the requests of a connection: the
+// client side (SpanKindClient, to destination) or the server side.
 type Trace struct {
 	tracer      *Tracer
+	kind        trace.SpanKind
 	destination common.HostPort
 	commonAttrs []attribute.KeyValue
 }
@@ -192,10 +239,15 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	t.createSpanAt(time.Time{}, name, duration, error, attrs...)
 }
 
-// createSpanAt makes a span that ended at `at` (now when zero): a span whose
-// body was awaited is created later than the call ended.
+// createSpanAt makes a span of the trace's side that ended at `at` (now when
+// zero): a span whose body was awaited is created later than the call ended.
 func (t *Trace) createSpanAt(at time.Time, name string, duration time.Duration, error bool, attrs ...attribute.KeyValue) {
-	if t.tracer.otel == nil {
+	t.tracer.createSpanAt(t.kind, at, name, duration, error, append(attrs, t.commonAttrs...)...)
+}
+
+// createSpanAt makes a span of the given kind that ended at `at` (now when zero).
+func (t *Tracer) createSpanAt(kind trace.SpanKind, at time.Time, name string, duration time.Duration, error bool, attrs ...attribute.KeyValue) {
+	if t.otel == nil {
 		return
 	}
 	end := at
@@ -208,9 +260,8 @@ func (t *Trace) createSpanAt(at time.Time, name string, duration time.Duration, 
 	}
 
 	start := end.Add(-duration)
-	_, span := t.tracer.otel.Start(nil, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
+	_, span := t.otel.Start(nil, name, trace.WithTimestamp(start), trace.WithSpanKind(kind))
 	span.SetAttributes(attrs...)
-	span.SetAttributes(t.commonAttrs...)
 	if error {
 		span.SetStatus(codes.Error, "")
 	}
@@ -218,21 +269,77 @@ func (t *Trace) createSpanAt(at time.Time, name string, duration time.Duration, 
 	spansCreated.Add(1)
 }
 
+// RequestKeyAttribute carries RequestKey on a span, as 16 hex digits.
+const RequestKeyAttribute = "coroot.request.key"
+
+// RequestKey names a request so that its client and its server, each recording
+// it on its own node, name it the same: the two ends of the connection, the
+// number of the request on it (counted by both from the connection's open, one
+// request at a time), its method and its path. A 4-tuple is not used again for
+// a minute after its connection closes (TIME_WAIT), so a key looked up within a
+// few seconds of its request is the key of that request.
+func RequestKey(client, server netaddr.IPPort, number uint64, method, path string) uint64 {
+	h := xxhash.New()
+	var buf [8]byte
+	for _, end := range []netaddr.IPPort{client, server} {
+		ip := end.IP().Unmap().As16()
+		_, _ = h.Write(ip[:])
+		binary.LittleEndian.PutUint16(buf[:2], end.Port())
+		_, _ = h.Write(buf[:2])
+	}
+	binary.LittleEndian.PutUint64(buf[:], number)
+	_, _ = h.Write(buf[:])
+	_, _ = h.WriteString(method)
+	_, _ = h.Write([]byte{0})
+	_, _ = h.WriteString(path)
+	return h.Sum64()
+}
+
+func requestKeyAttributes(requestKey uint64) []attribute.KeyValue {
+	if requestKey == 0 {
+		return nil
+	}
+	return []attribute.KeyValue{attribute.String(RequestKeyAttribute, fmt.Sprintf("%016x", requestKey))}
+}
+
+// httpAddressAttributes describe the address of an HTTP call the way an
+// instrumented server describes the request: the whole URL, the target (path
+// and query), the path, the scheme, and the server. path is the request
+// target as sent, with its query.
+func (t *Trace) httpAddressAttributes(scheme, path string) []attribute.KeyValue {
+	urlPath, _, _ := strings.Cut(path, "?")
+	if t.kind == trace.SpanKindServer {
+		// the server's and the client's addresses are common attributes
+		return []attribute.KeyValue{semconv.HTTPTarget(path), attribute.String("url.path", urlPath), semconv.HTTPScheme(scheme)}
+	}
+	return []attribute.KeyValue{
+		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.destination.String(), path)),
+		semconv.HTTPTarget(path),
+		attribute.String("url.path", urlPath),
+		semconv.HTTPScheme(scheme),
+		attribute.String("server.address", t.destination.Host()),
+		attribute.Int("server.port", int(t.destination.Port())),
+	}
+}
+
 // HttpRequest records an outbound HTTP/1 call. bodies may be nil; at is when
-// the call ended (zero for now).
-func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, bodies *HttpBodies, at time.Time) {
+// the call ended (zero for now); requestKey is RequestKey, 0 when the number of
+// the request on its connection is not known.
+func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time.Duration, bodies *HttpBodies, at time.Time, requestKey uint64) {
 	if t == nil || method == "" {
 		return
 	}
-	attrs := []attribute.KeyValue{
-		semconv.HTTPURL(fmt.Sprintf("http://%s%s", t.destination.String(), path)),
+	attrs := append(t.httpAddressAttributes("http", path),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
-	}
-	t.createSpanAt(at, method, duration, status >= 400, append(attrs, bodies.attrs()...)...)
+	)
+	attrs = append(attrs, bodies.attrs()...)
+	t.createSpanAt(at, method, duration, status.HttpServerError(), append(attrs, requestKeyAttributes(requestKey)...)...)
 }
 
-func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.Status, duration time.Duration, bodies *HttpBodies, at time.Time) {
+// Http2Request records an HTTP/2 (or gRPC) call. requestKey is RequestKey with
+// the stream id as the number, 0 when the connection's ends are not known.
+func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.Status, duration time.Duration, bodies *HttpBodies, at time.Time, requestKey uint64) {
 	if t == nil {
 		return
 	}
@@ -246,15 +353,15 @@ func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.
 		scheme = "unknown"
 	}
 
-	attrs := []attribute.KeyValue{
-		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.destination.String(), path)),
+	attrs := append(t.httpAddressAttributes(scheme, path),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
-	}
+	)
 	if grpcStatus >= 0 {
 		attrs = append(attrs, semconv.RPCGRPCStatusCodeKey.Int(int(grpcStatus)))
 	}
-	t.createSpanAt(at, method, duration, status > 400 || grpcStatus > 0, append(attrs, bodies.attrs()...)...)
+	attrs = append(attrs, bodies.attrs()...)
+	t.createSpanAt(at, method, duration, status.HttpServerError() || grpcStatus > 0, append(attrs, requestKeyAttributes(requestKey)...)...)
 }
 
 func (t *Trace) PostgresQuery(query string, error bool, duration time.Duration) {

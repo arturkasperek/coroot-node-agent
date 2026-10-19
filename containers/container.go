@@ -29,7 +29,11 @@ import (
 )
 
 var (
-	gcInterval             = 10 * time.Minute
+	gcInterval = 10 * time.Minute
+	// goneProcessesInterval is how often the stand-ins of gone processes are
+	// looked at, so that one lives RecentlyExitedTTL and at most this longer:
+	// a server forking per connection makes many.
+	goneProcessesInterval  = 30 * time.Second
 	tlsAttachRetryInterval = 5 * time.Second
 	pingTimeout            = 300 * time.Millisecond
 	gpuStatsWindow         = 15 * time.Second
@@ -77,10 +81,55 @@ type ActiveConnection struct {
 	BytesSent     uint64
 	BytesReceived uint64
 
-	http1Parser    *l7.Http1Parser
-	http2Parser    *l7.Http2Parser
-	postgresParser *l7.PostgresParser
-	mysqlParser    *l7.MysqlParser
+	// Preexisting is a connection open before the agent started: its requests
+	// cannot be numbered. http1Requests is the number of HTTP/1 requests
+	// parsed on it so far.
+	Preexisting   bool
+	http1Requests uint64
+
+	http1Parser *l7.Http1Parser
+	http2Parser *l7.Http2Parser
+	queries     queryParsers
+}
+
+// queryParsers keep the state the queries of a connection need to be read: a
+// prepared statement is named once and executed later.
+type queryParsers struct {
+	postgres *l7.PostgresParser
+	mysql    *l7.MysqlParser
+}
+
+// recordQuery makes the span of a database query or command, at the client or
+// at the server side (trace). Returns false for a protocol it has no span for.
+func recordQuery(trace *tracing.Trace, parsers *queryParsers, r *l7.RequestData) bool {
+	switch r.Protocol {
+	case l7.ProtocolPostgres:
+		if parsers.postgres == nil {
+			parsers.postgres = l7.NewPostgresParser()
+		}
+		trace.PostgresQuery(parsers.postgres.Parse(r.Payload), r.Status.Error(), r.Duration)
+	case l7.ProtocolMysql:
+		if parsers.mysql == nil {
+			parsers.mysql = l7.NewMysqlParser()
+		}
+		trace.MysqlQuery(parsers.mysql.Parse(r.Payload, r.StatementId), r.Status.Error(), r.Duration)
+	case l7.ProtocolMemcached:
+		cmd, items := l7.ParseMemcached(r.Payload)
+		trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
+	case l7.ProtocolRedis:
+		cmd, args := l7.ParseRedis(r.Payload)
+		trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
+	case l7.ProtocolMongo:
+		trace.MongoQuery(l7.ParseMongo(r.Payload), r.Status.Error(), r.Duration)
+	case l7.ProtocolClickhouse:
+		trace.ClickhouseQuery(l7.ParseClickhouse(r.Payload), r.Status.Error(), r.Duration)
+	case l7.ProtocolZookeeper:
+		op, arg := l7.ParseZookeeper(r.Payload)
+		trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
+	default:
+		return false
+	}
+	return true
 }
 
 type ListenDetails struct {
@@ -116,6 +165,10 @@ type Container struct {
 	metadata *ContainerMetadata
 
 	processes map[uint32]*Process
+	// tracesDisabledProcesses is how many of processes have eBPF traces
+	// disabled (setProcessLocked, deleteProcessLocked): asked at every L7
+	// event, so not looked up among them.
+	tracesDisabledProcesses int
 
 	createdAt time.Time
 	startedAt time.Time
@@ -227,12 +280,18 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	go func() {
 		ticker := time.NewTicker(gcInterval)
 		defer ticker.Stop()
+		goneTicker := time.NewTicker(goneProcessesInterval)
+		defer goneTicker.Stop()
 		for {
 			select {
 			case <-c.done:
 				return
 			case t := <-ticker.C:
 				c.gc(t)
+			case t := <-goneTicker.C:
+				c.lock.Lock()
+				c.forgetGoneProcesses(t)
+				c.lock.Unlock()
 			}
 		}
 	}()
@@ -511,7 +570,7 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 	if p == nil {
 		return nil
 	}
-	c.processes[pid] = p
+	c.setProcessLocked(pid, p)
 
 	if c.startedAt.IsZero() {
 		c.startedAt = stats.BeginTime
@@ -531,16 +590,100 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 }
 
 func (c *Container) onProcessExitLocked(pid uint32, oomKill bool) {
-	if p := c.processes[pid]; p != nil {
+	p := c.processes[pid]
+	if p != nil {
 		p.Close()
 	}
-	delete(c.processes, pid)
-	if len(c.processes) == 0 {
+	if p != nil && p.goneAt.IsZero() && p.hasInboundState() {
+		// The exit comes from its own ring and can be handled before the L7
+		// events the process sent before it exited: the state of its inbound
+		// connections (their ends, the requests held for their bodies) stays
+		// with a stand-in until forgetGoneProcesses.
+		c.setProcessLocked(pid, p.goneStandIn(time.Now()))
+	} else {
+		c.deleteProcessLocked(pid)
+	}
+	if !c.hasLiveProcesses() && c.zombieAt.IsZero() {
 		c.zombieAt = time.Now()
 	}
 	delete(c.delaysByPid, pid)
 	if oomKill {
 		c.oomKills++
+	}
+}
+
+// processOf returns the process pid of the container, or, for one that exited
+// before its events were handled (a process a server forked for a connection
+// lives a few milliseconds), a stand-in made from its parent. Called with
+// c.lock held.
+func (c *Container) processOf(pid uint32) *Process {
+	if p := c.processes[pid]; p != nil {
+		return p
+	}
+	if c.registry == nil {
+		return nil
+	}
+	// gone: exited with its exit handled already, or no longer in /proc. The
+	// registry routed its event to this container, as the container of the
+	// pid, of its exit or of its parent.
+	if !c.registry.exitedBeforeHandled(pid, c) && !processGone(pid) {
+		c.registry.l7InboundDroppedNoProcess.Add(1)
+		return nil
+	}
+	var parent *Process
+	if c.registry.parentPid != nil {
+		if parentPid, ok := c.registry.parentPid(pid); ok {
+			parent = c.processes[parentPid]
+		}
+	}
+	p := newGoneProcess(pid, parent, time.Now())
+	c.setProcessLocked(pid, p)
+	return p
+}
+
+// setProcessLocked puts p as the process pid of the container, in place of the
+// one it had. Called with c.lock held.
+func (c *Container) setProcessLocked(pid uint32, p *Process) {
+	c.deleteProcessLocked(pid)
+	if c.processes == nil {
+		c.processes = map[uint32]*Process{}
+	}
+	c.processes[pid] = p
+	if p.Flags.EbpfTracesDisabled {
+		c.tracesDisabledProcesses++
+	}
+}
+
+// deleteProcessLocked removes the process pid of the container. Called with
+// c.lock held.
+func (c *Container) deleteProcessLocked(pid uint32) {
+	if p := c.processes[pid]; p != nil {
+		if p.Flags.EbpfTracesDisabled {
+			c.tracesDisabledProcesses--
+		}
+		delete(c.processes, pid)
+	}
+}
+
+// hasLiveProcesses tells whether a process of the container runs: the
+// stand-ins of gone processes do not. Called with c.lock held.
+func (c *Container) hasLiveProcesses() bool {
+	for _, p := range c.processes {
+		if p.goneAt.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
+// forgetGoneProcesses removes the stand-ins of gone processes once the events
+// of an exited process stop coming (RecentlyExitedTTL). Called with c.lock
+// held.
+func (c *Container) forgetGoneProcesses(now time.Time) {
+	for pid, p := range c.processes {
+		if !p.goneAt.IsZero() && now.Sub(p.goneAt) > RecentlyExitedTTL {
+			c.onProcessExitLocked(pid, false)
+		}
 	}
 }
 
@@ -637,7 +780,7 @@ func (c *Container) onListenClose(pid uint32, addr netaddr.IPPort) {
 	}
 }
 
-func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
+func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst netaddr.IPPort, timestamp uint64, preexisting, failed bool, duration time.Duration) {
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
 	}
@@ -684,6 +827,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 			Pid:            pid,
 			Fd:             fd,
 			Timestamp:      timestamp,
+			Preexisting:    preexisting,
 		}
 		c.activeConnections[connection.key] = connection
 		k := PidFd{Pid: pid, Fd: fd}
@@ -700,13 +844,37 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
 }
 
+// onInboundConnectionOpen registers a connection a process accepted: server
+// is its local end, client the remote one.
+func (c *Container) onInboundConnectionOpen(pid uint32, fd uint64, server, client netaddr.IPPort, timestamp uint64, preexisting bool) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	p := c.processOf(pid)
+	if p == nil {
+		return
+	}
+	if p.inboundConnections == nil {
+		p.inboundConnections = map[uint64]*inboundConnection{}
+	}
+	p.inboundConnections[fd] = &inboundConnection{timestamp: timestamp, server: server, client: client, seenOpen: !preexisting}
+}
+
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	if e.IsInbound {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if p := c.processes[e.Pid]; p != nil {
+			// the requests still held for their bodies get their spans now
+			if state := p.inboundHttp1Parsers[e.Fd]; state != nil && state.connTimestamp == e.Timestamp {
+				c.observeInboundHttp1(p, e.Fd, state, state.parser.Flush(time.Now().Add(time.Hour)))
+			}
+			if state := p.inboundHttp2Parsers[e.Fd]; state != nil && state.connTimestamp == e.Timestamp {
+				c.observeInboundHttp2(p, e.Fd, state, state.parser.Flush(time.Now().Add(time.Hour)))
+			}
 			delete(p.inboundHttp1Parsers, e.Fd)
 			delete(p.inboundHttp2Parsers, e.Fd)
+			delete(p.inboundConnections, e.Fd)
+			delete(p.inboundQueries, e.Fd)
 		}
 		return
 	}
@@ -866,16 +1034,9 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey)
 
-	ebpfTracesDisabled := false
-	for _, p := range c.processes {
-		if p.Flags.EbpfTracesDisabled {
-			ebpfTracesDisabled = true
-			break
-		}
-	}
 	var trace *tracing.Trace
-	if !ebpfTracesDisabled {
-		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+	if !c.ebpfTracesDisabled() {
+		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown(), conn.key.src)
 	}
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
@@ -884,7 +1045,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 			conn.http1Parser = newHttp1Parser()
 		}
 		for _, req := range conn.http1Parser.Parse(r.Method, r.Payload, uint64(r.Duration)) {
-			c.observeHttp1(stats, trace, req)
+			c.observeOutboundHttp1(conn, stats, trace, req)
 		}
 		c.noteBodyHolder(conn)
 	case l7.ProtocolHTTP2:
@@ -894,39 +1055,17 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		}
 		requests := conn.http2Parser.Parse(r.Method, r.Payload, uint64(r.Duration))
 		for _, req := range requests {
-			c.observeHttp2(stats, trace, req)
+			c.observeHttp2(stats, trace, req, outboundHttp2RequestKey(conn, req))
 		}
 		c.noteBodyHolder(conn)
-	case l7.ProtocolPostgres:
+	case l7.ProtocolPostgres, l7.ProtocolMysql:
 		if r.Method != l7.MethodStatementClose {
 			stats.observe(r.Status.String(), "", r.Duration)
 		}
-		if conn.postgresParser == nil {
-			conn.postgresParser = l7.NewPostgresParser()
-		}
-		query := conn.postgresParser.Parse(r.Payload)
-		trace.PostgresQuery(query, r.Status.Error(), r.Duration)
-	case l7.ProtocolMysql:
-		if r.Method != l7.MethodStatementClose {
-			stats.observe(r.Status.String(), "", r.Duration)
-		}
-		if conn.mysqlParser == nil {
-			conn.mysqlParser = l7.NewMysqlParser()
-		}
-		query := conn.mysqlParser.Parse(r.Payload, r.StatementId)
-		trace.MysqlQuery(query, r.Status.Error(), r.Duration)
-	case l7.ProtocolMemcached:
+		recordQuery(trace, &conn.queries, r)
+	case l7.ProtocolMemcached, l7.ProtocolRedis, l7.ProtocolMongo:
 		stats.observe(r.Status.String(), "", r.Duration)
-		cmd, items := l7.ParseMemcached(r.Payload)
-		trace.MemcachedQuery(cmd, items, r.Status.Error(), r.Duration)
-	case l7.ProtocolRedis:
-		stats.observe(r.Status.String(), "", r.Duration)
-		cmd, args := l7.ParseRedis(r.Payload)
-		trace.RedisQuery(cmd, args, r.Status.Error(), r.Duration)
-	case l7.ProtocolMongo:
-		stats.observe(r.Status.String(), "", r.Duration)
-		query := l7.ParseMongo(r.Payload)
-		trace.MongoQuery(query, r.Status.Error(), r.Duration)
+		recordQuery(trace, &conn.queries, r)
 	case l7.ProtocolKafka, l7.ProtocolCassandra:
 		stats.observe(r.Status.String(), "", r.Duration)
 	case l7.ProtocolRabbitmq, l7.ProtocolNats:
@@ -935,12 +1074,10 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		stats.observe(r.Status.String(), "", r.Duration)
 	case l7.ProtocolClickhouse:
 		stats.observe(r.Status.String(), "", r.Duration)
-		query := l7.ParseClickhouse(r.Payload)
-		trace.ClickhouseQuery(query, r.Status.Error(), r.Duration)
+		recordQuery(trace, &conn.queries, r)
 	case l7.ProtocolZookeeper:
 		stats.observe(r.Status.Zookeeper(), "", r.Duration)
-		op, arg := l7.ParseZookeeper(r.Payload)
-		trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
+		recordQuery(trace, &conn.queries, r)
 	case l7.ProtocolFoundationDB:
 		stats.observe(r.Status.String(), "", r.Duration)
 	}
@@ -950,7 +1087,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 func (c *Container) observeInboundL7(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) {
 	protocol := r.Protocol
 	if protocol == l7.ProtocolHTTP {
-		p := c.processes[pid]
+		p := c.processOf(pid)
 		if p == nil {
 			return
 		}
@@ -960,26 +1097,16 @@ func (c *Container) observeInboundL7(pid uint32, fd uint64, timestamp uint64, r 
 		state := p.inboundHttp1Parsers[fd]
 		if state == nil || state.connTimestamp != timestamp {
 			state = &inboundHttp1State{
-				parser:        l7.NewHttp1Parser(),
+				parser:        newHttp1Parser(),
 				connTimestamp: timestamp,
 			}
 			p.inboundHttp1Parsers[fd] = state
 		}
-		requests := state.parser.Parse(r.Method, r.Payload, uint64(r.Duration))
-		if len(requests) == 0 {
-			return
-		}
-		stats := c.l7InboundStats.get(l7.ProtocolHTTP)
-		for _, req := range requests {
-			if common.HttpFilter.ShouldBeSkipped(req.Path) {
-				continue
-			}
-			stats.observe(req.Status.Http(), "", req.Duration)
-		}
+		c.observeInboundHttp1(p, fd, state, state.parser.Parse(r.Method, r.Payload, uint64(r.Duration)))
 		return
 	}
 	if protocol == l7.ProtocolHTTP2 {
-		p := c.processes[pid]
+		p := c.processOf(pid)
 		if p == nil {
 			return
 		}
@@ -989,26 +1116,12 @@ func (c *Container) observeInboundL7(pid uint32, fd uint64, timestamp uint64, r 
 		state := p.inboundHttp2Parsers[fd]
 		if state == nil || state.connTimestamp != timestamp {
 			state = &inboundHttp2State{
-				parser:        l7.NewHttp2Parser(),
+				parser:        newHttp2Parser(),
 				connTimestamp: timestamp,
 			}
 			p.inboundHttp2Parsers[fd] = state
 		}
-		requests := state.parser.Parse(r.Method, r.Payload, uint64(r.Duration))
-		if len(requests) == 0 {
-			return
-		}
-		stats := c.l7InboundStats.get(l7.ProtocolHTTP)
-		for _, req := range requests {
-			if common.HttpFilter.ShouldBeSkipped(req.Path) {
-				continue
-			}
-			status := req.Status.Http()
-			if req.GrpcStatus >= 0 {
-				status = req.GrpcStatus.GRPC()
-			}
-			stats.observe(status, "", req.Duration)
-		}
+		c.observeInboundHttp2(p, fd, state, state.parser.Parse(r.Method, r.Payload, uint64(r.Duration)))
 		return
 	}
 	if _, ok := L7InboundRequests[protocol]; !ok {
@@ -1021,6 +1134,125 @@ func (c *Container) observeInboundL7(pid uint32, fd uint64, timestamp uint64, r 
 	default:
 		stats.observe(r.Status.String(), "", r.Duration)
 	}
+	if p := c.processOf(pid); p != nil && !c.ebpfTracesDisabled() {
+		if p.inboundQueries == nil {
+			p.inboundQueries = map[uint64]*inboundQueryState{}
+		}
+		state := p.inboundQueries[fd]
+		if state == nil || state.connTimestamp != timestamp {
+			state = &inboundQueryState{connTimestamp: timestamp}
+			p.inboundQueries[fd] = state
+		}
+		recordQuery(c.serverTrace(p, fd, timestamp), &state.parsers, r)
+	}
+}
+
+// serverTrace records the server side of the requests of an accepted
+// connection, with its ends when the agent knows them. Called with c.lock held.
+func (c *Container) serverTrace(p *Process, fd uint64, timestamp uint64) *tracing.Trace {
+	if connection := p.inboundConnection(fd, timestamp); connection != nil {
+		return c.tracer.NewServerTrace(connection.server, connection.client)
+	}
+	return c.tracer.NewServerTrace(netaddr.IPPort{}, netaddr.IPPort{})
+}
+
+// observeInboundHttp2 counts and records the server side of the requests an
+// inbound HTTP/2 parser hands over. Called with c.lock held.
+func (c *Container) observeInboundHttp2(p *Process, fd uint64, state *inboundHttp2State, requests []l7.Http2Request) {
+	if len(requests) == 0 {
+		return
+	}
+	connection := p.inboundConnection(fd, state.connTimestamp)
+	var trace *tracing.Trace
+	if !c.ebpfTracesDisabled() {
+		trace = c.serverTrace(p, fd, state.connTimestamp)
+	}
+	stats := c.l7InboundStats.get(l7.ProtocolHTTP)
+	for _, req := range requests {
+		if common.HttpFilter.ShouldBeSkipped(req.Path) {
+			continue
+		}
+		status := req.Status.Http()
+		if req.GrpcStatus >= 0 {
+			status = req.GrpcStatus.GRPC()
+		}
+		stats.observe(status, "", req.Duration)
+		trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration, http2Bodies(req), req.At,
+			inboundHttp2RequestKey(connection, req))
+	}
+}
+
+// observeInboundHttp1 counts and records the server side of the requests an
+// inbound parser hands over: from a payload, or held for their bodies and
+// released. They are numbered in that order, which is the order they came in.
+// Called with c.lock held.
+func (c *Container) observeInboundHttp1(p *Process, fd uint64, state *inboundHttp1State, requests []l7.Http1Request) {
+	if len(requests) == 0 {
+		return
+	}
+	connection := p.inboundConnection(fd, state.connTimestamp)
+	var trace *tracing.Trace
+	if !c.ebpfTracesDisabled() {
+		trace = c.serverTrace(p, fd, state.connTimestamp)
+	}
+	stats := c.l7InboundStats.get(l7.ProtocolHTTP)
+	for _, req := range requests {
+		state.requests++
+		if common.HttpFilter.ShouldBeSkipped(req.Path) {
+			continue
+		}
+		stats.observe(req.Status.Http(), "", req.Duration)
+		trace.HttpRequest(req.Method, req.Path, req.Status, req.Duration, http1Bodies(req), req.At,
+			inboundRequestKey(connection, state.requests, req))
+	}
+}
+
+// ebpfTracesDisabled tells whether a process of the container asked for no
+// eBPF traces.
+func (c *Container) ebpfTracesDisabled() bool {
+	return c.tracesDisabledProcesses > 0
+}
+
+// outboundRequestKey is the RequestKey of the latest request of an outbound
+// connection: from its local end to the server it actually reached; 0 when
+// the connection was open before the agent started.
+func outboundRequestKey(conn *ActiveConnection, req l7.Http1Request) uint64 {
+	if conn.Preexisting {
+		return 0
+	}
+	server := conn.key.dst
+	if actual := conn.DestinationKey.ActualDestination(); !actual.IP().IsZero() {
+		server = actual.IPPort()
+	}
+	return tracing.RequestKey(conn.key.src, server, conn.http1Requests, req.Method, req.Path)
+}
+
+// outboundHttp2RequestKey is the RequestKey of an HTTP/2 request: numbered by
+// its stream, which both ends know however long the connection is open.
+func outboundHttp2RequestKey(conn *ActiveConnection, req l7.Http2Request) uint64 {
+	server := conn.key.dst
+	if actual := conn.DestinationKey.ActualDestination(); !actual.IP().IsZero() {
+		server = actual.IPPort()
+	}
+	return tracing.RequestKey(conn.key.src, server, uint64(req.StreamId()), req.Method, req.Path)
+}
+
+// inboundHttp2RequestKey is the RequestKey of an HTTP/2 request of an accepted
+// connection; 0 when its ends are not known.
+func inboundHttp2RequestKey(connection *inboundConnection, req l7.Http2Request) uint64 {
+	if connection == nil {
+		return 0
+	}
+	return tracing.RequestKey(connection.client, connection.server, uint64(req.StreamId()), req.Method, req.Path)
+}
+
+// inboundRequestKey is the RequestKey of the number-th request of an accepted
+// connection; 0 when its open was not seen.
+func inboundRequestKey(connection *inboundConnection, number uint64, req l7.Http1Request) uint64 {
+	if connection == nil || !connection.seenOpen {
+		return 0
+	}
+	return tracing.RequestKey(connection.client, connection.server, number, req.Method, req.Path)
 }
 
 func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) bool {
@@ -1041,7 +1273,10 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 
 func (c *Container) updateDelaysLocked() []uint32 {
 	var deadPids []uint32
-	for pid := range c.processes {
+	for pid, p := range c.processes {
+		if !p.goneAt.IsZero() {
+			continue // a stand-in, forgotten by forgetGoneProcesses
+		}
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
 			deadPids = append(deadPids, pid)
@@ -1359,11 +1594,13 @@ func (c *Container) gc(now time.Time) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	c.forgetGoneProcesses(now)
+
 	established := map[ConnectionKey]struct{}{}
 	listens := map[netaddr.IPPort]string{}
 	seenNamespaces := map[string]bool{}
 	for _, p := range c.processes {
-		if len(p.inboundHttp1Parsers) > 0 || len(p.inboundHttp2Parsers) > 0 {
+		if len(p.inboundHttp1Parsers) > 0 || len(p.inboundHttp2Parsers) > 0 || len(p.inboundConnections) > 0 || len(p.inboundQueries) > 0 {
 			fds, err := proc.ReadFds(p.Pid)
 			if err == nil {
 				openFds := map[uint64]struct{}{}
@@ -1380,6 +1617,16 @@ func (c *Container) gc(now time.Time) {
 				for fd := range p.inboundHttp2Parsers {
 					if _, ok := openFds[fd]; !ok {
 						delete(p.inboundHttp2Parsers, fd)
+					}
+				}
+				for fd := range p.inboundConnections {
+					if _, ok := openFds[fd]; !ok {
+						delete(p.inboundConnections, fd)
+					}
+				}
+				for fd := range p.inboundQueries {
+					if _, ok := openFds[fd]; !ok {
+						delete(p.inboundQueries, fd)
 					}
 				}
 			}

@@ -2,13 +2,20 @@
 """Python HTTP/1.1 (+ optional HTTPS) test service for the e2e suite
 (HTTP/2 skipped — needs the extra hyper-h2/httpx dependencies, not worth
 it for this harness).
-Usage: server.py <port> [https-port]
+Usage: server.py <port> [https-port] [--fork]
+--fork serves each connection in a process forked after accept, as Postgres
+does: the process that accepted the connection is not the one that reads it.
 """
 import json
+import socketserver
 import ssl
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+
+
+class ForkingHTTPServer(socketserver.ForkingMixIn, HTTPServer):
+    pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -57,8 +64,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8081
-    https_port = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    fork = "--fork" in sys.argv[1:]
+    args = [arg for arg in sys.argv[1:] if arg != "--fork"]
+    port = int(args[0]) if len(args) > 0 else 8081
+    https_port = int(args[1]) if len(args) > 1 else None
 
     if https_port:
         # CPython's ssl module wraps libssl (OpenSSL) via the _ssl C
@@ -74,6 +83,7 @@ if __name__ == "__main__":
         t.start()
         print(f"python-service: https on :{https_port}")
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print(f"python-service: http/1.1 on :{port}")
+    server_class = ForkingHTTPServer if fork else ThreadingHTTPServer
+    httpd = server_class(("0.0.0.0", port), Handler)
+    print(f"python-service: http/1.1 on :{port}" + (" (a process forked per connection)" if fork else ""))
     httpd.serve_forever()

@@ -202,7 +202,7 @@ sleep 5
 curl -s -m 5 -X POST "http://${MOCKBACKEND_ADDR}/api/reset" -o /dev/null || true
 
 echo "[run-agent] agent health counters (before load):"
-curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_http_bodies\|node_l7_http2_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
+curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_http_bodies\|node_l7_http2_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container\|node_l7_inbound_dropped_no_process" | grep -v '^#' || true
 
 # STRESS=1: background pressure while the measured load runs — CPU burners on
 # every core, memory churn plus forced compaction (page migration is what makes
@@ -261,7 +261,7 @@ echo "[run-agent] waiting ${FLUSH_SECONDS}s for the OTLP batch exporter to flush
 sleep "${FLUSH_SECONDS}"
 
 echo "[run-agent] agent health counters (after load):"
-curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_http_bodies\|node_l7_http2_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container" | grep -v '^#' || true
+curl -s http://127.0.0.1:10300/metrics 2>&1 | grep "node_ebpf_\|node_traces_\|node_l7_http1_\|node_l7_http_bodies\|node_l7_http2_\|node_l7_payloads_truncated\|node_l7_event_queue_depth\|node_l7_tls_attach_seconds\|node_l7_dropped_unknown_container\|node_l7_inbound_dropped_no_process" | grep -v '^#' || true
 
 # Dump the agent's own warnings/errors (deduplicated, pids/ids masked so
 # repeats collapse) — the single most useful thing to have when a run
@@ -275,6 +275,6 @@ echo "[run-agent] agent log: L7 events for unresolvable containers"
 grep -F "l7 event for unresolvable container" "${AGENT_LOG}" 2>/dev/null | head -10 || true
 
 echo "[run-agent] verifying"
-verify -backend "http://${MOCKBACKEND_ADDR}" -manifest "${MANIFEST}" -wait 20s "${VERIFY_ARGS[@]}"
+verify -backend "http://${MOCKBACKEND_ADDR}" -manifest "${MANIFEST}" -wait 20s -server-spans python-fork "${VERIFY_ARGS[@]}"
 RC=$?
 exit "${RC}"

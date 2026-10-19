@@ -36,3 +36,25 @@ func TestContainerIdToServiceName(t *testing.T) {
 		f("/docker/container_name"),
 		"/docker/container_name")
 }
+
+func TestKubernetesContainerOfContainerId(t *testing.T) {
+	container, ok := KubernetesContainerOf("/k8s/coroot-dev/demo-traffic-75b97975f8-4c8kf/traffic")
+	assert.True(t, ok)
+	assert.Equal(t, KubernetesContainer{Namespace: "coroot-dev", Pod: "demo-traffic-75b97975f8-4c8kf", Container: "traffic"}, container)
+
+	// a cron job's id names the cron job, not the pod of the run
+	container, ok = KubernetesContainerOf("/k8s-cronjob/default/hello/xz")
+	assert.True(t, ok)
+	assert.Equal(t, KubernetesContainer{Namespace: "default", CronJob: "hello", Container: "xz"}, container)
+
+	for _, containerId := range []string{
+		"/docker/a1b2c3",
+		"/system.slice/k3s.service",
+		"/k8s/coroot-dev/demo-traffic", // no container
+		"/k8s//pod/container",
+		"",
+	} {
+		_, ok = KubernetesContainerOf(containerId)
+		assert.False(t, ok, containerId)
+	}
+}

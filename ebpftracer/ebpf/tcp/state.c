@@ -200,7 +200,8 @@ struct tcp_event {
     __u8 daddr[16];
     __u8 aaddr[16];
     __u8 is_inbound;
-    __u8 pad[7];
+    __u8 not_seen_open; /* see struct connection */
+    __u8 pad[6];
 };
 
 _Static_assert(__builtin_offsetof(struct tcp_event, ts) == 24, "tcp_event.ts: tcpEventTsOffset in ringmerge.go");
@@ -294,7 +295,13 @@ struct connection {
     __u32 h2_skip_resp_stream;
     __u8 h2_skip_req_data;
     __u8 h2_skip_resp_data;
-    __u8 pad2[2];
+    /* an accepted connection from a client in traced_clients: the client's
+       agent captures the bodies of its requests, so the server skips them */
+    __u8 skip_bodies;
+    /* a connection the agent did not see open: open before it started, or
+       accepted by another process (a server that forks after accept, as
+       Postgres): its requests cannot be numbered */
+    __u8 not_seen_open;
     /* struct sock * of a connect()ed socket, recorded at SYN_SENT (see
        emit_connection_open_lazy) */
     __u64 skaddr;
@@ -393,6 +400,10 @@ void emit_connection_open_lazy(struct connection_id *cid, struct connection *con
     }
     conn->open_sent = 1;
     sc->e.type = EVENT_TYPE_CONNECTION_OPEN;
+    /* an accepted connection: the source is the local (server) end, the
+       destination the remote (client) one */
+    sc->e.is_inbound = conn->is_inbound;
+    sc->e.not_seen_open = conn->not_seen_open;
     sc->e.timestamp = conn->timestamp;
     sc->e.pid = cid->pid;
     sc->e.fd = cid->fd;
@@ -585,19 +596,130 @@ int sys_enter_close(struct syscall_trace_enter *ctx) {
     return 0;
 }
 
-static inline __attribute__((__always_inline__))
-int handle_accept_exit(long int ret) {
-    if (ret < 0) {
+/* The IPs (IPv4 mapped to IPv6) of the clients whose requests a node agent
+   records at the client: the pods on nodes with an agent, which user space
+   keeps up to date (Coroot's list and the local pods). */
+struct traced_client {
+    __u8 ip[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(struct traced_client));
+    __uint(value_size, sizeof(__u8));
+    __uint(max_entries, 65536);
+} traced_clients SEC(".maps");
+
+#define S_IFMT 00170000
+#define S_IFSOCK 0140000
+#define SOCK_STREAM 1
+
+/* The TCP socket (struct sock *) behind a file descriptor of the current
+   task, 0 for anything else. It finds the addresses of a connection the agent
+   did not see open in this process: one accepted by another process, as the
+   postmaster of Postgres accepts a connection and the backend it forks reads
+   it. Read within the syscall on the descriptor, so the socket is open. */
+static __always_inline
+__u64 socket_of_fd(__u64 fd) {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    struct fdtable *fdt = BPF_CORE_READ(task, files, fdt);
+    if (!fdt || fd >= BPF_CORE_READ(fdt, max_fds)) {
+        return 0;
+    }
+    struct file **fds = BPF_CORE_READ(fdt, fd);
+    struct file *file = 0;
+    if (!fds || bpf_probe_read_kernel(&file, sizeof(file), &fds[fd]) || !file) {
+        return 0;
+    }
+    if ((BPF_CORE_READ(file, f_inode, i_mode) & S_IFMT) != S_IFSOCK) {
+        return 0;
+    }
+    struct socket *sock = (struct socket *)BPF_CORE_READ(file, private_data);
+    if (!sock || BPF_CORE_READ(sock, type) != SOCK_STREAM) {
+        return 0;
+    }
+    struct sock *sk = BPF_CORE_READ(sock, sk);
+    if (!sk) {
+        return 0;
+    }
+    unsigned short family = BPF_CORE_READ((struct sock_common *)sk, skc_family);
+    if (family != AF_INET && family != AF_INET6) {
+        return 0;
+    }
+    return (__u64)sk;
+}
+
+/* Whether the remote end of an accepted socket is a traced client. */
+static __always_inline
+__u8 is_traced_client(struct sock_common *skc) {
+    struct traced_client client = {};
+    unsigned short family = BPF_CORE_READ(skc, skc_family);
+    if (family == AF_INET) {
+        client.ip[10] = 0xff;
+        client.ip[11] = 0xff;
+        if (BPF_CORE_READ_INTO((__be32 *)&client.ip[12], skc, skc_daddr)) {
+            return 0;
+        }
+    } else if (family == AF_INET6) {
+        if (BPF_CORE_READ_INTO((struct in6_addr *)&client.ip, skc, skc_v6_daddr)) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+    return bpf_map_lookup_elem(&traced_clients, &client) ? 1 : 0;
+}
+
+/* The socket inet_csk_accept() returns to accept() on this thread: the
+   accept tracepoint knows only the new fd, the socket has the addresses. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(__u64));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 10240);
+} accepted_sockets SEC(".maps");
+
+SEC("kretprobe/inet_csk_accept")
+int inet_csk_accept_exit(struct pt_regs *ctx) {
+    __u64 sk = (__u64)PT_REGS_RC(ctx);
+    if (!sk) {
         return 0;
     }
     __u64 id = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&accepted_sockets, &id, &sk, BPF_ANY);
+    return 0;
+}
+
+static inline __attribute__((__always_inline__))
+int handle_accept_exit(long int ret) {
+    __u64 id = bpf_get_current_pid_tgid();
+    __u64 *sk = bpf_map_lookup_elem(&accepted_sockets, &id);
+    __u64 skaddr = sk ? *sk : 0;
+    if (sk) {
+        bpf_map_delete_elem(&accepted_sockets, &id);
+    }
+    if (ret < 0) {
+        return 0;
+    }
     struct connection_id cid = {};
     cid.pid = id >> 32;
     cid.fd = (__u64)ret;
     struct connection conn = {};
     conn.timestamp = conn_timestamp(cid.pid, cid.fd);
     conn.is_inbound = 1;
+    conn.skaddr = skaddr;
+    if (skaddr) {
+        conn.skip_bodies = is_traced_client((struct sock_common *)skaddr);
+    }
     bpf_map_update_elem(&active_connections, &cid, &conn, BPF_ANY);
+    /* announce the connection with its addresses, so that the server side of
+       its requests knows the client */
+    if (skaddr) {
+        struct connection *c = bpf_map_lookup_elem(&active_connections, &cid);
+        if (c) {
+            emit_connection_open_lazy(&cid, c);
+        }
+    }
     return 0;
 }
 

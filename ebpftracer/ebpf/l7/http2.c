@@ -500,6 +500,10 @@ struct http2_trim_args {
     __u8 is_req;
     __u8 skip_data;
     __u8 method;
+    /* the connection's skip_bodies: a traced client's agent captures the
+       bodies, so DATA frames are kept as their headers only (length 0), for
+       their END_STREAM */
+    __u8 no_bodies;
 };
 
 // noinline: the reserved ringbuf dynptr must be submit/discarded here; inlining
@@ -600,11 +604,13 @@ int http2_classify_frame(struct http2_trim_args *a, const unsigned char hdr[HTTP
     __u32 length;
     __u32 stream_id;
     __u32 take;
+    __u32 want;
     __u32 copied;
     __u32 out;
     __u32 budget;
     __u8 type;
     __u8 is_header;
+    __u8 no_body;
 
     length = ((__u32)hdr[0] << 16) | ((__u32)hdr[1] << 8) | hdr[2];
     type = hdr[3];
@@ -650,21 +656,27 @@ int http2_classify_frame(struct http2_trim_args *a, const unsigned char hdr[HTTP
         return 1;
     }
     PAYLOAD_BOUND(out);
+    /* A DATA frame of a connection whose bodies are skipped is its header
+       only: no body to copy, no slot of its own, nothing to top up. take can
+       be 0 for any frame (its header ends the buffer), so this is a flag of
+       its own. */
+    no_body = type == HTTP2_FRAME_DATA && a->no_bodies;
+    want = no_body ? 0 : take;
     /* DATA has its own 1KB slot, not the space left after headers. */
-    if (type == HTTP2_FRAME_DATA && out > 0) {
+    if (type == HTTP2_FRAME_DATA && !no_body && out > 0) {
         http2_flush(a);
         out = 0;
     }
     if (out > 0 &&
-        take <= MAX_PAYLOAD_SIZE - HTTP2_FRAME_HEADER_SIZE &&
-        out + HTTP2_FRAME_HEADER_SIZE + take > MAX_PAYLOAD_SIZE) {
+        want <= MAX_PAYLOAD_SIZE - HTTP2_FRAME_HEADER_SIZE &&
+        out + HTTP2_FRAME_HEADER_SIZE + want > MAX_PAYLOAD_SIZE) {
         http2_flush(a);
         out = 0;
     } else if (out + HTTP2_FRAME_HEADER_SIZE > MAX_PAYLOAD_SIZE) {
         http2_flush(a);
         out = 0;
     }
-    copied = take;
+    copied = want;
     if (copied > budget) {
         copied = budget;
     }
@@ -673,7 +685,7 @@ int http2_classify_frame(struct http2_trim_args *a, const unsigned char hdr[HTTP
     }
     copied = http2_bound_body(copied);
 
-    if (copied == take && take < length && budget > copied) {
+    if (!no_body && copied == take && take < length && budget > copied) {
         /* Captured everything available, but the frame continues beyond
            this buffer and the stream can still take more: ask for a
            cross-syscall top-up instead of settling for `copied`. The
@@ -1500,6 +1512,7 @@ int http2_iov_impl(void *ctx) {
     t.dst = dst;
     t.method = s->method;
     t.is_req = is_req;
+    t.no_bodies = conn ? conn->skip_bodies : 0;
     bpf_loop(HTTP2_TRIM_MAX_FRAMES, http2_iov_cb, &t, 0);
     http2_flush(&t);
     if (t.skip_data == HTTP2_SKIP_CUT) {

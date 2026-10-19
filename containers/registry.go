@@ -111,15 +111,25 @@ type Registry struct {
 	// what gcClosedConnections kept on its last run, see node_tracked_connections
 	trackedConnectionsOpen   atomic.Int64
 	trackedConnectionsClosed atomic.Int64
+	// the traced clients Coroot sends (nil while it does not know them), and
+	// how many the tracer holds with the local ones, see updateTracedClients
+	tracedClientsUpdates chan []netaddr.IP
+	remoteTracedClients  []netaddr.IP
+	tracedClients        atomic.Int64
 	// L7 events dropped because their pid's container could not be
 	// resolved even after trying to register it (process already gone, or a
 	// cgroup that is deliberately ignored). See the EventTypeL7Request case.
 	l7DroppedUnknownContainer atomic.Uint64
+	l7InboundDroppedNoProcess atomic.Uint64
 	// Processes whose exit event was already handled, kept for
 	// RecentlyExitedTTL so L7/connection events of theirs that are still
 	// queued behind it (they come from separate ring buffers) can still be
 	// attributed — see lateEventContainer.
 	recentlyExited map[uint32]recentlyExitedProc
+	// parentPid is the parent of a process, known after it is gone
+	// (Tracer.ParentPid): a process that lived a few milliseconds belongs to
+	// the container of its parent.
+	parentPid func(pid uint32) (uint32, bool)
 
 	// Set by the goroutine that feeds handleEvents: the cgroup of every pid
 	// seen in an event, read as soon as the event left the tracer rather than
@@ -205,6 +215,11 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 	}
 	r.tracerEvents = make(chan ebpftracer.Event, 10000)
 	r.earlyCg = map[uint32]earlyCgroup{}
+	r.parentPid = r.tracer.ParentPid
+	r.tracedClientsUpdates = make(chan []netaddr.IP, 1)
+	if *flags.HttpBodyCapture {
+		go runTracedClientsFetcher(r.tracedClientsUpdates)
+	}
 	go r.handleEvents(r.events)
 	go r.forwardEvents(r.tracerEvents)
 	if err = r.tracer.Run(r.tracerEvents); err != nil {
@@ -220,6 +235,7 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.EbpfLostSamples
 	ch <- metrics.EbpfLostEvents
 	ch <- metrics.TrackedConnections
+	ch <- metrics.TracedClients
 	ch <- metrics.EbpfActiveConnections
 	ch <- metrics.EbpfActiveConnectionsSwept
 	ch <- metrics.L7PayloadsTruncated
@@ -240,6 +256,7 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.Http1RequestsWithoutResponse
 	ch <- metrics.Http1ResponsesFromData
 	ch <- metrics.L7DroppedUnknownContainer
+	ch <- metrics.L7InboundDroppedNoProcess
 	ch <- metrics.L7EventQueueDepth
 	ch <- metrics.L7TlsAttachSeconds
 	ch <- metrics.Http2EventsSeen
@@ -299,7 +316,9 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	ch <- metrics.Counter(metrics.Http1RequestsWithoutResponse, float64(l7.Http1Stats.RequestsWithoutResponse.Load()))
 	ch <- metrics.Counter(metrics.Http1ResponsesFromData, float64(l7.Http1Stats.ResponsesFromData.Load()))
 	ch <- metrics.Counter(metrics.L7DroppedUnknownContainer, float64(r.l7DroppedUnknownContainer.Load()))
+	ch <- metrics.Counter(metrics.L7InboundDroppedNoProcess, float64(r.l7InboundDroppedNoProcess.Load()))
 	ch <- metrics.Gauge(metrics.L7EventQueueDepth, float64(len(r.events)))
+	ch <- metrics.Gauge(metrics.TracedClients, float64(r.tracedClients.Load()))
 	ch <- metrics.Gauge(metrics.TrackedConnections, float64(r.trackedConnectionsOpen.Load()), "open")
 	ch <- metrics.Gauge(metrics.TrackedConnections, float64(r.trackedConnectionsClosed.Load()), "closed")
 	ch <- metrics.Counter(metrics.L7TlsAttachSeconds, float64(r.tlsAttachNanos.Load())/1e9)
@@ -389,8 +408,21 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 		defer t.Stop()
 		bodyFlush = t.C
 	}
+	// Only with --http-body-capture: a server skips the bodies its traced
+	// clients capture.
+	var localTracedClients <-chan time.Time
+	if *flags.HttpBodyCapture {
+		t := time.NewTicker(localTracedClientsInterval)
+		defer t.Stop()
+		localTracedClients = t.C
+	}
 	for {
 		select {
+		case remote := <-r.tracedClientsUpdates:
+			r.remoteTracedClients = remote
+			r.updateTracedClients()
+		case <-localTracedClients:
+			r.updateTracedClients()
 		case now := <-bodyFlush:
 			if len(r.events) > bodyFlushMaxQueue {
 				break // behind on events: "no more body" would only mean "not read yet"
@@ -558,8 +590,14 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 
 			case ebpftracer.EventTypeConnectionOpen:
+				if e.IsInbound {
+					if c := r.containerOrLate(e.Pid); c != nil {
+						c.onInboundConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.Timestamp, e.Preexisting)
+					}
+					continue
+				}
 				if c := r.containerOrLate(e.Pid); c != nil {
-					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
+					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, e.Preexisting, false, e.Duration)
 					if len(r.events) > eventQueueBusyThreshold {
 						// Behind on events — defer rather than pay the
 						// attach cost inline. See eventQueueBusyThreshold.
@@ -575,7 +613,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			case ebpftracer.EventTypeConnectionError:
 				if c := r.containerOrLate(e.Pid); c != nil {
-					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
+					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, false, true, e.Duration)
 				}
 			case ebpftracer.EventTypeConnectionClose:
 				c := r.containersByPid[e.Pid]
@@ -673,6 +711,25 @@ func (r *Registry) exitedBeforeHandled(pid uint32, c *Container) bool {
 	return err != nil && common.IsNotExist(err)
 }
 
+// goneProcessContainer resolves the container of a process that is gone
+// before handleEvents got to it: forwardEvents may have read its cgroup while
+// it was alive, and else it is the container of its parent, whose cgroup it
+// inherited (a server forks a process for a connection, which lives a few
+// milliseconds). It is remembered as exited, so that its later events resolve
+// too and its container makes a stand-in for it (processOf).
+func (r *Registry) goneProcessContainer(pid uint32) *Container {
+	c := r.earlyContainer(pid)
+	if c == nil && r.parentPid != nil {
+		if parent, ok := r.parentPid(pid); ok && parent != pid {
+			c = r.getOrCreateContainer(parent)
+		}
+	}
+	if c != nil {
+		r.rememberExited(pid, c)
+	}
+	return c
+}
+
 func (r *Registry) containerOrLate(pid uint32) *Container {
 	if c := r.containersByPid[pid]; c != nil {
 		return c
@@ -697,10 +754,9 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	cg, err := proc.ReadCgroup(pid)
 	if err != nil && common.IsNotExist(err) {
-		// Gone before handleEvents got to it; forwardEvents may have read
-		// its cgroup while it was alive. Only an already-known container is
-		// used: nothing is registered for a pid that no longer exists.
-		if c := r.earlyContainer(pid); c != nil {
+		// Gone before handleEvents got to it. Only an already-known container
+		// is used: nothing is registered for a pid that no longer exists.
+		if c := r.goneProcessContainer(pid); c != nil {
 			return c
 		}
 	}

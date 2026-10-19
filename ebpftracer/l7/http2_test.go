@@ -435,3 +435,27 @@ func TestHttp2FlushWaitsForTheRestOfADataFrame(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, strings.Repeat("x", 400), got[0].ResponseBody)
 }
+
+// The DATA frames of a connection whose bodies the agent skips (a traced
+// client's agent captures them) come from the kernel as their headers only,
+// with length 0: the request and its response end on their END_STREAM, at
+// once, with no body and nothing held.
+func TestHttp2DataFramesWithoutBodies(t *testing.T) {
+	c := newH2Conn(t)
+	p := newH2BodyParser(4096)
+	headerOnly := func(frame []byte) []byte {
+		h := append([]byte(nil), frame[:9]...)
+		h[0], h[1], h[2] = 0, 0, 0
+		return h
+	}
+	require.Empty(t, p.Parse(MethodHttp2ClientFrames, c.reqHeaders(1, false, h2post...), 1))
+	require.Empty(t, p.Parse(MethodHttp2ClientFrames, headerOnly(c.clientData(1, true, []byte(`{"a":1}`))), 2))
+	require.Empty(t, p.Parse(MethodHttp2ServerFrames, c.respHeaders(1, false,
+		hpack.HeaderField{Name: ":status", Value: "201"}, hpack.HeaderField{Name: "content-type", Value: "application/json"}), 5))
+	got := p.Parse(MethodHttp2ServerFrames, headerOnly(c.serverData(1, true, []byte(`{"id":"ab"}`))), 6)
+	require.Len(t, got, 1)
+	require.Equal(t, Status(201), got[0].Status)
+	require.Empty(t, got[0].RequestBody)
+	require.Empty(t, got[0].ResponseBody)
+	require.Equal(t, 0, p.Held())
+}
