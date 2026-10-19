@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status (2026-10-19):** done, except Task 6 Step 5 (the latency with and without body capture is not recorded in `docs/latency-benchmark.md`). Since this plan: `--http-body-capture` is on by default (`Default("true")`), and two of its non-goals were done later, in `coroot/docs/superpowers/plans/2026-10-16-ebpf-client-server-coverage.md`: the bodies of inbound requests (server spans), and kernel changes (a server skips the bodies its traced clients' agents capture, `skip_bodies`, HTTP/1 and HTTP/2).
+
 **Goal:** put the request and response body of an outbound HTTP/1.1 or HTTP/2 call on its span as `http.request.body` and `http.response.body`, behind a flag that is off by default.
 
 **Scope:** the userspace side of `coroot-node-agent`: flags, the HTTP/1 and HTTP/2 parsers in `ebpftracer/l7`, the span creation in `tracing` and the wiring in `containers`. The consumer is `coroot/docs/superpowers/plans/2026-09-17-clickhouse-trace-body-columns.md`, which stores exactly these two attributes in their own columns.
@@ -83,7 +85,7 @@ Rules for what is captured (everything else is dropped and counted):
 
 **Files:** `flags/flags.go`, `ebpftracer/l7/bodies.go`, `ebpftracer/l7/bodies_test.go`
 
-- [ ] **Step 1: Write the failing tests** for the pieces everything else builds on:
+- [x] **Step 1: Write the failing tests** for the pieces everything else builds on:
 
 ```go
 func TestBodyAllowed(t *testing.T) {
@@ -124,9 +126,9 @@ func TestBodyCollectorCaps(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run them (expect fail).** `go test ./ebpftracer/l7 -run 'TestBodyAllowed|TestCutOnRune|TestBodyCollector' -count=1`
+- [x] **Step 2: Run them (expect fail).** `go test ./ebpftracer/l7 -run 'TestBodyAllowed|TestCutOnRune|TestBodyCollector' -count=1`
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `flags/flags.go`, same style as the other flags (`kingpin`, `envar`):
     - `HttpBodyCapture` bool, default false;
     - `HttpBodyMaxBytes` int, default 4096, values above 4096 are clamped (the kernel never sends more);
@@ -135,7 +137,7 @@ func TestBodyCollectorCaps(t *testing.T) {
   - `ebpftracer/l7/bodies.go`: `BodyOptions{Enabled bool, MaxBytes int, ContentTypes []string, Wait time.Duration}` with `DefaultBodyOptions()`, `Allowed(contentType, contentEncoding string, sample []byte) bool`, `cutUTF8(b []byte, max int) []byte`, and `bodyCollector` (`Add`, `Bytes`, `Full`, `Len`).
   - `Allowed` matches the content type case-insensitively, ignoring parameters, with `*` suffix/prefix patterns; with no content type it sniffs (valid UTF-8 after cutting an incomplete tail, no NUL byte).
 
-- [ ] **Step 4: Run the package.** `go test ./ebpftracer/l7 -count=1`
+- [x] **Step 4: Run the package.** `go test ./ebpftracer/l7 -count=1`
 
 ---
 
@@ -152,7 +154,7 @@ When is a response body complete?
 
 The request body is complete by the time the response arrives (a server does not answer before reading the request in any normal exchange), so it is whatever the client-direction collector holds when the response headers are seen.
 
-- [ ] **Step 1: Write the failing tests** (plain `Parse` calls, no kernel):
+- [x] **Step 1: Write the failing tests** (plain `Parse` calls, no kernel):
 
 ```go
 func newBodyParser(max int) *Http1Parser {
@@ -183,9 +185,9 @@ func TestHttp1DisabledIsUnchanged(t *testing.T)               { /* NewHttp1Parse
 
 Write the elided tests in full; each is a few `Parse` calls like the first one. `Flush` is the function the container's ticker calls (below).
 
-- [ ] **Step 2: Run them (expect fail).** `go test ./ebpftracer/l7 -run TestHttp1 -count=1`
+- [x] **Step 2: Run them (expect fail).** `go test ./ebpftracer/l7 -run TestHttp1 -count=1`
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `Http1Request` gets `RequestBody, ResponseBody string` and `RequestBodySize, ResponseBodySize int64` (-1 when unknown). The existing fields are untouched.
   - `NewHttp1Parser()` stays exactly as is, with bodies off. Add `NewHttp1ParserWithBodies(BodyOptions)`. Inbound parsers keep using `NewHttp1Parser()`.
   - When bodies are on, the client side parses from the finished header block (`clientBuf`/`serverBuf` at the moment of the `\r\n\r\n` check) the values of `Content-Length`, `Transfer-Encoding`, `Content-Type` and `Content-Encoding`, and stores them in `http1PendingRequest`/a new `http1PendingResponse`.
@@ -194,7 +196,7 @@ Write the elided tests in full; each is a few `Parse` calls like the first one. 
   - `Flush(now time.Time) []Http1Request` releases pairs waiting longer than `Wait`. `Parse` records the time of the last event per pair using the caller-supplied clock, so tests do not sleep: `Parse` keeps its signature and a separate `ParseAt(method, payload, kernelTime, now)` carries the clock; `Parse` calls it with `time.Now()`.
   - Bound the queues: at most 64 messages held per parser; beyond that the oldest is released without body.
 
-- [ ] **Step 4: Run the package.** `go test ./ebpftracer/l7 -count=1`
+- [x] **Step 4: Run the package.** `go test ./ebpftracer/l7 -count=1`
 
 ---
 
@@ -206,7 +208,7 @@ HTTP/2 has an exact end marker: `END_STREAM` on the last HEADERS/DATA frame of a
 
 The existing `Parse` returns a request when the response HEADERS are decoded (`statuses` map). With bodies on it must instead return it when the response stream ends.
 
-- [ ] **Step 1: Write the failing tests** with frames built by `golang.org/x/net/http2` (`http2.Framer` writing to a buffer, the HPACK encoder from `hpack`):
+- [x] **Step 1: Write the failing tests** with frames built by `golang.org/x/net/http2` (`http2.Framer` writing to a buffer, the HPACK encoder from `hpack`):
   - `TestHttp2BodiesRequestAndResponse`: HEADERS (no END_STREAM) + DATA (END_STREAM) on the client side, HEADERS + DATA (END_STREAM) on the server side → one request with both bodies after the last frame.
   - `TestHttp2NoBodyResponse`: HEADERS with END_STREAM → complete at once, no body attributes.
   - `TestHttp2DataSplitAcrossEvents`: a 3000-byte DATA frame delivered as header + 1000 bytes + 1000 bytes + 1000 bytes in four `Parse` calls (the kernel's continuation events) → the body is assembled; the existing reassembly limit `http2ReassemblyMax` (1024) must not drop it.
@@ -216,9 +218,9 @@ The existing `Parse` returns a request when the response HEADERS are decoded (`s
   - `TestHttp2PaddedDataSkipped`: a PADDED DATA frame is skipped, not misread.
   - `TestHttp2DisabledIsUnchanged`: `NewHttp2Parser()` returns requests on response HEADERS exactly as today.
 
-- [ ] **Step 2: Run them (expect fail).** `go test ./ebpftracer/l7 -run TestHttp2 -count=1`
+- [x] **Step 2: Run them (expect fail).** `go test ./ebpftracer/l7 -run TestHttp2 -count=1`
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `NewHttp2ParserWithBodies(BodyOptions)`; `NewHttp2Parser()` unchanged.
   - Extend the HEADERS decode callbacks to also read `content-type`, `content-encoding` and `content-length` per stream (request side from the client decoder, response side from the server decoder), and the `END_STREAM` flag of the HEADERS frame.
   - Handle `http2.FrameData` in `Parse`: append the DATA body to the stream's request or response collector; honour `END_STREAM`.
@@ -228,7 +230,7 @@ The existing `Parse` returns a request when the response HEADERS are decoded (`s
   - Return a request when the server side of its stream has ended (or after `Wait` past the response HEADERS for streams that never end: `Flush(now)`, mirroring HTTP/1). With bodies off, return on response HEADERS as today.
   - Garbage-collect streams that never end together with the existing `activeRequests` GC.
 
-- [ ] **Step 4: Run the package.** `go test ./ebpftracer/l7 -count=1`
+- [x] **Step 4: Run the package.** `go test ./ebpftracer/l7 -count=1`
 
 ---
 
@@ -236,19 +238,19 @@ The existing `Parse` returns a request when the response HEADERS are decoded (`s
 
 **Files:** `tracing/tracing.go`, `tracing/tracing_test.go` (new)
 
-- [ ] **Step 1: Write the failing tests** with an in-memory span exporter (`sdktrace` has `tracetest.NewInMemoryExporter`):
+- [x] **Step 1: Write the failing tests** with an in-memory span exporter (`sdktrace` has `tracetest.NewInMemoryExporter`):
   - `TestHttpRequestSpanWithBodies`: `HttpRequest` with bodies produces `http.request.body`, `http.response.body` and the two `*.size` attributes; without bodies it produces exactly the attributes it produces today (compare the full attribute set, so a stray empty attribute fails).
   - `TestSpanUsesGivenEndTime`: a span created 300 ms after the response, with `at` set to the response time, ends at `at` and starts at `at - duration`.
 
-- [ ] **Step 2: Run them (expect fail).** `go test ./tracing -count=1`
+- [x] **Step 2: Run them (expect fail).** `go test ./tracing -count=1`
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - A small `HttpBodies{Request, Response string; RequestSize, ResponseSize int64}` value; `HttpRequest` and `Http2Request` take a `*HttpBodies` (nil = none) and an `at time.Time` (zero = now) as their last arguments.
   - `createSpan` uses `at` instead of `time.Now()` when given, so a deferred span keeps its true start and end.
   - Attributes are added only when non-empty; sizes only when known.
   - Update the callers; with `nil, time.Time{}` behaviour is unchanged.
 
-- [ ] **Step 4: Run the package.** `go test ./tracing ./containers -count=1`
+- [x] **Step 4: Run the package.** `go test ./tracing ./containers -count=1`
 
 ---
 
@@ -258,17 +260,17 @@ The existing `Parse` returns a request when the response HEADERS are decoded (`s
 
 Spans are created in three places: `onL7Request` (live), `emitPendingHttp1Requests` and `emitPendingHttp2Requests` (replay of events that arrived before the connection was registered, bounded by `pendingL7RequestMaxAge`).
 
-- [ ] **Step 1: Write the failing test** in `containers` (a `Container` with a fake tracer is already constructible in the existing tests; if not, test the helper below directly):
+- [x] **Step 1: Write the failing test** in `containers` (a `Container` with a fake tracer is already constructible in the existing tests; if not, test the helper below directly):
   - `TestFlushReleasesWaitingBodies`: feed a chunked response, call `c.flushHttpBodies(now+Wait)` and see one span with the body.
 
-- [ ] **Step 2: Implement.**
+- [x] **Step 2: Implement.**
   - Factor the three span-creation sites into one helper (`c.observeHttp(protocol, req, conn, trace)`), so the body attributes are added in one place.
   - Create the outbound parsers (`conn.http1Parser`, `conn.http2Parser` and the pending ones) with `...WithBodies` when `*flags.HttpBodyCapture`; inbound parsers are created as today.
   - `flushHttpBodies(now)`: for each connection with a parser that can hold messages, call `Flush`, then run the released requests through the same helper. Call it from a new 250 ms ticker in `Registry.handleEvents` for containers that have any held message (keep a counter, so idle containers cost nothing). Only start the ticker when the flag is on.
   - Pass the response time (`at`) from the parser to the tracer so a released span keeps its timing.
   - `metrics.go`: `node_l7_http_bodies_total{result}` with results `captured`, `skipped_content_type`, `skipped_encoding`, `skipped_binary`, `truncated`, `dropped_no_message`, `dropped_queue_full`.
 
-- [ ] **Step 3: Run the packages.** `go test ./containers ./ebpftracer/... ./tracing -count=1` (on Linux; `containers` does not build on macOS, run it in the test container, see `make docker-test`).
+- [x] **Step 3: Run the packages.** `go test ./containers ./ebpftracer/... ./tracing -count=1` (on Linux; `containers` does not build on macOS, run it in the test container, see `make docker-test`).
 
 ---
 
@@ -278,11 +280,11 @@ Spans are created in three places: `onL7Request` (live), `emitPendingHttp1Reques
 
 `POST /echo` already sends a deterministic body (`bytes.Repeat([]byte{byte('a' + i%26)}, 200+i%800)`) and the services echo it back, so both bodies are known from the request number `n`.
 
-- [ ] **Step 0: Give the echo a text content type.** The services answer `POST /echo` with different types: Node sets `application/octet-stream` (`e2e/services/node/server.js`), which the text-only rule skips by design, while Go, Python, PHP and Java set none (the body is then sniffed). Make the test deterministic: `loadgen` sends `Content-Type: text/plain` on echo requests, and the Node service echoes the request's `content-type` instead of the fixed one. The other services are left alone, so the "no content type, sniff" path stays covered.
-- [ ] **Step 1: Pass the flag.** `run-agent.sh` starts the agent with `--http-body-capture` when `HTTP_BODIES=1`; `e2e/run.sh` passes the variable through.
-- [ ] **Step 2: Extend `verify`** with `-bodies`: for every matched `POST /echo` span, `http.request.body` and `http.response.body` must both equal `strings.Repeat(letter, min(200+n%800, MaxBytes))` where `letter` follows from `n`. Report mismatches with the request number, like the existing missing-request list.
-- [ ] **Step 3: Run it** for the targets that have `POST /echo`: `HTTP_BODIES=1 ONLY=go-h1,node-h1,python-h1,node-tls,python-tls,go-h2c,node-h2c N_REQUESTS=1000 bash e2e/run.sh`. All bodies must match, for plain HTTP/1, TLS and HTTP/2. Add `STRESS=cpu CONCURRENCY=80` once it passes, as bodies are the first thing a lossy pipeline would cut.
-- [ ] **Step 4: Check the flag off.** A normal `bash e2e/run.sh` must be unchanged: no body attribute on any span, the same ratios.
+- [x] **Step 0: Give the echo a text content type.** The services answer `POST /echo` with different types: Node sets `application/octet-stream` (`e2e/services/node/server.js`), which the text-only rule skips by design, while Go, Python, PHP and Java set none (the body is then sniffed). Make the test deterministic: `loadgen` sends `Content-Type: text/plain` on echo requests, and the Node service echoes the request's `content-type` instead of the fixed one. The other services are left alone, so the "no content type, sniff" path stays covered.
+- [x] **Step 1: Pass the flag.** `run-agent.sh` starts the agent with `--http-body-capture` when `HTTP_BODIES=1`; `e2e/run.sh` passes the variable through.
+- [x] **Step 2: Extend `verify`** with `-bodies`: for every matched `POST /echo` span, `http.request.body` and `http.response.body` must both equal `strings.Repeat(letter, min(200+n%800, MaxBytes))` where `letter` follows from `n`. Report mismatches with the request number, like the existing missing-request list.
+- [x] **Step 3: Run it** for the targets that have `POST /echo`: `HTTP_BODIES=1 ONLY=go-h1,node-h1,python-h1,node-tls,python-tls,go-h2c,node-h2c N_REQUESTS=1000 bash e2e/run.sh`. All bodies must match, for plain HTTP/1, TLS and HTTP/2. Add `STRESS=cpu CONCURRENCY=80` once it passes, as bodies are the first thing a lossy pipeline would cut.
+- [x] **Step 4: Check the flag off.** A normal `bash e2e/run.sh` must be unchanged: no body attribute on any span, the same ratios.
 - [ ] **Step 5: Measure the cost.** `make docker-test-latency` with and without `--http-body-capture`; the parsers run in userspace only, so the added latency to the application should be zero and the agent's CPU slightly higher. Record both in `docs/latency-benchmark.md`.
 
 ---
