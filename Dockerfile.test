@@ -1,6 +1,6 @@
-# Runs the test suite on Linux. The agent only builds for linux and windows - the
-# platform-specific halves of packages like flags, gpu and host are selected by
-# filename suffix - so `go test ./...` cannot work on a macOS host.
+# Runs the test suite on Linux. The agent builds only for linux - packages like
+# host and node/metadata are in *_linux.go files - so `go test ./...` cannot work
+# on a macOS host.
 #
 # Mirrors the builder stage of Dockerfile so the test environment does not drift
 # from the one the agent is actually built in. iproute2 provides `tc` for the

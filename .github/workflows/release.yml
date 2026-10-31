@@ -122,62 +122,8 @@ jobs:
       - name: Inspect the pushed image
         run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
 
-  windows:
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goarch: amd64
-            wixarch: x64
-          - goarch: arm64
-            wixarch: arm64
-    env:
-      CGO_ENABLED: '0'
-    steps:
-      # The repo's Linux cgroup test fixtures have very long paths that exceed
-      # Windows' 260-char MAX_PATH, breaking checkout unless long paths are on.
-      - name: Enable Git long paths
-        run: git config --system core.longpaths true
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.9'
-
-      - name: Build binary
-        shell: pwsh
-        env:
-          GOOS: windows
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          $version = "${{ github.event.release.tag_name }}"
-          go build -ldflags "-X 'github.com/coroot/coroot-node-agent/flags.Version=$version'" -o coroot-windows-agent-${{ matrix.goarch }}.exe ./cmd/coroot-windows-agent
-
-      - name: Install WiX Toolset
-        shell: pwsh
-        run: dotnet tool install --global wix --version 5.0.2
-
-      - name: Build MSI
-        shell: pwsh
-        run: |
-          # MSI ProductVersion must be numeric x.y.z; strip the leading "v".
-          $version = "${{ github.event.release.tag_name }}".TrimStart("v")
-          if ($version -notmatch '^\d+\.\d+\.\d+') {
-            $version = "0.0.1"
-          }
-          wix build -arch ${{ matrix.wixarch }} windows/wix/product.wxs -d Version=$version -d ExePath=coroot-windows-agent-${{ matrix.goarch }}.exe -o coroot-windows-agent-${{ matrix.goarch }}.msi
-
-      - name: Upload EXE and MSI to the release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            coroot-windows-agent-${{ matrix.goarch }}.exe
-            coroot-windows-agent-${{ matrix.goarch }}.msi
-
   finalize:
-    needs: [linux, merge, windows]
+    needs: [linux, merge]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
