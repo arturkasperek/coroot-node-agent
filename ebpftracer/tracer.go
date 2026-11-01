@@ -109,7 +109,16 @@ type UprobeKey struct {
 type globalUprobe struct {
 	links    []link.Link
 	refcount int
+	// when refcount dropped to 0: the links stay attached for globalUprobeIdleTTL
+	unusedSince time.Time
 }
+
+// globalUprobeIdleTTL is how long the uprobes of a binary stay attached after its
+// last process has exited. A binary that is started again (a CLI run in a loop, a
+// cron job, a restarted service) is traced from its first request: attaching takes
+// until the agent has handled the first connection of the new process, and every
+// TLS request sent before that would have no span.
+const globalUprobeIdleTTL = 5 * time.Minute
 
 type Tracer struct {
 	disableL7Tracing bool
@@ -203,6 +212,10 @@ func (t *Tracer) Close() {
 }
 
 func (t *Tracer) AcquireGlobalUprobe(path string, attach func() []link.Link) (UprobeKey, bool) {
+	return t.acquireGlobalUprobe(path, attach, time.Now())
+}
+
+func (t *Tracer) acquireGlobalUprobe(path string, attach func() []link.Link, now time.Time) (UprobeKey, bool) {
 	var stat syscall.Stat_t
 	if err := syscall.Stat(path, &stat); err != nil {
 		return UprobeKey{}, false
@@ -212,6 +225,7 @@ func (t *Tracer) AcquireGlobalUprobe(path string, attach func() []link.Link) (Up
 	t.globalUprobesLock.Lock()
 	defer t.globalUprobesLock.Unlock()
 
+	t.detachIdleGlobalUprobes(now)
 	if gu, ok := t.globalUprobes[key]; ok {
 		gu.refcount++
 		return key, true
@@ -225,21 +239,37 @@ func (t *Tracer) AcquireGlobalUprobe(path string, attach func() []link.Link) (Up
 }
 
 func (t *Tracer) ReleaseGlobalUprobes(keys ...UprobeKey) {
+	t.releaseGlobalUprobes(time.Now(), keys...)
+}
+
+func (t *Tracer) releaseGlobalUprobes(now time.Time, keys ...UprobeKey) {
 	t.globalUprobesLock.Lock()
 	defer t.globalUprobesLock.Unlock()
 
 	for _, key := range keys {
 		gu, ok := t.globalUprobes[key]
-		if !ok {
+		if !ok || gu.refcount <= 0 {
 			continue
 		}
 		gu.refcount--
-		if gu.refcount <= 0 {
-			for _, l := range gu.links {
-				_ = l.Close()
-			}
-			delete(t.globalUprobes, key)
+		if gu.refcount == 0 {
+			gu.unusedSince = now
 		}
+	}
+	t.detachIdleGlobalUprobes(now)
+}
+
+// detachIdleGlobalUprobes detaches the uprobes that no process has used for
+// globalUprobeIdleTTL. Called with globalUprobesLock held.
+func (t *Tracer) detachIdleGlobalUprobes(now time.Time) {
+	for key, gu := range t.globalUprobes {
+		if gu.refcount > 0 || now.Sub(gu.unusedSince) < globalUprobeIdleTTL {
+			continue
+		}
+		for _, l := range gu.links {
+			_ = l.Close()
+		}
+		delete(t.globalUprobes, key)
 	}
 }
 

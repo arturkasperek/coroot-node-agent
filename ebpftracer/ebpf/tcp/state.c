@@ -240,7 +240,7 @@ void tcp_connect_drop_event(void) {
 static __always_inline
 void send_tcp_connect_event(struct tcp_event *e) {
     e->ts = bpf_ktime_get_ns();
-    if (bpf_ringbuf_output(&tcp_connect_events, e, sizeof(*e), 0)) {
+    if (bpf_ringbuf_output(&tcp_connect_events, e, sizeof(*e), RINGBUF_FLAGS)) {
         tcp_connect_drop_event();
     }
 }

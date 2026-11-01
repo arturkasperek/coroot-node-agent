@@ -241,15 +241,15 @@ void http1_flush(struct http1_flush_args *a) {
         e->ts = bpf_ktime_get_ns();
         if (bpf_ringbuf_reserve_dynptr(&l7_events, rec, 0, &d)) {
             l7_drop_event();
-            bpf_ringbuf_discard_dynptr(&d, 0);
+            bpf_ringbuf_discard_dynptr(&d, RINGBUF_FLAGS);
         } else if (bpf_dynptr_write(&d, 0, e, sizeof(*e), 0)) {
-            bpf_ringbuf_discard_dynptr(&d, 0);
+            bpf_ringbuf_discard_dynptr(&d, RINGBUF_FLAGS);
         } else if (pn &&
                    bpf_probe_read_user_dynptr(&d, sizeof(*e), pn, a->dst) &&
                    bpf_probe_read_kernel_dynptr(&d, sizeof(*e), pn, a->dst)) {
-            bpf_ringbuf_discard_dynptr(&d, 0);
+            bpf_ringbuf_discard_dynptr(&d, RINGBUF_FLAGS);
         } else {
-            bpf_ringbuf_submit_dynptr(&d, 0);
+            bpf_ringbuf_submit_dynptr(&d, RINGBUF_FLAGS);
         }
     }
     a->out_len = 0;

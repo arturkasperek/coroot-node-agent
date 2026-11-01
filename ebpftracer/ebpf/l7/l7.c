@@ -294,20 +294,20 @@ void send_event(struct l7_send_args *a) {
 
     if (bpf_ringbuf_reserve_dynptr(&l7_events, rec, 0, &d)) {
         l7_drop_event();
-        bpf_ringbuf_discard_dynptr(&d, 0);
+        bpf_ringbuf_discard_dynptr(&d, RINGBUF_FLAGS);
         return;
     }
     if (bpf_dynptr_write(&d, 0, e, sizeof(*e), 0)) {
-        bpf_ringbuf_discard_dynptr(&d, 0);
+        bpf_ringbuf_discard_dynptr(&d, RINGBUF_FLAGS);
         return;
     }
     if (n &&
         bpf_probe_read_user_dynptr(&d, sizeof(*e), n, a->src) &&
         bpf_probe_read_kernel_dynptr(&d, sizeof(*e), n, a->src)) {
-        bpf_ringbuf_discard_dynptr(&d, 0);
+        bpf_ringbuf_discard_dynptr(&d, RINGBUF_FLAGS);
         return;
     }
-    bpf_ringbuf_submit_dynptr(&d, 0);
+    bpf_ringbuf_submit_dynptr(&d, RINGBUF_FLAGS);
 }
 
 // Packs send_event args. Underscored names so the preprocessor does not rewrite

@@ -26,6 +26,12 @@ extern int bpf_probe_read_kernel_dynptr(struct bpf_dynptr *dptr, __u32 off, __u3
 
 #define EVENT_REASON_OOM_KILL		1
 
+/* The flags of every write to the l7_events and tcp_connect_events ring buffers.
+   No wakeup: the agent polls both rings (see ringMerger in ringmerge.go), so a
+   wakeup per event only costs a context switch, and at a high rate of events it
+   doubles the CPU of the agent. */
+#define RINGBUF_FLAGS BPF_RB_NO_WAKEUP
+
 #define MIN(a,b) (((a)<(b))?(a):(b))
 
 /* Reads the traced application's data (a payload, an iovec, a msghdr) into dst,

@@ -222,6 +222,13 @@ func (r *mmapRing) close() {
 	_ = unix.Munmap(r.consumer)
 }
 
+// ringPollInterval is how long ringMerger sleeps once both rings are drained. The
+// eBPF side does not wake it up: a wakeup per event cost as much CPU as the rest
+// of the agent. The interval bounds how late an event is handled, and how many
+// events pile up in the queue of the registry meanwhile (a full queue defers the
+// TLS uprobes of a new process, see eventQueueBusyThreshold).
+const ringPollInterval = 10 * time.Millisecond
+
 // ringMerger reads the two rings in one goroutine.
 // tcpQueueMaxBytes bounds the connection records waiting out of their ring for older
 // L7 records: twice the ring, ~260k connection events.
@@ -230,7 +237,6 @@ const tcpQueueMaxBytes = 32 << 20
 type ringMerger struct {
 	l7, tcpRing *mmapRing
 	tcp         *queuedRing // tcpRing, taken out of it as soon as possible
-	epfd        int
 	stopped     atomic.Bool
 	done        chan struct{}
 }
@@ -245,27 +251,12 @@ func newRingMerger(l7Map, tcpMap *ebpf.Map) (*ringMerger, error) {
 		l7.close()
 		return nil, err
 	}
-	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
-	if err != nil {
-		l7.close()
-		tcp.close()
-		return nil, err
-	}
-	for _, fd := range []int{l7Map.FD(), tcpMap.FD()} {
-		if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)}); err != nil {
-			_ = unix.Close(epfd)
-			l7.close()
-			tcp.close()
-			return nil, err
-		}
-	}
-	return &ringMerger{l7: l7, tcpRing: tcp, tcp: newQueuedRing(tcp, tcpQueueMaxBytes), epfd: epfd, done: make(chan struct{})}, nil
+	return &ringMerger{l7: l7, tcpRing: tcp, tcp: newQueuedRing(tcp, tcpQueueMaxBytes), done: make(chan struct{})}, nil
 }
 
 // run hands every record over to emit, a copy it owns, until close.
 func (m *ringMerger) run(emit func(fromL7 bool, rec []byte)) {
 	defer close(m.done)
-	events := make([]unix.EpollEvent, 2)
 	busy := 0
 	for !m.stopped.Load() {
 		m.tcp.fill()
@@ -285,8 +276,8 @@ func (m *ringMerger) run(emit func(fromL7 bool, rec []byte)) {
 				time.Sleep(20 * time.Microsecond)
 			}
 		default:
-			// both rings drained: wait for the kernel to wake us up (or stop)
-			_, _ = unix.EpollWait(m.epfd, events, 100)
+			// both rings drained: the eBPF side writes with no wakeup (RINGBUF_FLAGS)
+			time.Sleep(ringPollInterval)
 		}
 	}
 }
@@ -301,7 +292,6 @@ func (m *ringMerger) close() {
 	case <-time.After(time.Second):
 		return
 	}
-	_ = unix.Close(m.epfd)
 	m.l7.close()
 	m.tcpRing.close()
 }
