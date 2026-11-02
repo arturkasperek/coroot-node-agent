@@ -255,6 +255,92 @@ void http1_flush(struct http1_flush_args *a) {
     a->out_len = 0;
 }
 
+/* The header scan reads the source a block at a time: one bpf_probe_read per
+   block instead of a map lookup and a bpf_probe_read per byte, which made a
+   header cost ~170 ns per byte (~20 us for a request head of ~100 bytes,
+   measured with the latency benchmark). A block stops at the end of a
+   vector, so a writev's headers take one block per vector at least. */
+#define HTTP1_HDR_BLOCK 256
+
+struct http1_hdr_block {
+    __u8 b[HTTP1_HDR_BLOCK];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct http1_hdr_block);
+} http1_hdr_block SEC(".maps");
+
+/* Global for the same reason as probe_read_byte_retry. */
+__attribute__((noinline))
+long probe_read_block_retry(struct http1_hdr_block *out, __u64 addr, __u32 size) {
+    if (!out || !size) {
+        return -1;
+    }
+    if (size > HTTP1_HDR_BLOCK) {
+        size = HTTP1_HDR_BLOCK;
+    }
+    return probe_read_retry(out->b, size, (void *)addr);
+}
+
+/* Up to HTTP1_HDR_BLOCK bytes from the source cursor into block, none past
+   the end of the vector under it. The cursor stays where it is (it only moves
+   to the next vector when the current one is used up): http2_iov_skip moves
+   it past the bytes used. Returns how many, 0 once the source is out. */
+static __attribute__((noinline))
+__u32 http1_iov_peek(struct http1_hdr_block *block) {
+    struct http2_iovec_table *t;
+    __u32 idx;
+    __u32 off;
+    __u32 len;
+    __u32 n;
+
+    t = scratch_lookup(&http2_iovecs);
+    if (!t || !block) {
+        return 0;
+    }
+    if (t->idx >= t->n || t->idx >= HTTP2_MAX_VECS) {
+        return 0;
+    }
+    idx = t->idx;
+    asm volatile("%0 &= %1" : "+r"(idx) : "i"(HTTP2_MAX_VECS - 1));
+    len = t->v[idx].len;
+    if (len > HTTP2_SRC_MAX) {
+        len = HTTP2_SRC_MAX;
+    }
+    off = t->off;
+    HTTP2_SRC_BOUND(off);
+    if (off >= len) {
+        idx++;
+        if (idx >= t->n || idx >= HTTP2_MAX_VECS) {
+            return 0;
+        }
+        asm volatile("%0 &= %1" : "+r"(idx) : "i"(HTTP2_MAX_VECS - 1));
+        t->idx = idx;
+        t->off = 0;
+        off = 0;
+        len = t->v[idx].len;
+        if (len > HTTP2_SRC_MAX) {
+            len = HTTP2_SRC_MAX;
+        }
+        if (!len) {
+            return 0;
+        }
+    }
+    n = len - off;
+    if (n > HTTP1_HDR_BLOCK) {
+        n = HTTP1_HDR_BLOCK;
+    }
+    /* Generic (not _user), same reasoning as http2_iov_pull. */
+    if (probe_read_block_retry(block, t->v[idx].base + off, n)) {
+        count_src_fail(0);
+        return 0;
+    }
+    return n;
+}
+
 struct http1_hdr_scan_ctx {
     struct connection_id cid;
     char *dst;
@@ -280,6 +366,13 @@ struct http1_hdr_scan_ctx {
     __u8 not_head;
     __u8 done;
     __u8 method;
+    /* The bytes of the source being scanned (see http1_hdr_scan_cb): how many
+       block holds and how many of them were scanned. The source cursor is
+       still at the block's start; it moves past the scanned bytes when the
+       next block is read and when the scan ends. */
+    struct http1_hdr_block *block;
+    __u32 block_len;
+    __u32 block_pos;
     /* Set for a chunked trailer block (HTTP1_PHASE_CHUNK_TRAILER): still
        scans Content-Length/Transfer-Encoding (harmless — trailers don't
        carry a body of their own either way), but the caller ignores the
@@ -308,10 +401,9 @@ static const char http1_head_method[] = "HEAD";
 
 /* One byte per bpf_loop iteration: unlike a DATA chunk (a flat byte count),
    where the headers end is data-dependent (the "\r\n\r\n" delimiter), so
-   there is no way to bulk-copy ahead of knowing where to stop. Byte-at-a-
-   time is the same tradeoff http2_iov_pull_header's byte fallback makes,
-   just for the whole header block instead of 9 fixed bytes — headers are
-   typically a few hundred bytes in real traffic, not the full 4KB cap. */
+   the scan cannot know ahead how many bytes are headers. The bytes come
+   from a block read ahead of the cursor (see HTTP1_HDR_BLOCK); the cursor
+   moves only past the bytes scanned, so it stops right after the headers. */
 static long http1_hdr_scan_cb(__u32 i, void *ctx) {
     struct http1_hdr_scan_ctx *a = ctx;
     struct http1_flush_args f;
@@ -320,12 +412,21 @@ static long http1_hdr_scan_cb(__u32 i, void *ctx) {
     __u8 match;
     (void)i;
 
-    if (!a) {
+    if (!a || !a->block) {
         return 1;
     }
-    if (http2_iov_pull(&b)) {
-        return 1;
+    if (a->block_pos >= a->block_len) {
+        if (a->block_len && http2_iov_skip(a->block_len)) {
+            return 1;
+        }
+        a->block_pos = 0;
+        a->block_len = http1_iov_peek(a->block);
+        if (!a->block_len) {
+            return 1;
+        }
     }
+    b = a->block->b[a->block_pos & (HTTP1_HDR_BLOCK - 1)];
+    a->block_pos += 1;
     match = a->tail_len >= 3 && a->tail[0] == '\r' && a->tail[1] == '\n' &&
             a->tail[2] == '\r' && b == '\n';
 
@@ -428,9 +529,7 @@ static long http1_hdr_scan_cb(__u32 i, void *ctx) {
             http1_flush(&f);
             a->out_len = f.out_len;
         }
-        if (copy_to_payload(a->dst, a->out_len, 1, &b)) {
-            return 1;
-        }
+        a->dst[a->out_len & (MAX_PAYLOAD_SIZE - 1)] = b;
         a->out_len += 1;
         a->hdr_captured += 1;
     }
@@ -684,8 +783,15 @@ int http1_walk_impl(void *ctx, void *tail_progs) {
         sc.first_word_len = sv.first_word_len;
         sc.not_head = sv.not_head;
         sc.method = s->is_req ? METHOD_HTTP_CLIENT_HEADERS : METHOD_HTTP_SERVER_HEADERS;
+        sc.block = scratch_lookup(&http1_hdr_block);
+        if (!sc.block) {
+            return 0;
+        }
 
         bpf_loop(HTTP1_HDR_SCAN_MAX, http1_hdr_scan_cb, &sc, 0);
+        if (sc.block_pos) {
+            http2_iov_skip(sc.block_pos);
+        }
 
         if (sc.out_len) {
             f.cid = s->cid;

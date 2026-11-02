@@ -587,6 +587,36 @@ func TestHttp1HeadersDelimiterSplitAcrossSyscalls(t *testing.T) {
 	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xcd, bodyLen))
 }
 
+// TestHttp1WritevHeadersSplitAcrossVectors sends headers longer than one
+// block of the header scan (HTTP1_HDR_BLOCK) in one writev: they start in one
+// vector and end in the next, followed in it by the start of the body. The
+// scan must take every header byte from both vectors and leave the cursor
+// right after "\r\n\r\n", so the body is DATA from its first byte.
+func TestHttp1WritevHeadersSplitAcrossVectors(t *testing.T) {
+	skipIfNotVM(t)
+	getEvent, stop := runTracer(t)
+	defer stop()
+
+	addr, stopDiscard := startTCPDiscard(t)
+	defer stopDiscard()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	watchConn(t, conn)
+	defer conn.Close()
+
+	const padLen = 600
+	const bodyLen = 200
+	headers := http1HeadersWithBody(padLen, bodyLen)
+	body := bytes.Repeat([]byte{0xcd}, bodyLen)
+	second := append(append([]byte{}, headers[100:]...), body[:50]...)
+	writevConn(t, conn, [][]byte{headers[:100], second, body[50:]})
+
+	pid := uint32(os.Getpid())
+	require.Equal(t, padLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientHeaders, 0xab, padLen))
+	require.Equal(t, bodyLen, collectHTTP1MethodBytes(t, getEvent, pid, false, l7.MethodHttpClientData, 0xcd, bodyLen))
+}
+
 // TestHttp1HeadersOver4KBTruncated checks that headers past the 4KB cap stop
 // being captured but the walker keeps scanning (uncounted) for "\r\n\r\n" so
 // the body that follows is still correctly recognized as DATA, not more
