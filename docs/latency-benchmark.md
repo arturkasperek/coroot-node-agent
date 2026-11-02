@@ -93,5 +93,9 @@ buffer drops events, an over-full LRU map evicts live connections).
   change, not as an absolute number. Repeat before trusting a small difference.
 - The agent shares the CPUs with the benchmark. On a loaded node the numbers are
   worse (see [known-issues](known-issues/README.md)).
-- `node-tls` (new TLS connection per request, 10 KB body) lost 48 of 3323 spans in
-  the last run; see [known-issues/tls-residual-loss.md](known-issues/tls-residual-loss.md).
+- `node-tls` (new TLS connection per request, 10 KB body) used to lose 1-4% of its
+  spans. Two causes, both fixed: the TLS uprobes were detached when the last
+  process of a binary exited (they now stay attached for a while, see
+  `globalUprobeIdleTTL`), and the end of a read used its `active_reads` entry
+  after deleting it, so a concurrent read could hand it another buffer (see
+  `exiting_read` in `ebpf/l7/l7.c`).

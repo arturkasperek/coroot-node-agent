@@ -6,7 +6,6 @@ measured, what is already ruled out, and where to start.
 
 | File | Problem | Size of the loss |
 |---|---|---|
-| [tls-residual-loss.md](tls-residual-loss.md) | A few TLS requests never become spans | ~1-2 per 8000; 1.4% on node-tls with a new connection per request |
 | [keepalive-rare-loss-under-cpu-stress.md](keepalive-rare-loss-under-cpu-stress.md) | Keep-alive HTTP/1 loses a request at 99% CPU | 2 per 4000, once |
 | [write-retry-dedup-gaps.md](write-retry-dedup-gaps.md) | Retried writes still counted twice on some paths | not measured |
 | [http1-pipelining-depth.md](http1-pipelining-depth.md) | Deep HTTP/1 pipelining loses the tail of a buffer | by design, ~12-14 |

@@ -476,6 +476,11 @@ int inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
         if (!conn) {
             return 0;
         }
+        /* Read before the deletes below: an LRU hash reuses a deleted element
+           at once, so cid and conn can then hold another connection's values. */
+        duration = bpf_ktime_get_ns() - conn->timestamp;
+        pid = cid->pid;
+        fd = cid->fd;
         if (args.newstate == BPF_TCP_ESTABLISHED) {
             if (conn->open_sent) {
                 return 0;
@@ -488,9 +493,6 @@ int inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
             bpf_map_delete_elem(&active_connections, cid);
             type = EVENT_TYPE_CONNECTION_ERROR;
         }
-        duration = bpf_ktime_get_ns() - conn->timestamp;
-        pid = cid->pid;
-        fd = cid->fd;
     }
     if (args.oldstate == BPF_TCP_ESTABLISHED && (args.newstate == BPF_TCP_FIN_WAIT1 || args.newstate == BPF_TCP_CLOSE_WAIT)) {
         bpf_map_delete_elem(&connection_id_by_socket, &args.skaddr);

@@ -163,6 +163,18 @@ struct {
     __uint(max_entries, 10240);
 } active_reads SEC(".maps");
 
+/* trace_exit_read's copy of the active_reads entry it handles. An LRU hash
+   puts a deleted element back on its free list at once, with no RCU grace
+   period: a read starting on another CPU can take it and overwrite it while
+   this program still reads it, and the event then carries that read's buffer
+   (another request's bytes, or zeros not yet filled). */
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct read_args);
+} exiting_read SEC(".maps");
+
 struct ssl_args {
     char *buf;
     __u64 size;
@@ -810,14 +822,20 @@ int trace_enter_read(__u64 id, __u32 pid, __u64 fd, __u8 socket_only, char *buf,
 
 static inline __attribute__((__always_inline__))
 int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret, void *tail_progs) {
-    struct read_args *args = bpf_map_lookup_elem(&active_reads, &id);
-    if (!args) {
+    struct read_args *active = bpf_map_lookup_elem(&active_reads, &id);
+    if (!active) {
         return 0;
     }
+    struct read_args *args = scratch_lookup(&exiting_read);
+    if (!args) {
+        bpf_map_delete_elem(&active_reads, &id);
+        return 0;
+    }
+    __builtin_memcpy(args, active, sizeof(*args));
+    bpf_map_delete_elem(&active_reads, &id);
     struct connection_id cid = {};
     cid.pid = pid;
     cid.fd = args->fd;
-    bpf_map_delete_elem(&active_reads, &id);
 
     if (ret <= 0) {
         return 0;
